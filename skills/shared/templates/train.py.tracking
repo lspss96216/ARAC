@@ -1,0 +1,157 @@
+"""
+train.py.tracking — detector-training half of task_type: object_tracking
+
+Conforms to train-script-spec.md § Task-type variants. This file trains the
+detector on labelled video frames and exits after printing num_params_M.
+The tracking pipeline + TrackEval live in the companion track.py; both write
+to the same run.log so a single evaluation.parsing config can extract
+detection and tracking metrics in one pass.
+
+Run (called by autoresearch in the object_tracking branch):
+    uv run train.py  > run.log 2>&1
+    uv run track.py >> run.log 2>&1
+"""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section ① — Imports and constants
+# ═══════════════════════════════════════════════════════════════════════════════
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+from ultralytics import YOLO
+
+try:
+    from custom_modules import *       # noqa: F401,F403
+except ImportError:
+    pass
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section ② — Tunables (the contract surface)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Locked by orchestrator.
+TIME_BUDGET = 1200
+SEED        = 42
+IMGSZ       = 1920      # locked; halve BATCH_SIZE for OOM, never change resolution
+
+# Modifiable.
+BATCH_SIZE     = 16
+WEIGHTS        = "weights/yolo26x.pt"
+DATA_YAML      = "data/dataset.yaml"           # frame-level labels in YOLO format
+NUM_CLASSES    = 10
+FREEZE_LAYERS  = 0
+CKPT_DIR       = Path("runs/train")
+
+# Detector-level module toggles. Tracker-level toggles (CMC, NSA Kalman, re-ID)
+# live at the top of track.py, not here — see train-script-spec.md § Task-type
+# variants for the split.
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section ③ — inject_modules hook
+# ═══════════════════════════════════════════════════════════════════════════════
+def inject_modules(model):
+    """Detector-layer modules only. Tracker-layer modules go in track.py.
+    Each branch must be idempotent when its flag is False."""
+    return model
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section ④ — Main (train detector + print detection metrics)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Two kinds of consumers read this script's output:
+#   1. autoresearch — cares about the *tracking* metrics (HOTA etc.) emitted
+#      by track.py, which runs after this script
+#   2. dataset hunter — cares about *detection* quality to decide whether pretrain
+#      improved the backbone. It reads val_mAP50_95 from this script's log.
+#
+# Therefore this script, despite being the "tracking train", also runs
+# model.val() at the end and prints detection metrics. track.py appends
+# tracking metrics to the same run.log afterward.
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def train(model) -> str:
+    """Train and return the path to the best checkpoint."""
+    results = model.train(
+        data=DATA_YAML,
+        epochs=10000,
+        batch=BATCH_SIZE,
+        time=TIME_BUDGET / 3600,
+        imgsz=IMGSZ,
+        freeze=FREEZE_LAYERS,
+        project=str(CKPT_DIR.parent),
+        name=CKPT_DIR.name,
+        seed=SEED,
+        exist_ok=True,
+    )
+    best = Path(results.save_dir) / "weights" / "best.pt"
+    return str(best)
+
+
+def evaluate(model):
+    """Detection-level validation. Tracking metrics come from track.py."""
+    return model.val(
+        data=DATA_YAML,
+        imgsz=IMGSZ,
+        batch=BATCH_SIZE,
+        verbose=True,
+    )
+
+
+def print_metrics(metrics, model, best_ckpt: str) -> None:
+    """Emit canonical `key: value` lines matchable by evaluation.parsing.patterns."""
+    box = metrics.box
+    print(f"val_precision:    {box.mp:.4f}")
+    print(f"val_recall:       {box.mr:.4f}")
+    print(f"val_mAP50:        {box.map50:.4f}")
+    print(f"val_mAP50_95:     {box.map:.4f}")
+
+    n_params_m = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"Model Summary: {n_params_m:.1f}M params")
+    peak_vram_mb = (torch.cuda.max_memory_allocated() / 1e6
+                    if torch.cuda.is_available() else 0)
+    print(f"peak_vram_mb:     {peak_vram_mb:.0f}")
+
+    # Sentinel for track.py to pick up which weights to use.
+    print(f"trained_weights:  {best_ckpt}")
+
+
+def main() -> int:
+    set_seed(SEED)
+
+    try:
+        model = YOLO(WEIGHTS)
+    except Exception as e:
+        print(f"FATAL: failed to load weights {WEIGHTS}: {e}", file=sys.stderr)
+        return 1
+
+    model = inject_modules(model)
+
+    try:
+        best_ckpt = train(model)
+    except torch.cuda.OutOfMemoryError:
+        print("FATAL: CUDA OOM during training", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"FATAL: training crashed: {e}", file=sys.stderr)
+        return 3
+
+    try:
+        metrics = evaluate(model)
+        print_metrics(metrics, model, best_ckpt)
+    except Exception as e:
+        print(f"FATAL: detection eval crashed: {e}", file=sys.stderr)
+        return 4
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,162 @@
+"""
+train.py.detection — default template for task_type: object_detection
+
+Conforms to train-script-spec.md. Orchestrator copies this file to the project
+root as `train.py` when scaffolding, then patches TIME_BUDGET and SEED in
+Section ②. Autoresearch appends USE_* flags and inject_modules branches.
+
+Run: uv run train.py > run.log 2>&1
+"""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section ① — Imports and constants
+# ═══════════════════════════════════════════════════════════════════════════════
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+from ultralytics import YOLO
+
+# custom_modules.py is populated by autoresearch via paper2code / GitHub clones.
+# The star-import is intentional: autoresearch adds classes to custom_modules.py
+# and the names must be available inside inject_modules() without extra edits.
+try:
+    from custom_modules import *       # noqa: F401,F403
+except ImportError:
+    pass                                # OK on first run — no modules injected yet
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section ② — Tunables (the contract surface)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Locked by orchestrator — never edit from autoresearch.
+TIME_BUDGET = 1200      # seconds per training run
+SEED        = 42        # random seed
+IMGSZ       = 1920      # image size — locked; halve BATCH_SIZE for OOM, never change resolution
+
+# Modifiable by autoresearch and dataset hunter.
+BATCH_SIZE     = 16
+WEIGHTS        = "weights/yolo26x.pt"
+DATA_YAML      = "data/dataset.yaml"
+NUM_CLASSES    = 10
+FREEZE_LAYERS  = 0
+CKPT_DIR       = Path("runs/train")
+EVAL_CONF      = 0.001
+EVAL_IOU       = 0.6
+
+# Module toggles — autoresearch flips and appends these one at a time.
+# Each flag corresponds to one branch inside inject_modules().
+# (empty on first scaffold; populated as experiments progress)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section ③ — inject_modules hook
+# ═══════════════════════════════════════════════════════════════════════════════
+def inject_modules(model):
+    """Apply experimental modules based on USE_* flags. Mutates model in place
+    and returns it. Each branch must be idempotent when its flag is False
+    (i.e. flipping the flag off must restore baseline behaviour).
+
+    autoresearch appends new branches here when pulling modules from modules.md.
+    Do not reorder existing branches — order must stay stable for reproducibility.
+    """
+    # Branches go here. Example shape:
+    #
+    # if USE_SMALL_OBJECT_FPN:
+    #     from custom_modules import SmallObjectFPN
+    #     SmallObjectFPN.replace_neck(model)
+
+    return model
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section ④ — Main (train + eval)
+# ═══════════════════════════════════════════════════════════════════════════════
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def train(model) -> None:
+    model.train(
+        data=DATA_YAML,
+        epochs=10000,                        # time-bounded, epochs is just an upper bound
+        batch=BATCH_SIZE,
+        time=TIME_BUDGET / 3600,             # ultralytics accepts time in hours
+        imgsz=IMGSZ,
+        freeze=FREEZE_LAYERS,
+        project=str(CKPT_DIR.parent),
+        name=CKPT_DIR.name,
+        seed=SEED,
+        exist_ok=True,
+        verbose=True,
+    )
+
+
+def evaluate(model):
+    """Run validation and return the ultralytics metrics object."""
+    return model.val(
+        data=DATA_YAML,
+        imgsz=IMGSZ,
+        batch=BATCH_SIZE,
+        conf=EVAL_CONF,
+        iou=EVAL_IOU,
+        verbose=True,
+    )
+
+
+def print_metrics(metrics, model) -> None:
+    """Emit metrics in a format matchable by evaluation.parsing.patterns.
+
+    The regex patterns in research_config.yaml must match these prints exactly.
+    If you change a print here you must update the yaml pattern too.
+    """
+    box = metrics.box
+    print(f"val_precision:    {box.mp:.4f}")
+    print(f"val_recall:       {box.mr:.4f}")
+    print(f"val_mAP50:        {box.map50:.4f}")
+    print(f"val_mAP50_95:     {box.map:.4f}")
+
+    n_params_m = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"Model Summary: {n_params_m:.1f}M params")
+
+    peak_vram_mb = (torch.cuda.max_memory_allocated() / 1e6
+                    if torch.cuda.is_available() else 0)
+    print(f"peak_vram_mb:     {peak_vram_mb:.0f}")
+
+
+def main() -> int:
+    set_seed(SEED)
+
+    try:
+        model = YOLO(WEIGHTS)
+    except Exception as e:
+        print(f"FATAL: failed to load weights {WEIGHTS}: {e}", file=sys.stderr)
+        return 1
+
+    model = inject_modules(model)
+
+    try:
+        train(model)
+    except torch.cuda.OutOfMemoryError:
+        # Let autoresearch handle the OOM policy (halve BATCH_SIZE and retry).
+        print("FATAL: CUDA OOM during training", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"FATAL: training crashed: {e}", file=sys.stderr)
+        return 3
+
+    try:
+        metrics = evaluate(model)
+        print_metrics(metrics, model)
+    except Exception as e:
+        print(f"FATAL: evaluation crashed: {e}", file=sys.stderr)
+        return 4
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,193 @@
+# =============================================================================
+# research_config.yaml — VisDrone small object detection
+# -----------------------------------------------------------------------------
+# Single source of configuration for the YOLO research pipeline.
+# Every field below has an inline comment explaining what it does.
+# Fields marked [required] must be set; [optional] can be left as default/null.
+# =============================================================================
+
+meta:
+  config_version: "3.0"            # [required] Schema version. Bump when adding/removing fields.
+  project_name: "visdrone-small-object"  # [required] Used in log lines, git commit messages, summary output.
+  run_tag: null                    # [optional] Custom tag appended to git branch name. null = today's date auto-used.
+
+# -----------------------------------------------------------------------------
+# task — what you're trying to do
+# -----------------------------------------------------------------------------
+task:
+  description: >                   # [required] Free-text task description. Paper finder uses this to build search queries.
+    Detect small objects (pedestrians, vehicles, bicycles) in drone aerial
+    imagery at 1920x1080, with heavy occlusion and long-tail class distribution.
+  task_type: object_detection      # [required] Decides which template to scaffold. Options: object_detection / object_tracking
+  framework: ultralytics-yolo      # [required] Framework family. Currently only ultralytics-yolo supported.
+  domain: aerial_drone             # [optional] Hint for paper finder query generation. e.g. aerial_drone / medical / autonomous / satellite / general
+  detection_targets:               # [optional] Class names being detected. Used in paper finder query generation.
+    - pedestrian
+    - vehicle
+    - bicycle
+  key_challenges:                  # [optional] Difficulties paper finder should target. e.g. small_objects / dense_scene / occlusion / camera_motion / id_switch
+    - small_objects
+    - dense_scene
+    - occlusion
+  reference_baselines:             # [optional] Models that the chosen base model must beat. Used in paper finder Phase 4 base model selection.
+    - YOLOv8
+    - YOLOv11
+    - YOLOv26
+
+# -----------------------------------------------------------------------------
+# paths — where files live
+# -----------------------------------------------------------------------------
+paths:
+  project_root: "."                # [required] Project working directory. Almost always "." (current dir).
+  skills_dir: "~/.claude/skills"   # [required] Where the four skills + shared/ live. Use absolute path; ~ may not be expanded by all callers.
+  pipeline_state: "pipeline_state.json"  # [optional] Where orchestrator stores cross-stage state. Default ok.
+  train_script: "train.py"         # [optional] The script autoresearch iterates on. Default ok.
+  custom_modules_file: "custom_modules.py"  # [optional] Where autoresearch puts paper-extracted module classes.
+  weights_dir: "weights"           # [optional] Where downloaded base model weights are cached.
+  local_papers_dir: null           # [optional] Folder of manually downloaded PDFs for paper finder to scan. null = skip local PDF source.
+  local_datasets_dir: null         # [optional] Folder of pre-converted YOLO datasets to merge into pretrain corpus. null = skip local dataset source.
+  dataset_root: "/data/visdrone"   # [required] Path to your YOLO-format dataset (must contain images/ + labels/ + data.yaml).
+
+# -----------------------------------------------------------------------------
+# evaluation — how to measure model quality
+# -----------------------------------------------------------------------------
+evaluation:
+  tool: ultralytics_val            # [required] Evaluation backend. Options: ultralytics_val / trackeval / pycocotools / custom_script
+
+  ultralytics_val:                 # [required if tool=ultralytics_val] Settings passed to ultralytics model.val(). Skip block if using a different tool.
+    split: val                     # Which dataset split to evaluate on. val / test
+    imgsz: 1920                    # Inference image size. Locked across runs — orchestrator copies this to train.py's IMGSZ.
+    batch: 8                       # Eval batch size. Lower if OOM during val.
+    conf: 0.001                    # Confidence threshold for predictions during eval. Standard COCO value.
+    iou: 0.6                       # IoU threshold for NMS. Standard YOLO value.
+
+  metrics:                         # [required] Defines what autoresearch keeps/discards on, and what's tracked in results.tsv.
+    primary: val_mAP50_95          # The metric autoresearch optimizes. Must have a parsing pattern below.
+    tiebreak: val_mAP50            # When primary changes by less than min_improvement, this is the tie-breaker.
+    secondary: [val_precision, val_recall]  # Tracked in results.tsv but doesn't affect keep/discard.
+    guard:                         # Metrics that, if they degrade beyond tolerance, force discard regardless of primary.
+      num_params_M: 5              # Param count must not grow > 5%. Prevents bloated models that win mAP by adding 50M params.
+    min_improvement: 0.001         # Primary must improve by at least this much (absolute) to be kept.
+    # minimize: []                 # [optional] Metrics where smaller is better (e.g. IDSW for tracking). Default empty.
+
+  parsing:                         # [required] How to extract metrics from train.py's stdout.
+    source: stdout                 # Where metrics live. Options: stdout / json / csv
+    patterns:                      # Regex per metric. First capture group is the value. Must include all metrics referenced above.
+      val_precision: 'val_precision:\s+([\d.]+)'
+      val_recall:    'val_recall:\s+([\d.]+)'
+      val_mAP50:     'val_mAP50:\s+([\d.]+)'
+      val_mAP50_95:  'val_mAP50_95:\s+([\d.]+)'
+      num_params_M:  'Model Summary:.*?([\d.]+)M params'
+
+# -----------------------------------------------------------------------------
+# paper_finder — how to find base model + improvement modules
+# -----------------------------------------------------------------------------
+paper_finder:
+  mode: initial                    # [optional] Always initial on first run. Orchestrator overrides to "expand" when autoresearch stalls.
+  sources:                         # [optional] Which paper sources to query. Disable any you don't have access to.
+    arxiv: true                    # arXiv API (no key required)
+    papers_with_code: true         # Papers with Code API (no key required)
+    semantic_scholar: true         # Semantic Scholar Graph API (no key required, but rate-limited)
+    local_pdfs: true               # Scan paths.local_papers_dir if set
+  search_queries:                  # [required] Seed queries for paper search. Be specific — vague queries return noise.
+    - "small object detection UAV YOLO"
+    - "drone aerial object detection transformer"
+    - "feature pyramid small object"
+  scoring_weights:                 # [optional] Relative importance of paper ranking criteria. Must sum to 100.
+    task_relevance: 40             # Does the abstract mention the same domain/challenge?
+    recency: 20                    # Newer papers score higher (cutoff in recency_cutoff_year below).
+    has_official_code: 20          # Has a public repo (paper2code can use it)?
+    benchmark_result: 20           # Reports results on benchmark_datasets below?
+  recency_cutoff_year: 2022        # [optional] Papers older than this year score 0 on recency.
+  benchmark_datasets:              # [optional] Boost papers that report on these benchmarks.
+    - VisDrone
+    - COCO
+    - DOTA
+  top_n_papers: 20                 # [optional] Keep top N after scoring. Higher = more module candidates, slower.
+  pdf_max_pages: 12                # [optional] Local PDF reader page limit. Abstract+intro+method usually fit in 12 pages.
+  min_repo_stars: 10               # [optional] GitHub repos with fewer stars are ignored when looking for `paper2code: yes (GitHub repo available)`.
+  base_model:                      # [optional] Constraints on the base model paper finder picks.
+    require_weights_or_reconstruct: true   # Either downloadable weights or reconstructable via paper2code; otherwise reject.
+    allow_paper2code_reconstruct: true     # If only paper exists (no weights), reconstruct from arXiv via paper2code.
+  modules:                         # [optional] Constraints on improvement modules paper finder writes to modules.md.
+    max_complexity: high           # Skip modules harder than this. Options: low / medium / high
+    preferred_locations:           # Module insertion points to prioritize. For tracking add: tracker / post_processing
+      - backbone
+      - neck
+      - head
+      - loss
+    max_pending_in_md: 20          # Cap on pending modules in modules.md. Above this, paper finder skips its search and reports.
+
+# -----------------------------------------------------------------------------
+# dataset_hunter — public dataset search + pretrain corpus
+# -----------------------------------------------------------------------------
+dataset_hunter:
+  enabled: true                    # [required] Set to false to skip Stage 2 entirely (no pretrain).
+  sources:                         # [optional] Which dataset sources to query. Disable any you don't have access to.
+    local: true                    # Scan paths.local_datasets_dir if set
+    huggingface: true              # HuggingFace Datasets, tag=object-detection
+    roboflow: false                # Roboflow Universe (requires API key)
+    coco: true                     # Direct COCO 2017 download
+    openimages: true               # OpenImages v7 via openimages CLI
+    papers_with_code: true         # Datasets listed on papers_with_code with direct download URLs
+  credentials:                     # [optional] API tokens. Only needed for sources marked true above.
+    roboflow_api_key: null         # Free at roboflow.com. Required if sources.roboflow=true.
+    huggingface_token: null        # Required only for gated/private HF datasets.
+  disk:                            # [required] Disk space management.
+    budget_gb: 100                 # Hard limit on download size. Dataset hunter checks remaining before each download.
+    output_dir: "pretrain_data"    # Where downloads land. Subdirs: raw/ converted/ merged/.
+  openimages_max_samples: 50000    # [optional] Cap OpenImages download size. Full dataset is ~1.5TB — usually want a subset.
+  val_split_ratio: 0.1             # [optional] When a dataset has no val split, reserve this fraction (deterministic by filename hash).
+  pretrain:                        # [required] Pretrain settings.
+    time_budget_sec: 21600         # How long pretrain may run. Default 21600 = 6 hours.
+    eval_time_budget_sec: 1800     # How long each self-eval finetune may run (one for baseline, one for pretrained). Default 1800 = 30 min each.
+    improvement_threshold: 0.002   # Pretrained must beat baseline by this much (absolute) to recommend use_pretrained.
+    skip_if_corpus_empty: true     # If all downloads failed and corpus is empty, skip pretrain rather than crash.
+    batch_size: null               # null = inherit from train.py. Override only if pretrain OOMs.
+    # eval_metric: val_mAP50_95    # [optional] Metric used for pretrain self-eval. Default val_mAP50_95 — independent of evaluation.metrics.primary.
+
+# -----------------------------------------------------------------------------
+# autoresearch — the experiment loop
+# -----------------------------------------------------------------------------
+autoresearch:
+  loop:                            # [required] Per-iteration settings.
+    time_budget_sec: 1200          # Wall-clock per experiment. Locked across runs to keep results comparable. Default 1200 = 20 min.
+    max_runtime_multiplier: 2      # If a run exceeds time_budget_sec * this, kill it as crashed. Default 2.
+    iterations: null               # null = loop forever until interrupted. Set integer for bounded run.
+    seed: 42                       # Random seed. Locked across runs for reproducibility.
+  stall:                           # [optional] When to escalate after no-improvement streaks.
+    threshold: 10                  # Consecutive non-improving rounds before triggering paper_finder expand.
+    force_test_reset: 5            # When stall hits threshold AND modules.md has pending entries, reset stall to this and force-test next pending module.
+  module_priority:                 # [optional] Order autoresearch picks experiment types. Lower index = tried first.
+    - modules_md_pending           # A: paper-backed modules from modules.md
+    - zero_param_changes           # B: hyperparameters, LR, augmentation (no param count change)
+    - replacement_changes          # C: swap one block for another of similar size
+    - additive_changes             # D: add new block (param count grows)
+    - combinations                 # E: combine 2-3 previously-kept changes
+
+# -----------------------------------------------------------------------------
+# orchestrator — pipeline-level control
+# -----------------------------------------------------------------------------
+orchestrator:
+  auto_advance: true               # [required] Move between stages without asking. Setting false defeats the autonomous design.
+  resume_from_state: true          # [required] On restart, read pipeline_state.json and resume from the recorded stage.
+  optional_pretrain_trigger:       # [optional] Auto-trigger pretrain mid-autoresearch if first stage skipped pretrain and the loop stalls.
+    enabled: true                  # Set false to disable mid-run pretrain entirely.
+    min_autoresearch_loops: 5      # Don't trigger before this many loops have run.
+    stalled_loops_required: 5      # Trigger after this many consecutive no-improvement loops.
+  error_policy:                    # [optional] How to handle expected failures.
+    paper_finder_retries: 1        # Retry paper finder this many times before falling back to default base model.
+    autoresearch_crash_pause_after: 3  # After this many consecutive crashes, halve BATCH_SIZE and continue (does NOT pause for user input).
+  git:                             # [optional] Git automation.
+    auto_init: true                # Run `git init` if project isn't a repo. Required for autoresearch's commit/revert flow.
+    branch_prefix: "autoresearch/" # All experiment commits go on a branch named <prefix><run_tag>.
+
+# -----------------------------------------------------------------------------
+# advanced — output filenames, rarely changed
+# -----------------------------------------------------------------------------
+advanced:
+  results_tsv: "results.tsv"       # [optional] One row per experiment loop. Header is dynamic based on evaluation.metrics.
+  hunt_log_tsv: "hunt_log.tsv"     # [optional] Dataset hunter download log. Internal — not read by other skills.
+  modules_md: "modules.md"         # [optional] Module registry written by paper finder, consumed by autoresearch.
+  base_model_md: "base_model.md"   # [optional] Base model selection written by paper finder.
+  pretrain_ckpt_dir: "pretrain_ckpt"  # [optional] Where pretrain.py writes checkpoints.

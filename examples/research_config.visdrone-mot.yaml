@@ -1,0 +1,204 @@
+# =============================================================================
+# research_config.yaml — VisDrone multi-object tracking (MOT)
+# -----------------------------------------------------------------------------
+# Tracking-task version. Differences from detection version are highlighted
+# inline with [tracking-only] tags.
+# =============================================================================
+
+meta:
+  config_version: "3.0"            # [required] Schema version.
+  project_name: "visdrone-mot"     # [required] Used in log lines and git commit messages.
+  run_tag: null                    # [optional] Custom tag. null = today's date auto-used.
+
+# -----------------------------------------------------------------------------
+# task
+# -----------------------------------------------------------------------------
+task:
+  description: >                   # [required] Free-text. Paper finder builds search queries from this.
+    Multi-object tracking (MOT) for pedestrians, vehicles, and bicycles
+    in drone aerial video (VisDrone-MOT). Handle frequent occlusion,
+    small object scale, camera motion, and dense crowded scenes.
+  task_type: object_tracking       # [required] [tracking-only] Triggers scaffolding of train.py + track.py (vs detection: train.py only).
+  framework: ultralytics-yolo      # [required] Currently only ultralytics-yolo supported.
+  domain: aerial_drone             # [optional] Hint for paper finder query generation.
+  detection_targets:               # [optional] Class names. Used in paper finder query generation.
+    - pedestrian
+    - vehicle
+    - bicycle
+  key_challenges:                  # [optional] Difficulties paper finder should target. Tracking adds: camera_motion / id_switch
+    - small_objects
+    - dense_scene
+    - occlusion
+    - camera_motion                # [tracking-only]
+    - id_switch                    # [tracking-only]
+  reference_baselines:             # [optional] [tracking-only] Trackers (not detectors) the chosen base must beat.
+    - BoT-SORT
+    - ByteTrack
+    - StrongSORT
+
+# -----------------------------------------------------------------------------
+# paths
+# -----------------------------------------------------------------------------
+paths:
+  project_root: "."                # [required] Project working directory.
+  skills_dir: "~/.claude/skills"   # [required] Where the skills + shared/ live.
+  pipeline_state: "pipeline_state.json"  # [optional] Default ok.
+  train_script: "train.py"         # [optional] [tracking-only] Note: also creates track.py automatically. Default ok.
+  custom_modules_file: "custom_modules.py"
+  weights_dir: "weights"
+  local_papers_dir: null           # [optional] Folder of manually downloaded PDFs. null = skip.
+  local_datasets_dir: null         # [optional] Folder of pre-converted YOLO datasets. null = skip.
+  dataset_root: "/data/visdrone-mot"  # [required] [tracking-only] Path to MOT-format dataset (frame folders + annotations/).
+
+# -----------------------------------------------------------------------------
+# evaluation
+# -----------------------------------------------------------------------------
+evaluation:
+  tool: trackeval                  # [required] [tracking-only] TrackEval for HOTA/MOTA/IDF1. Detection uses ultralytics_val.
+
+  trackeval:                       # [required if tool=trackeval] [tracking-only] TrackEval-specific config.
+    install_cmd: "pip install git+https://github.com/JonathonLuiten/TrackEval.git"  # Run if not already installed.
+    gt_format: visdrone            # GT format. Options: visdrone / mot_challenge
+    tracker_output_format: mot_challenge  # Format track.py writes predictions in. Almost always mot_challenge.
+    gt_dir: "/data/visdrone-mot/annotations"  # Where ground-truth files live for TrackEval to compare against.
+    benchmark: VisDrone            # Benchmark name TrackEval uses internally for paths.
+    split: val                     # Which split to evaluate on.
+
+  metrics:                         # [required] What autoresearch keeps/discards on, plus what's tracked.
+    primary: HOTA                  # [tracking-only] HOTA is the standard tracking primary. Detection uses val_mAP50_95.
+    tiebreak: MOTA                 # [tracking-only] When HOTA is tied, MOTA breaks tie.
+    secondary: [IDF1, IDSW]        # [tracking-only] Tracked but not deciding. IDSW = ID switches.
+    guard:                         # Constraints that force discard if violated.
+      num_params_M: 5              # Param count must not grow > 5%.
+      FPS: 20                      # [tracking-only] FPS must not drop > 20% — relevant for tracking real-time use.
+    min_improvement: 0.005         # HOTA must improve by at least this. Larger than detection (0.001) because HOTA is on a coarser scale.
+    minimize: [IDSW]               # [tracking-only] IDSW (ID switches) is "smaller is better". Critical for direction-aware comparisons.
+
+  parsing:                         # [required] How to extract metrics from run.log.
+    source: stdout                 # Options: stdout / json / csv
+    patterns:                      # [tracking-only] track.py reformats TrackEval table into canonical key:value lines, then we regex those.
+      HOTA: 'HOTA:\s+([\d.]+)'
+      MOTA: 'MOTA:\s+([\d.]+)'
+      IDF1: 'IDF1:\s+([\d.]+)'
+      IDSW: 'IDSW:\s+(\d+)'
+      FPS:  '([\d.]+)\s*FPS'
+      val_mAP50_95: 'val_mAP50_95:\s+([\d.]+)'  # [tracking-only] Required for dataset hunter's self-eval (always uses detection mAP, regardless of task_type).
+      num_params_M: 'Model Summary:.*?([\d.]+)M params'
+
+# -----------------------------------------------------------------------------
+# paper_finder
+# -----------------------------------------------------------------------------
+paper_finder:
+  mode: initial                    # [optional] Always initial on first run. Orchestrator overrides to "expand" on stall.
+  sources:                         # [optional] Which paper sources to query.
+    arxiv: true
+    papers_with_code: true
+    semantic_scholar: true
+    local_pdfs: true
+  search_queries:                  # [required] [tracking-only] Tracking-focused queries.
+    - "multi object tracking UAV drone"
+    - "aerial video object tracking YOLO"
+    - "small object tracking attention"
+    - "MOT camera motion compensation"
+    - "ByteTrack BoT-SORT improvement"
+  scoring_weights:                 # [optional] Must sum to 100.
+    task_relevance: 40
+    recency: 20
+    has_official_code: 20
+    benchmark_result: 20
+  recency_cutoff_year: 2022        # [optional] Papers older than this score 0 on recency.
+  benchmark_datasets:              # [optional] [tracking-only] Tracking benchmarks.
+    - VisDrone-MOT
+    - MOT17
+    - MOT20
+    - DanceTrack
+  top_n_papers: 20
+  pdf_max_pages: 12
+  min_repo_stars: 10
+  base_model:
+    require_weights_or_reconstruct: true
+    allow_paper2code_reconstruct: true
+  modules:
+    max_complexity: high           # Options: low / medium / high
+    preferred_locations:           # [tracking-only] Includes tracker/post_processing for tracker-layer modules.
+      - backbone
+      - neck
+      - head
+      - tracker                    # [tracking-only] e.g. CMC, Kalman variants
+      - post_processing            # [tracking-only] e.g. Global Link, re-ID
+      - loss
+    max_pending_in_md: 20
+
+# -----------------------------------------------------------------------------
+# dataset_hunter
+# -----------------------------------------------------------------------------
+dataset_hunter:
+  enabled: true                    # [required] Set false to skip Stage 2.
+  sources:                         # [optional] Note: dataset hunter searches DETECTION datasets even for tracking, because it measures detector quality only.
+    local: true
+    huggingface: true
+    roboflow: false
+    coco: true
+    openimages: true
+    papers_with_code: true
+  credentials:
+    roboflow_api_key: null         # Required if sources.roboflow=true.
+    huggingface_token: null        # Required only for gated datasets.
+  disk:
+    budget_gb: 100                 # Hard limit on download size.
+    output_dir: "pretrain_data"
+  openimages_max_samples: 50000
+  val_split_ratio: 0.1
+  pretrain:
+    time_budget_sec: 21600         # 6 hours pretrain.
+    eval_time_budget_sec: 1800     # 30 min × 2 finetune jobs for self-eval.
+    improvement_threshold: 0.002   # Pretrained must beat baseline by this absolute margin.
+    skip_if_corpus_empty: true
+    batch_size: null               # null = inherit from train.py.
+    # eval_metric: val_mAP50_95    # [optional] Pretrain self-eval always uses detection mAP, regardless of task_type. Default val_mAP50_95.
+
+# -----------------------------------------------------------------------------
+# autoresearch
+# -----------------------------------------------------------------------------
+autoresearch:
+  loop:
+    time_budget_sec: 1200          # 20 min per experiment. Locked across runs.
+    max_runtime_multiplier: 2      # Kill as crashed if exceeds budget × this.
+    iterations: null               # null = run forever until interrupted.
+    seed: 42                       # Locked across runs.
+  stall:
+    threshold: 10                  # Consecutive no-improvement rounds before triggering paper finder expand.
+    force_test_reset: 5            # When stalled with pending modules, reset stall to this and force-test next pending.
+  module_priority:                 # Order autoresearch picks experiment types.
+    - modules_md_pending
+    - zero_param_changes
+    - replacement_changes
+    - additive_changes
+    - combinations
+
+# -----------------------------------------------------------------------------
+# orchestrator
+# -----------------------------------------------------------------------------
+orchestrator:
+  auto_advance: true
+  resume_from_state: true
+  optional_pretrain_trigger:
+    enabled: true
+    min_autoresearch_loops: 5
+    stalled_loops_required: 5
+  error_policy:
+    paper_finder_retries: 1
+    autoresearch_crash_pause_after: 3  # After this many consecutive crashes, halve BATCH_SIZE and continue (does not pause for user).
+  git:
+    auto_init: true
+    branch_prefix: "autoresearch/"
+
+# -----------------------------------------------------------------------------
+# advanced
+# -----------------------------------------------------------------------------
+advanced:
+  results_tsv: "results.tsv"       # One row per experiment. Header is dynamic.
+  hunt_log_tsv: "hunt_log.tsv"
+  modules_md: "modules.md"
+  base_model_md: "base_model.md"
+  pretrain_ckpt_dir: "pretrain_ckpt"

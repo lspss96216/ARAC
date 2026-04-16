@@ -1,0 +1,202 @@
+"""
+track.py.tracking — tracker + TrackEval half of task_type: object_tracking
+
+Reads the detector checkpoint from `run.log` (sentinel line `trained_weights: ...`
+emitted by train.py), runs a tracker on the val split, and invokes TrackEval
+to compute HOTA / MOTA / IDF1 / IDSW.
+
+Output is appended to run.log so a single evaluation.parsing config can
+extract metrics from one file across both scripts.
+
+Run (after train.py):
+    uv run track.py >> run.log 2>&1
+"""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section ① — Imports and constants
+# ═══════════════════════════════════════════════════════════════════════════════
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from ultralytics import YOLO
+
+try:
+    from custom_modules import *       # noqa: F401,F403
+except ImportError:
+    pass
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section ② — Tunables (the contract surface)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Locked by orchestrator (shared with train.py — kept in sync by orchestrator).
+SEED        = 42
+# TIME_BUDGET is not used in track.py (inference + eval are typically much
+# shorter than training), but kept here to match the spec shape.
+TIME_BUDGET = 1200
+IMGSZ       = 1920      # locked; must match train.py's IMGSZ
+
+# Tracker config.
+TRACKER_CONFIG = "tracker.yaml"        # BoT-SORT / ByteTrack base config
+VAL_SEQUENCES  = "data/val_sequences"  # dir of video folders with frames
+GT_DIR         = "data/val_gt"         # TrackEval-format ground truth
+BENCHMARK      = "VisDrone"
+TRACKER_OUT    = Path("runs/track/predictions")
+
+# Tracker-layer module toggles — autoresearch flips and appends these.
+# Each toggle maps to a branch inside apply_tracker_modules() below.
+USE_CMC              = False
+USE_NSA_KALMAN       = False
+USE_GLOBAL_LINK      = False
+USE_APPEARANCE_REID  = False
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section ③ — apply_tracker_modules hook
+# ═══════════════════════════════════════════════════════════════════════════════
+def apply_tracker_modules(tracker_cfg: dict) -> dict:
+    """Mutate tracker config based on USE_* flags. Idempotent when flags are False.
+
+    Parallel to train.py's inject_modules, but operates on tracker config dict
+    rather than the detector model.
+    """
+    if USE_CMC:
+        tracker_cfg["cmc"] = "ecc"
+    if USE_NSA_KALMAN:
+        tracker_cfg["kalman"] = "nsa"
+    if USE_GLOBAL_LINK:
+        tracker_cfg["post_processing"] = "global_link"
+    if USE_APPEARANCE_REID:
+        tracker_cfg["with_reid"] = True
+    return tracker_cfg
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Section ④ — Main (inference + TrackEval)
+# ═══════════════════════════════════════════════════════════════════════════════
+def read_trained_weights_from_log(log_path: str = "run.log") -> str:
+    """Read `trained_weights: <path>` sentinel written by train.py."""
+    text = Path(log_path).read_text(errors="ignore") if Path(log_path).exists() else ""
+    m = re.search(r"^trained_weights:\s+(\S+)", text, flags=re.MULTILINE)
+    if not m:
+        raise RuntimeError(
+            "Could not find `trained_weights: ...` in run.log. "
+            "track.py must run after train.py."
+        )
+    return m.group(1)
+
+
+def run_tracker(weights: str) -> int:
+    """Run detector + tracker on every val sequence; write MOT-challenge-format
+    predictions to TRACKER_OUT. Return total number of frames processed."""
+    import yaml as _yaml
+    tracker_cfg = _yaml.safe_load(Path(TRACKER_CONFIG).read_text())
+    tracker_cfg = apply_tracker_modules(tracker_cfg)
+
+    patched_cfg = TRACKER_OUT.parent / "tracker.patched.yaml"
+    patched_cfg.parent.mkdir(parents=True, exist_ok=True)
+    patched_cfg.write_text(_yaml.safe_dump(tracker_cfg))
+
+    model = YOLO(weights)
+    TRACKER_OUT.mkdir(parents=True, exist_ok=True)
+
+    frames_total = 0
+    fps_samples = []
+    for seq_dir in sorted(Path(VAL_SEQUENCES).iterdir()):
+        if not seq_dir.is_dir():
+            continue
+        t0 = time.time()
+        results = model.track(
+            source=str(seq_dir),
+            tracker=str(patched_cfg),
+            imgsz=IMGSZ,
+            stream=True,
+            verbose=False,
+        )
+        out_txt = TRACKER_OUT / f"{seq_dir.name}.txt"
+        with out_txt.open("w") as f:
+            for frame_idx, r in enumerate(results, start=1):
+                if r.boxes is None or r.boxes.id is None:
+                    continue
+                for box, tid, cls in zip(r.boxes.xywh.cpu().numpy(),
+                                         r.boxes.id.int().cpu().numpy(),
+                                         r.boxes.cls.int().cpu().numpy()):
+                    x, y, w, h = box
+                    # MOT-challenge format: frame,id,x,y,w,h,conf,cls,vis
+                    f.write(f"{frame_idx},{tid},{x - w/2:.2f},{y - h/2:.2f},"
+                            f"{w:.2f},{h:.2f},1,{cls},1\n")
+                    frames_total += 1
+        elapsed = max(time.time() - t0, 1e-6)
+        fps_samples.append(frames_total / elapsed)
+
+    avg_fps = sum(fps_samples) / len(fps_samples) if fps_samples else 0.0
+    print(f"tracker_frames:   {frames_total}")
+    print(f"{avg_fps:.1f} FPS")
+    return frames_total
+
+
+def run_trackeval() -> None:
+    """Invoke TrackEval, capture its table output, and re-emit canonical
+    `<metric>: <value>` lines so evaluation.parsing.patterns has a stable
+    format to match (rather than TrackEval's position-dependent columns)."""
+    cmd = [
+        sys.executable, "-m", "trackeval.scripts.run_mot_challenge",
+        "--BENCHMARK", BENCHMARK,
+        "--GT_FOLDER", GT_DIR,
+        "--TRACKERS_FOLDER", str(TRACKER_OUT.parent),
+        "--USE_PARALLEL", "False",
+        "--METRICS", "HOTA", "CLEAR", "Identity",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    raw = proc.stdout + "\n" + proc.stderr
+    print(raw)                                      # preserve full log for debugging
+
+    # TrackEval prints a column table like:
+    #   HOTA  DetA  AssA  MOTA  IDF1  IDSW
+    #   COMBINED 0.412 0.385 0.441 0.587 0.612 342
+    # Find the COMBINED row and pair values with the preceding header row.
+    lines = raw.splitlines()
+    header, values = None, None
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("COMBINED"):
+            values = line.split()[1:]
+            # Walk backwards to the nearest header row containing "HOTA"
+            for j in range(i - 1, -1, -1):
+                if "HOTA" in lines[j]:
+                    header = lines[j].split()
+                    break
+            break
+
+    if header and values and len(header) == len(values):
+        for k, v in zip(header, values):
+            # Emit canonical key: value lines — what evaluation.parsing.patterns matches.
+            print(f"{k}: {v}")
+    else:
+        print("WARN: could not parse TrackEval COMBINED row — "
+              "autoresearch will see None for tracking metrics.", file=sys.stderr)
+
+
+def main() -> int:
+    try:
+        weights = read_trained_weights_from_log()
+    except RuntimeError as e:
+        print(f"FATAL: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        run_tracker(weights)
+    except Exception as e:
+        print(f"FATAL: tracker inference crashed: {e}", file=sys.stderr)
+        return 2
+
+    try:
+        run_trackeval()
+    except Exception as e:
+        print(f"FATAL: TrackEval crashed: {e}", file=sys.stderr)
+        return 3
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
