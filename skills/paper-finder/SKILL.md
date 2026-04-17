@@ -1,7 +1,7 @@
 ---
 name: paper finder
 description: >
-  Autonomous research skill for YOLO / object detection model improvement. Given a task
+  Autonomous research skill for model improvement. Given a task
   description, searches academic sources (arXiv, Papers with Code, Semantic Scholar) to find
   the best base model and collect improvement modules from related papers. Writes findings to
   modules.md for use by autoresearch and paper2code. Also handles the feedback loop when
@@ -15,7 +15,7 @@ description: >
 
 Searches academic sources to find (1) the best base model for the task, and (2) improvement
 modules from related papers. Outputs are written to `modules.md` for downstream use by
-`autoresearch for yolo` and `paper2code`.
+`autoresearch` and `paper2code`.
 
 Shared files produced by this skill (`base_model.md`, `modules.md`) have their
 schemas documented in `<skills_dir>/shared/file-contracts.md` — read it once
@@ -79,6 +79,53 @@ curl "https://paperswithcode.com/api/v1/papers/?q=<query>&page=1" \
 
 Focus on papers with associated code repos and benchmark results on relevant datasets
 (VisDrone, COCO, DOTA, etc.).
+
+#### Deep scrape via Firecrawl (optional enhancement)
+
+The PwC JSON API returns basic metadata (title, abstract, URL) but misses
+repo README details, exact benchmark numbers, and pretrained weights links.
+If `firecrawl` CLI is installed, scrape each paper's PwC page to extract richer
+data:
+
+```bash
+# Check if firecrawl is available
+if command -v firecrawl &>/dev/null; then
+    for paper_url in $PwC_PAPER_URLS; do
+        slug=$(echo "$paper_url" | grep -oE '[^/]+$')
+        firecrawl scrape "$paper_url" -o ".firecrawl/pwc-${slug}.md" 2>/dev/null
+    done
+fi
+```
+
+From the scraped markdown, extract:
+- **GitHub repo URL**: look for `github.com` links in the "Code" section
+- **Benchmark table rows**: look for markdown tables with mAP / HOTA / MOTA columns
+- **Pretrained weights URL**: look for links ending in `.pt` / `.pth` / `.ckpt`
+
+```python
+import pathlib, re
+
+def extract_pwc_details(scraped_md: str) -> dict:
+    """Extract structured data from a Firecrawl-scraped PwC page."""
+    details = {"repo_url": None, "benchmarks": [], "weights_urls": []}
+    # GitHub repo
+    m = re.search(r'(https?://github\.com/[\w-]+/[\w.-]+)', scraped_md)
+    if m: details["repo_url"] = m.group(1)
+    # Weights links
+    details["weights_urls"] = re.findall(
+        r'(https?://\S+\.(?:pt|pth|ckpt|safetensors))', scraped_md)
+    # Benchmark numbers (mAP, HOTA, etc.)
+    for line in scraped_md.splitlines():
+        if re.search(r'\b(?:mAP|HOTA|MOTA|AP50)\b', line) and '|' in line:
+            details["benchmarks"].append(line.strip())
+    return details
+```
+
+If Firecrawl is not installed, the pipeline falls back to the JSON API alone —
+no data is lost, just less detail available for scoring. Install with:
+`npm install -g firecrawl` + set `FIRECRAWL_API_KEY` in `.env` (see
+orchestrator Stage 0 Step 1.5). The CLI reads the key from `os.environ`
+automatically.
 
 ### Semantic Scholar
 
@@ -189,6 +236,39 @@ A paper qualifies as a base model candidate if:
 
 Select the single highest-scoring candidate as base model.
 
+#### Validate weights URL via Firecrawl (optional)
+
+Before writing the weights URL to `base_model.md`, verify the link is alive.
+Dead links cause orchestrator Stage 2 to `wget` a 404 and silently fall back
+to `yolo26x.pt`, wasting the entire base model selection.
+
+```python
+import subprocess, shutil
+
+def validate_weights_url(url: str) -> bool:
+    """Check if a weights URL is reachable. Uses firecrawl if available,
+    falls back to curl HEAD request."""
+    if not url or url == "reconstruct via paper2code":
+        return True   # paper2code path — no URL to check
+
+    if shutil.which("firecrawl"):
+        # Firecrawl scrape returns non-zero on unreachable pages
+        r = subprocess.run(["firecrawl", "scrape", url, "--format", "links"],
+                           capture_output=True, text=True, timeout=30)
+        return r.returncode == 0
+    else:
+        # Fallback: curl HEAD
+        r = subprocess.run(["curl", "-sI", "-o", "/dev/null", "-w", "%{http_code}", url],
+                           capture_output=True, text=True, timeout=15)
+        return r.stdout.strip().startswith("2")
+
+# After selecting the base model, before writing base_model.md:
+if not validate_weights_url(weights_url):
+    log_discovery(f"Base model {model_name}: weights URL {weights_url} is dead. "
+                  f"Falling back to runner-up.", loop=0, category="bug_workaround")
+    # Try runner-up's weights URL; if also dead, use "reconstruct via paper2code"
+```
+
 Write to `base_model.md`. The file is read by orchestrator Stage 2 (extracts
 `Weights URL`) and by dataset hunter Phase 5 (fallback path when orchestrator
 did not pre-resolve). The contract — which fields those consumers need and how
@@ -214,7 +294,7 @@ they parse — is in `<skills_dir>/shared/file-contracts.md § base_model.md`.
 ## Phase 5 — Collect improvement modules
 
 From the remaining top papers (excluding the base model paper), extract modular techniques
-that can be plugged into an existing YOLO backbone, neck, head, or loss.
+that can be plugged into an existing backbone, neck, head, or loss.
 
 For each module, determine:
 - **Location**: where it inserts (backbone / neck / head / loss / label assignment)

@@ -183,6 +183,38 @@ def inject_modules(model) -> model
   ablation logic because flipping the flag off no longer actually turns the
   module off.
 
+### Injection technique: replace, don't wrap
+
+**Never monkey-patch `model.forward()` or wrap layers with decorators.**
+Ultralytics saves checkpoints by serializing model state dicts. Monkey-patched
+forward methods and wrapper objects are not part of the state dict, so their
+weights are lost on checkpoint save/load. An experiment that "works" during
+training but whose weights vanish on reload is a false positive.
+
+Instead, **replace the target layer** with a new `nn.Module` subclass:
+
+```python
+# WRONG — monkey-patch (weights not saved)
+original_forward = model.model[6].forward
+def patched_forward(x):
+    return my_attention(original_forward(x))
+model.model[6].forward = patched_forward
+
+# RIGHT — subclass replacement (weights saved with checkpoint)
+class EnhancedBlock(nn.Module):
+    def __init__(self, original_block):
+        super().__init__()
+        self.block = original_block
+        self.attention = MyAttention(channels=original_block.out_channels)
+    def forward(self, x):
+        return self.attention(self.block(x))
+
+model.model[6] = EnhancedBlock(model.model[6])
+```
+
+The subclass approach makes the new parameters part of `model.parameters()`,
+so they appear in the state dict and survive checkpoint round-trips.
+
 Tracker-layer modules (CMC, NSA Kalman, re-ID) do **not** go through
 `inject_modules()` — they live in the tracker config and are applied by
 `track.py`. `inject_modules` is strictly for detector surgery (backbone / neck /
@@ -278,9 +310,9 @@ command) apply universally.
 │       ├── train.py.tracking       # detector-training half of tracking
 │       └── track.py.tracking       # tracker + TrackEval half
 ├── paper-finder/
-├── autoresearch-for-yolo/
-├── yolo-research-orchestrator/
-└── dataset-hunter-for-yolo/
+├── autoresearch/
+├── research-orchestrator/
+└── dataset-hunter/
 ```
 
 Each skill reads this spec when it touches `train.py`. The orchestrator

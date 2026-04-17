@@ -197,3 +197,41 @@ inside the template before emission — see
 Written by dataset hunter, not currently read by any other skill. Internal log.
 Format defined in dataset hunter SKILL.md § Phase 1 Step 4 — not part of the
 cross-skill contract and may change.
+
+---
+
+## `discoveries.md`
+
+Written by autoresearch during the loop. Read by orchestrator at Stage 4
+(printed in the final summary). Designed to absorb observations that would
+otherwise cause the agent to stop and talk to the user.
+
+Format is append-only markdown:
+
+```markdown
+# Discoveries
+
+Observations from the experiment loop. User reads these after the run.
+
+---
+
+## Loop 3 — observation
+
+2026-04-15T14:23:00
+
+At imgsz=1280, TIME_BUDGET=1200s yields ~5 epochs. Relative comparison is
+still valid but convergence is limited.
+
+## Loop 7 — bug_workaround
+
+2026-04-15T15:10:00
+
+Monkey-patching model.forward() causes injected module weights to not persist
+in checkpoint. Switched to subclass-based injection.
+```
+
+Categories: `observation` / `limitation` / `strategy_shift` / `bug_workaround`
+
+This file has no schema enforcement — it is human-readable notes, not
+machine-parsed state. The only contract is: autoresearch appends to it,
+orchestrator reads and prints it.

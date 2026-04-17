@@ -141,9 +141,9 @@ dataset_hunter:
     coco: true
     openimages: true
     papers_with_code: true
-  credentials:
-    roboflow_api_key: null         # Required if sources.roboflow=true.
-    huggingface_token: null        # Required only for gated datasets.
+  # credentials:
+  # API keys live in `.env`, not here. See orchestrator Stage 0 Step 1.5.
+  #   ROBOFLOW_API_KEY=...    FIRECRAWL_API_KEY=fc-...    HF_TOKEN=hf_...
   disk:
     budget_gb: 100                 # Hard limit on download size.
     output_dir: "pretrain_data"

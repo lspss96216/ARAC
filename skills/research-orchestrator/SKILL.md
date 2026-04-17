@@ -1,14 +1,14 @@
 ---
-name: yolo research orchestrator
+name: research orchestrator
 description: >
-  Master controller for the autonomous YOLO object detection research pipeline.
-  Coordinates paper finder, dataset hunter for yolo, and autoresearch for yolo in sequence,
+  Master controller for the autonomous research pipeline.
+  Coordinates paper finder, dataset hunter, and autoresearch in sequence,
   passing outputs between them automatically. Trigger when the user wants to start the full
   research pipeline end-to-end, or says "start the pipeline", "run the full experiment",
   "start from scratch", or provides a task description and dataset.
 ---
 
-# YOLO Research Orchestrator
+# Research Orchestrator
 
 Single entry point for the full autonomous research pipeline. You read this skill once,
 then drive the entire workflow — invoking each sub-skill in order, passing their outputs
@@ -26,7 +26,9 @@ skill expects to read.
 ## How sub-skills are invoked
 
 Each sub-skill lives in `<skills_dir>/<n>/SKILL.md`.
-Read `skills_dir` from `pipeline_state.json` (default: `~/.claude/skills`).
+On first run, `skills_dir` comes from `research_config.yaml → paths.skills_dir`.
+On resume, read it from `pipeline_state.json` (which was populated from the yaml
+at Stage 0 Step 2). Fallback: `~/.claude/skills`.
 
 To invoke a sub-skill:
 1. Read its SKILL.md with the `view` tool or `cat`
@@ -36,8 +38,8 @@ To invoke a sub-skill:
 ```bash
 SKILLS_DIR=$(python3 -c "import json; print(json.load(open('pipeline_state.json'))['skills_dir'])" 2>/dev/null || echo "$HOME/.claude/skills")
 cat $SKILLS_DIR/paper-finder/SKILL.md
-cat $SKILLS_DIR/dataset-hunter-for-yolo/SKILL.md
-cat $SKILLS_DIR/autoresearch-for-yolo/SKILL.md
+cat $SKILLS_DIR/dataset-hunter/SKILL.md
+cat $SKILLS_DIR/autoresearch/SKILL.md
 ```
 
 ---
@@ -109,6 +111,47 @@ Read this file at startup to resume a partially completed pipeline.
      Do not ask the user for fields interactively — the yaml is the single source
      of configuration. Without it, the pipeline cannot start.
 
+1.5. **Load `.env` for API keys.** Secrets (API keys, tokens) live in a `.env`
+   file in the project root, NOT in `research_config.yaml` (which may be
+   committed to git). Load it before state init:
+
+   ```python
+   import pathlib, os
+
+   env_path = pathlib.Path(".env")
+   if env_path.exists():
+       for line in env_path.read_text().splitlines():
+           line = line.strip()
+           if not line or line.startswith("#") or "=" not in line:
+               continue
+           key, _, value = line.partition("=")
+           key = key.strip()
+           value = value.strip().strip("'\"")   # strip optional quotes
+           os.environ.setdefault(key, value)     # don't override existing env vars
+   ```
+
+   Expected `.env` fields (all optional — features degrade gracefully without them):
+
+   ```bash
+   # .env — API keys for the research pipeline
+   # This file is gitignored. Never commit secrets to the repo.
+
+   FIRECRAWL_API_KEY=fc-...       # Enables deep scrape of PwC pages + weights URL validation.
+                                   # Free 500 credits/month at firecrawl.dev. Without it,
+                                   # paper finder uses JSON API only; dataset hunter Source 5
+                                   # skips non-direct-download datasets.
+
+   ROBOFLOW_API_KEY=...           # Enables Roboflow Universe dataset downloads.
+                                   # Free at roboflow.com. Without it, Source 2 is skipped.
+
+   HF_TOKEN=hf_...                # Enables access to gated HuggingFace datasets.
+                                   # Without it, only public datasets are downloadable.
+   ```
+
+   Skills access keys via `os.environ.get("FIRECRAWL_API_KEY")` — never from
+   `pipeline_state.json` or `research_config.yaml`. This keeps secrets out of
+   state files that might be shared or accidentally committed.
+
 2. Check if `pipeline_state.json` exists:
    - **Exists** → read it, print current stage, resume from that stage
    - **Does not exist** → create from yaml values:
@@ -172,7 +215,9 @@ Read this file at startup to resume a partially completed pipeline.
        # dataset hunter
        "dataset_hunter_enabled": dh.get("enabled", True),
        "disk_budget_gb":        dh.get("disk", {}).get("budget_gb", 100),
-       "roboflow_api_key":      dh.get("credentials", {}).get("roboflow_api_key"),
+       # API keys are read from os.environ at runtime, NOT stored in state.
+       # See Stage 0 Step 1.5 for .env loading. Skills access them via
+       # os.environ.get("ROBOFLOW_API_KEY") etc.
        # autoresearch behaviour (metric-related values now come from evaluation)
        "stall_threshold":       ar.get("stall", {}).get("threshold", 10),
        "improvement_threshold": MIN_IMPROVE,              # from evaluation.metrics.min_improvement
@@ -200,7 +245,7 @@ Read this file at startup to resume a partially completed pipeline.
 3. Verify skill files exist (using `skills_dir` from pipeline state, default: `~/.claude/skills`):
    ```bash
    SKILLS_DIR=$(python3 -c "import json; print(json.load(open('pipeline_state.json'))['skills_dir'])")
-   for s in paper-finder dataset-hunter-for-yolo autoresearch-for-yolo; do
+   for s in paper-finder dataset-hunter autoresearch; do
      [ -f "$SKILLS_DIR/$s/SKILL.md" ] && echo "OK: $s" || echo "MISSING: $s"
    done
    ```
@@ -210,11 +255,19 @@ Read this file at startup to resume a partially completed pipeline.
    # e.g. unzip paper-finder.skill -d ~/.claude/skills/paper-finder
    ```
 
-4. Verify paper2code is available:
+4. Verify paper2code is available (optional but recommended):
    ```bash
    [ -f "$SKILLS_DIR/paper2code/SKILL.md" ] && echo "OK: paper2code" \
-     || echo "MISSING: run: npx skills add PrathamLearnsToCode/paper2code/skills/paper2code"
+     || echo "OPTIONAL: paper2code not installed. Modules with paper2code: yes will use GitHub clone fallback."
    ```
+   paper2code converts arXiv papers to code. Without it, autoresearch handles
+   modules by:
+   - `paper2code: yes (GitHub repo available)` → clone the repo directly
+   - `paper2code: yes` (no repo) → Claude writes the module code from the paper's
+     description in `modules.md`. Quality varies — log any concerns to `discoveries.md`
+   - `paper2code: no` → same as above
+
+   Install if desired: `npx skills add PrathamLearnsToCode/paper2code/skills/paper2code`
 
 5. Initialise git if needed:
    ```bash
@@ -338,7 +391,7 @@ or abort Stage 2 because it is taking a long time.** The only valid reasons
 to skip pretrain are: (a) corpus is empty after all downloads, or (b) the
 user set `dataset_hunter.enabled: false` in the yaml.
 
-1. Read `$SKILLS_DIR/dataset-hunter-for-yolo/SKILL.md`
+1. Read `$SKILLS_DIR/dataset-hunter/SKILL.md`
 2. Pass from pipeline state: disk budget, Roboflow API key, pretrain TIME_BUDGET, `local_datasets_dir`
 3. **Resolve base model weights to a local path before anything else:**
    ```python
@@ -420,62 +473,135 @@ user set `dataset_hunter.enabled: false` in the yaml.
 
 **Entry condition:** `autoresearch_running == false` or resuming
 
-1. Read `$SKILLS_DIR/autoresearch-for-yolo/SKILL.md`
+1. Read `$SKILLS_DIR/autoresearch/SKILL.md`
 
-2. Set starting weights in `train.py` based on pipeline state:
-   - If `pretrain_weights` is not null → patch `train.py`: `WEIGHTS = "<pretrain_weights>"`
-   - If `pretrain_weights` is null or `pretrain_skipped == true` → leave `WEIGHTS` as-is
-     (uses original base model weights from `base_model.md`)
+2. **Resolve and patch `WEIGHTS` in `train.py`.**
+
+   The template ships with a placeholder (`weights/yolo26x.pt`). Orchestrator
+   must set this to the actual weights path before the first run, or `train.py`
+   will crash with `FileNotFoundError`.
+
+   ```python
+   import re, pathlib, subprocess, json, yaml
+
+   state = json.loads(pathlib.Path("pipeline_state.json").read_text())
+   train_py = pathlib.Path(state["train_script"])
+
+   def patch_variable(path, name, value):
+       """Replace ^<name>\s*=.*$ with <name> = <value>. Not locked."""
+       src = path.read_text()
+       pattern = re.compile(rf"(?m)^{re.escape(name)}\s*=.*$")
+       new_src, n = pattern.subn(f'{name} = {value}', src, count=1)
+       if n == 0:
+           raise RuntimeError(f"{path}: {name} not found at column 0.")
+       path.write_text(new_src)
+
+   # Resolve weights to a local file
+   if state.get("pretrain_weights"):
+       weights_local = state["pretrain_weights"]
+   elif state.get("base_weights_local"):
+       weights_local = state["base_weights_local"]
+   else:
+       # Download from base_model.md
+       bm = pathlib.Path(state["base_model_md_path"])
+       weights_local = None
+       if bm.exists():
+           bm_text = bm.read_text()
+           m = re.search(r"Weights URL.*?:\s*(.+)", bm_text)
+           url = m.group(1).strip() if m else None
+           if url and url.startswith("http"):
+               pathlib.Path(state["weights_dir"]).mkdir(exist_ok=True)
+               local = f"{state['weights_dir']}/{pathlib.Path(url).name}"
+               if not pathlib.Path(local).exists():
+                   subprocess.run(["wget", "-q", "-c", url, "-O", local], check=True)
+               weights_local = local
+
+   if weights_local and pathlib.Path(weights_local).exists():
+       patch_variable(train_py, "WEIGHTS", f'"{weights_local}"')
+       state["base_weights_local"] = weights_local
+   else:
+       print("WARNING: no weights file resolved. train.py WEIGHTS must point to "
+             "an existing .pt file or the first run will crash.")
+   ```
+
+2.5. **Patch `DATA_YAML` and `NUM_CLASSES` in `train.py`.**
+
+   The template ships with `DATA_YAML = "data/dataset.yaml"` — a placeholder.
+   Orchestrator must patch this to match `paths.dataset_root` from the yaml,
+   or `train.py` will crash with `FileNotFoundError`.
+
+   ```python
+   dataset_root = pathlib.Path(state["dataset"])
+
+   # Find the data.yaml in the dataset directory
+   data_yaml = None
+   for candidate in [dataset_root / "data.yaml",
+                     dataset_root / "data.yml",
+                     dataset_root / "dataset.yaml",
+                     dataset_root.parent / "data.yaml"]:
+       if candidate.exists():
+           data_yaml = str(candidate.resolve())
+           break
+
+   if data_yaml:
+       patch_variable(train_py, "DATA_YAML", f'"{data_yaml}"')
+       # Read NUM_CLASSES from data.yaml
+       try:
+           ds_cfg = yaml.safe_load(open(data_yaml))
+           nc = ds_cfg.get("nc") or len(ds_cfg.get("names", []))
+           if nc:
+               patch_variable(train_py, "NUM_CLASSES", nc)
+       except Exception:
+           pass
+   else:
+       print(f"WARNING: no data.yaml found under {dataset_root}. "
+             f"Patch DATA_YAML in train.py manually before running.")
+
+   # Save updated state
+   json.dump(state, open("pipeline_state.json", "w"), indent=2)
+   ```
 
 3. **Lock `TIME_BUDGET`, `SEED`, and `IMGSZ` across all experiment scripts.** For
    `task_type: object_detection` this is just `train.py`; for
    `object_tracking` it is `train.py` + `track.py` (both have Section ②
-   per the spec). Helper function below fails loudly if either variable is
+   per the spec). Helper function below fails loudly if any variable is
    missing — a silent no-op here would let experiments run with stale
    values and silently corrupt results.
 
    ```python
-   import re, pathlib
-
-   def lock_variable(path: pathlib.Path, name: str, value) -> None:
-       """Replace `^<name>\\s*=.*$` with `<name> = <value>  # locked by orchestrator`.
-       Raises RuntimeError if no line matches (spec says the variable must exist)."""
+   def lock_variable(path, name, value):
+       """Replace ^<name>\s*=.*$ with <name> = <value>  # locked by orchestrator.
+       Raises RuntimeError if no line matches."""
        src = path.read_text()
        pattern = re.compile(rf"(?m)^{re.escape(name)}\s*=.*$")
        new_src, n = pattern.subn(
-           f"{name} = {value}  # locked by orchestrator", src, count=1,
-       )
+           f"{name} = {value}  # locked by orchestrator", src, count=1)
        if n == 0:
-           raise RuntimeError(
-               f"{path}: {name} assignment not found at column 0. "
-               f"Script is not spec-compliant — see train-script-spec.md § Section ②."
-           )
+           raise RuntimeError(f"{path}: {name} not found at column 0.")
        path.write_text(new_src)
 
-   scripts_to_lock = [pathlib.Path(pipeline_state["train_script"])]
-   if pipeline_state["task_type"] == "object_tracking":
-       scripts_to_lock.append(pathlib.Path("track.py"))
-
-   for script in scripts_to_lock:
-       if not script.exists():
-           raise RuntimeError(f"{script} not found — Stage 0 Step 6 should have scaffolded it.")
-       lock_variable(script, "TIME_BUDGET", pipeline_state["loop_time_budget"])
-       lock_variable(script, "SEED",        pipeline_state.get("seed", 42))
-       lock_variable(script, "IMGSZ",       imgsz)
-   ```
-
-   Resolve `imgsz` from the yaml before the loop:
-   ```python
-   import yaml
+   # Resolve IMGSZ from yaml BEFORE the lock loop (not after)
    cfg = yaml.safe_load(pathlib.Path("research_config.yaml").read_text())
    ev = cfg.get("evaluation", {})
    imgsz = (ev.get("ultralytics_val", {}).get("imgsz")
             or ev.get("trackeval", {}).get("imgsz")
             or 1920)
+
+   scripts_to_lock = [train_py]
+   if state["task_type"] == "object_tracking":
+       scripts_to_lock.append(pathlib.Path("track.py"))
+
+   for script in scripts_to_lock:
+       if not script.exists():
+           raise RuntimeError(f"{script} not found.")
+       lock_variable(script, "TIME_BUDGET", state["loop_time_budget"])
+       lock_variable(script, "SEED",        state.get("seed", 42))
+       lock_variable(script, "IMGSZ",       imgsz)
    ```
 
-   These three values (TIME_BUDGET, SEED, IMGSZ) are fixed for the entire pipeline run. — identical across every experiment
-   so that keep/discard decisions reflect the change being tested, not randomness.
+   These three values (TIME_BUDGET, SEED, IMGSZ) are fixed for the entire pipeline
+   run — identical across every experiment so that keep/discard decisions reflect
+   the change being tested, not randomness or resolution differences.
 
 4. Update pipeline state: `autoresearch_running: true`
 
@@ -524,7 +650,7 @@ user set `dataset_hunter.enabled: false` in the yaml.
    ```
    When triggered:
    a. Log: `"Re-pretrain requested after architecture combination"`
-   b. Read `$SKILLS_DIR/dataset-hunter-for-yolo/SKILL.md`
+   b. Read `$SKILLS_DIR/dataset-hunter/SKILL.md`
    c. Run dataset hunter **Phase 5 + Phase 6 only** (pretrain + self-eval).
       Use current `train.py` (which now has the combined architecture modules).
       Corpus at `pretrain_data/merged/` already exists from Stage 2.
@@ -542,7 +668,7 @@ user set `dataset_hunter.enabled: false` in the yaml.
    AND autoresearch has run ≥ 5 loops AND `best_primary_value` has not improved in last 5 loops:
    - **Automatically** run pretrain (do not ask the user):
      1. Log: `"Auto-triggering pretrain after 5 stalled loops"`
-     2. Read `$SKILLS_DIR/dataset-hunter-for-yolo/SKILL.md`
+     2. Read `$SKILLS_DIR/dataset-hunter/SKILL.md`
      3. Skip directly to **Phase 5 — Pretrain** (dataset hunter's phases 1–4 already done)
         using `BASE_WEIGHTS` from `pipeline_state.base_weights_local`
         and corpus already in `pretrain_data/merged/`
@@ -590,7 +716,17 @@ Triggered only by user interruption (Ctrl+C) or explicit user command "stop".
    The "sort by primary metric" step must respect `evaluation.metrics.minimize` —
    if the primary metric is in `minimize`, sort ascending; otherwise descending.
 
-2. Update pipeline state: `stage: "done"`
+2. **Print discoveries** — if `discoveries.md` exists, print its contents.
+   This is where autoresearch logged technical insights during the run
+   instead of stopping to ask the user:
+   ```python
+   disc = pathlib.Path("discoveries.md")
+   if disc.exists() and disc.stat().st_size > 100:  # more than just the header
+       print("\n=== Discoveries (observations from the loop) ===")
+       print(disc.read_text())
+   ```
+
+3. Update pipeline state: `stage: "done"`
 
 ---
 

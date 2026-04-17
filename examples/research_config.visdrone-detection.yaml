@@ -1,7 +1,7 @@
 # =============================================================================
 # research_config.yaml — VisDrone small object detection
 # -----------------------------------------------------------------------------
-# Single source of configuration for the YOLO research pipeline.
+# Single source of configuration for the research pipeline.
 # Every field below has an inline comment explaining what it does.
 # Fields marked [required] must be set; [optional] can be left as default/null.
 # =============================================================================
@@ -130,9 +130,15 @@ dataset_hunter:
     coco: true                     # Direct COCO 2017 download
     openimages: true               # OpenImages v7 via openimages CLI
     papers_with_code: true         # Datasets listed on papers_with_code with direct download URLs
-  credentials:                     # [optional] API tokens. Only needed for sources marked true above.
-    roboflow_api_key: null         # Free at roboflow.com. Required if sources.roboflow=true.
-    huggingface_token: null        # Required only for gated/private HF datasets.
+  # credentials:
+  # API keys are NOT stored in this yaml (it may be committed to git).
+  # Put them in a `.env` file in the project root instead:
+  #
+  #   ROBOFLOW_API_KEY=...          # Free at roboflow.com. Required if sources.roboflow=true.
+  #   HF_TOKEN=hf_...               # Required only for gated HF datasets.
+  #   FIRECRAWL_API_KEY=fc-...      # Enables deep scrape of PwC pages. Free 500 credits/month.
+  #
+  # Orchestrator loads .env at Stage 0 Step 1.5. Skills read via os.environ.get().
   disk:                            # [required] Disk space management.
     budget_gb: 100                 # Hard limit on download size. Dataset hunter checks remaining before each download.
     output_dir: "pretrain_data"    # Where downloads land. Subdirs: raw/ converted/ merged/.

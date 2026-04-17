@@ -1,11 +1,11 @@
 ---
-name: autoresearch for yolo
-description: Autonomous ML experiment loop for YOLO models. Iteratively modifies a training script, runs experiments, and keeps only changes that improve the primary metric defined in research_config.yaml while respecting guard metrics. Reads modules.md to find paper-backed modules to test, calls paper2code to generate code, and triggers paper finder when experiments stall. Trigger on phrases like "start the experiment loop", "run autoresearch", "keep trying things", or "optimise my model".
+name: autoresearch
+description: Autonomous ML experiment loop. Iteratively modifies a training script, runs experiments, and keeps only changes that improve the primary metric defined in research_config.yaml while respecting guard metrics. Reads modules.md to find paper-backed modules to test, calls paper2code to generate code, and triggers paper finder when experiments stall. Trigger on phrases like "start the experiment loop", "run autoresearch", "keep trying things", or "optimise my model".
 ---
 
-# Autoresearch for YOLO — Autonomous Experiment Loop
+# Autoresearch — Autonomous Experiment Loop
 
-Autonomous experiment loop for YOLO. Modify `train.py` → Run → Keep if better → Revert if not → Repeat forever.
+Autonomous experiment loop. Modify `train.py` → Run → Keep if better → Revert if not → Repeat forever.
 
 **Objective:** Maximise the **primary metric** declared in `research_config.yaml → evaluation.metrics.primary`, while respecting all **guard metrics** declared in `evaluation.metrics.guard`.
 
@@ -86,6 +86,62 @@ Each loop takes ~20 minutes (TIME_BUDGET) plus a few seconds for startup and eva
    `loop` is a sequential integer starting from 1, incremented each iteration.
 
 6. **Confirm and go** — say "Setup complete. Tracking: primary=`{PRIMARY}`, guard=`{list(GUARD)}`" and immediately begin The Loop.
+
+7. **Initialise `discoveries.md`** — a log for observations that arise during
+   experiments. This is the replacement for stopping to talk to the user:
+
+   ```python
+   if not pathlib.Path("discoveries.md").exists():
+       pathlib.Path("discoveries.md").write_text("# Discoveries\n\nObservations from the experiment loop. User reads these after the run.\n\n---\n\n")
+   ```
+
+---
+
+## Discoveries — the "don't stop, write it down" mechanism
+
+During the loop you will notice things: a module injection technique doesn't
+persist to checkpoint, time budget is too short for convergence, a particular
+combination is promising, a paper's method doesn't apply to this architecture.
+
+**These are valuable observations. They are NOT a reason to stop the loop.**
+
+When you notice something, append it to `discoveries.md` and continue:
+
+```python
+from datetime import datetime
+
+def log_discovery(message: str, loop: int, category: str = "observation") -> None:
+    """Write a discovery and keep looping. NEVER stop to report to user."""
+    entry = f"\n## Loop {loop} — {category}\n\n{datetime.now().isoformat()}\n\n{message}\n"
+    with open("discoveries.md", "a") as f:
+        f.write(entry)
+```
+
+Categories: `observation` / `limitation` / `strategy_shift` / `bug_workaround`
+
+### Examples of what goes into discoveries.md (NOT into chat)
+
+| You notice... | Write to discoveries.md | Then... |
+|---|---|---|
+| "Monkey-patch forward wrapping doesn't save weights to checkpoint" | `log_discovery("Monkey-patching model.forward() causes injected module weights to not persist in checkpoint. Switching to subclass-based injection for future modules.", loop, "bug_workaround")` | Switch injection method, continue loop |
+| "TIME_BUDGET=1200 only allows 5 epochs at imgsz=1280" | `log_discovery("At imgsz=1280, 1200s budget yields ~5 epochs. Short runs may not converge fully, but relative comparison between experiments is still valid.", loop, "limitation")` | Continue — TIME_BUDGET is locked, you can't change it. The comparison is still fair because every run gets the same budget |
+| "Freeze backbone + cosine LR is the best combo so far" | `log_discovery("freeze_backbone + cosine_lr combination gave best PRIMARY so far. Will try adding modules on top of this configuration.", loop, "strategy_shift")` | Adopt as new baseline, continue loop |
+| "This module clearly needs more epochs to converge" | `log_discovery("Module X shows improving trend but didn't converge in TIME_BUDGET. Relative comparison still valid — if it can't beat baseline in equal time, discard.", loop, "observation")` | Discard if it didn't beat baseline. Equal time is fair |
+| "I found 3 useful insights the user should know about" | Write all three to `discoveries.md` | **Continue the loop.** User reads `discoveries.md` when they check back |
+
+### What NEVER goes into chat mid-loop
+
+- Summaries of what you learned
+- Questions about strategy direction
+- Suggestions to change locked parameters
+- Requests for user input on which approach to try next
+- "Important findings" reports
+- "Do you want me to continue?" — YES, always continue
+
+The user will read `discoveries.md` when they stop the pipeline. Until then,
+your job is to loop. If you find yourself composing a message to the user that
+isn't a git commit message or a one-line "Loop N: keep/discard" status — stop,
+write it to `discoveries.md` instead, and move to the next iteration.
 
 ---
 
@@ -652,19 +708,65 @@ If `stall_count >= 10` AND `modules.md` has pending entries:
 12. **Never hardcode metric names in the skill body** — always reference `PRIMARY`, `TIEBREAK`,
     `SECONDARY`, `GUARD` loaded from `research_config.yaml` at setup time. The same skill must
     work unchanged for detection (`val_mAP50_95`), tracking (`HOTA`), segmentation, etc.
-13. **Never ask the user for decisions.** The loop is fully autonomous. Every error has a
+13. **Never talk to the user mid-loop.** The loop is fully autonomous. Every error has a
     predefined resolution (see § Crash Diagnosis). Every stall triggers automatic expansion.
-    If you find yourself about to ask the user a question, there is a default — use it.
+    Every observation goes into `discoveries.md` — see § Discoveries.
+    If you find yourself composing a multi-sentence message to the user, or asking a question,
+    or reporting findings, or saying "do you want me to continue" — **STOP**. Write it to
+    `discoveries.md` instead. Then start the next iteration. The user reads `discoveries.md`
+    after the pipeline stops. Your only chat output during the loop is one-line status per
+    iteration: `"Loop N: keep/discard — <description>"`.
 
 ---
 
 ## Crash Diagnosis
+
+### Actual crashes (fix and rerun or revert)
 
 - `loss = nan` → LR too high, reduce 5–10×
 - Flat loss from step 1 → wrong `num_classes` or bad head init
 - OOM → halve `BATCH_SIZE` or revert the last change
 - Slow convergence → LR too low or warmup too long
 - `ImportError` from custom_modules → check class name and import statement in train.py
+
+### Common observations that are NOT crashes (log to discoveries.md, continue)
+
+These are real technical insights that feel important enough to report to the
+user. They are not. Write them to `discoveries.md` and keep looping.
+
+**"Monkey-patch forward wrapping doesn't save weights to checkpoint"**
+→ This is a known ultralytics limitation. Wrapping `model.forward()` with a
+  decorator works for the current run but the weights aren't saved by
+  `model.save()`. Solution: use subclass-based injection (create a new
+  `nn.Module` subclass that replaces the target layer) instead of
+  monkey-patching. Log the discovery, switch technique, continue.
+
+**"TIME_BUDGET only allows N epochs, results may not converge"**
+→ TIME_BUDGET is locked. You cannot change it. The key insight is: **relative
+  comparison is still valid**. Both the baseline and the experiment get the
+  same wall-clock. If a module can't beat baseline in equal time, it's either
+  not helpful or too expensive — both are valid discard reasons. Log to
+  discoveries.md, discard if didn't improve, continue.
+
+**"Hyperparameter tuning has limited benefit at this time budget"**
+→ Correct observation. This is why the pipeline has `param_only_streak` and
+  forced architecture exploration — if param changes aren't helping after 5
+  rounds, the loop automatically switches to architecture changes. You don't
+  need to report this. The mechanism handles it.
+
+**"Module X shows improving trend but didn't converge"**
+→ If PRIMARY didn't beat baseline, discard. "Improving trend" is a subjective
+  judgment; the pipeline uses mechanical verification only (Rule #4). Log the
+  trend observation to discoveries.md if you want, then discard and move on.
+
+**"I found that [strategy A] works better than [strategy B]"**
+→ Great insight. Write it to discoveries.md. Adopt the better strategy for
+  future iterations. Do not stop to tell the user.
+
+**"I think the user should increase TIME_BUDGET / change IMGSZ"**
+→ You cannot change locked parameters. The user chose them. If you believe
+  they're suboptimal, log to discoveries.md with your reasoning. The user
+  reads it later and decides. Continue looping with current settings.
 
 ---
 

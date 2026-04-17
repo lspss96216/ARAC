@@ -1,6 +1,6 @@
-# YOLO Research Pipeline Skills
+# Research Pipeline Skills
 
-Autonomous ML experiment pipeline for YOLO-family models. Four Claude skills
+Autonomous ML experiment pipeline. Four Claude skills
 (orchestrator, paper finder, dataset hunter, autoresearch) coordinate via
 shared files to: find the best base model + improvement modules, build a
 pretrain corpus, run pretrain, then iterate `train.py` through experiments
@@ -14,27 +14,28 @@ by `research_config.yaml`. No skill hardcodes a specific metric.
 ## Layout
 
 ```
-skills/                                     → copy this to ~/.claude/skills/
-├── shared/                                 ← shared infrastructure
-│   ├── modules_md.py                       · canonical modules.md parser
-│   ├── test_modules_md.py                  · parser unit tests (8 cases)
+skills/                                     → copy to ~/.claude/skills/
+├── shared/
+│   ├── modules_md.py                       · modules.md parser (8 unit tests)
 │   ├── train-script-spec.md                · train.py / track.py contract
 │   ├── file-contracts.md                   · schemas for all cross-skill files
+│   ├── test_modules_md.py                  · parser unit tests
 │   ├── test_templates.py                   · template compliance checker
 │   └── templates/
-│       ├── train.py.detection              · default for task_type: object_detection
+│       ├── train.py.detection              · scaffold for object_detection
 │       ├── train.py.tracking               · detector-training half of tracking
 │       └── track.py.tracking               · tracker + TrackEval half
-├── yolo-research-orchestrator/SKILL.md     ← Stage 0–4 master controller
+├── research-orchestrator/SKILL.md     ← Stage 0–4 master controller
 ├── paper-finder/SKILL.md                   ← Stage 1: base_model.md + modules.md
-├── dataset-hunter-for-yolo/SKILL.md        ← Stage 2: pretrain corpus + self-eval
-└── autoresearch-for-yolo/SKILL.md          ← Stage 3: keep/discard experiment loop
+├── dataset-hunter/SKILL.md        ← Stage 2: pretrain corpus + self-eval
+└── autoresearch/SKILL.md          ← Stage 3: keep/discard experiment loop
 
 examples/
-├── research_config.visdrone-detection.yaml · annotated detection task config
-└── research_config.visdrone-mot.yaml       · annotated tracking task config
+├── research_config.visdrone-detection.yaml · annotated detection config
+└── research_config.visdrone-mot.yaml       · annotated tracking config
 
-CHANGELOG.md                                · summary of all changes by version
+.env.example                                · API key template (copy to project as .env)
+CHANGELOG.md
 ```
 
 ---
@@ -44,7 +45,7 @@ CHANGELOG.md                                · summary of all changes by version
 ### 1. Install
 
 ```bash
-unzip yolo-skills-bundle-v1.2.zip
+unzip research-skills-bundle-v1.5.zip
 cp -r bundle/skills/* ~/.claude/skills/
 ```
 
@@ -61,18 +62,18 @@ python3 test_templates.py     # expect: 3/3 passed
 ```bash
 mkdir my-project && cd my-project
 cp ~/.claude/skills/examples/research_config.visdrone-detection.yaml research_config.yaml
-# (or .visdrone-mot.yaml for tracking)
+cp ~/.claude/skills/.env.example .env
 ```
 
 Edit at minimum:
-- `paths.skills_dir` → absolute path to `~/.claude/skills`
-- `paths.dataset_root` → your dataset's location
+- `paths.skills_dir` → absolute path to your skills install
+- `paths.dataset_root` → your YOLO-format dataset (must contain `data.yaml`)
 - `task.description` → what you're trying to do (paper finder uses this)
-- `dataset_hunter.disk.budget_gb` → match your free disk
+- `.env` → fill in any API keys you have (all optional)
 
 ### 4. Start
 
-In Claude (Code, desktop, or wherever), open the project folder and say:
+In Claude Code (or desktop), open the project folder and say:
 
 ```
 start the pipeline
@@ -92,121 +93,125 @@ All cross-skill communication goes through files. No skill calls another directl
                             │  (user-authored, all settings)  │
                             └─────────────────┬───────────────┘
                                               ▼
-     ┌──────────────────── yolo-research-orchestrator ────────────────────┐
+     ┌──────────────────── research-orchestrator ────────────────────┐
      │                                                                    │
-     │  Stage 0: read yaml → pipeline_state.json + scaffold train.py      │
+     │  Stage 0: read yaml → .env → pipeline_state.json → scaffold       │
      │                                                                    │
-     │  ┌─ Stage 1 ──┐    ┌─ Stage 2 ────┐    ┌─ Stage 3 ─────────┐       │
-     │  │ paper      │    │ dataset       │    │ autoresearch      │       │
-     │  │ finder     │    │ hunter        │    │ (loops forever)   │       │
-     │  │            │    │               │    │                   │       │
-     │  │ writes:    │    │ writes:       │    │ reads:            │       │
-     │  │ base_model │───▶│ pretrain_eval │───▶│ modules.md        │       │
-     │  │ modules.md │    │ pretrain_ckpt │    │ writes:           │       │
-     │  │            │    │               │    │ results.tsv       │       │
-     │  │            │    │               │    │ run.log           │       │
-     │  └────────────┘    └───────────────┘    └───────────────────┘       │
+     │  ┌─ Stage 1 ──┐    ┌─ Stage 2 ────┐    ┌─ Stage 3 ─────────┐      │
+     │  │ paper      │    │ dataset       │    │ autoresearch      │      │
+     │  │ finder     │    │ hunter        │    │ (loops forever)   │      │
+     │  │            │    │               │    │                   │      │
+     │  │ writes:    │    │ writes:       │    │ reads:            │      │
+     │  │ base_model │───▶│ pretrain_eval │───▶│ modules.md        │      │
+     │  │ modules.md │    │ pretrain_ckpt │    │ writes:           │      │
+     │  │            │    │               │    │ results.tsv       │      │
+     │  │            │    │               │    │ discoveries.md    │      │
+     │  └────────────┘    └───────────────┘    └───────────────────┘      │
      │                                                                    │
-     │  Stage 4: summary from pipeline_state.json (on Ctrl+C)             │
+     │  Stage 4: summary + discoveries.md (on Ctrl+C)                    │
      └────────────────────────────────────────────────────────────────────┘
 ```
 
-Schemas for every cross-skill file are in `skills/shared/file-contracts.md`.
-Contract for `train.py` (and `track.py` for tracking) is in
-`skills/shared/train-script-spec.md`. Skills fail loudly if either is violated.
+Schemas for every cross-skill file are in `shared/file-contracts.md`.
+Contract for `train.py` is in `shared/train-script-spec.md`.
 
 ---
 
-## Switching task types
+## API keys
 
-Change one field in `research_config.yaml`:
+API keys live in `.env` in the project root, **not** in `research_config.yaml`
+(which may be committed to git). Orchestrator loads `.env` at Stage 0 Step 1.5.
 
-```yaml
-task:
-  task_type: object_detection     # or object_tracking
+```bash
+# .env
+FIRECRAWL_API_KEY=fc-...   # deep scrape of PwC pages (paper finder + dataset hunter)
+ROBOFLOW_API_KEY=...       # Roboflow Universe dataset downloads
+HF_TOKEN=hf_...            # gated HuggingFace datasets
 ```
 
-and update `evaluation.metrics` / `evaluation.parsing` to match the metrics
-the chosen tool reports. Template scaffolding picks the right `train.py`
-(and `track.py` for tracking).
-
-Dataset hunter's self-eval **always uses detection mAP** (`val_mAP50_95` by
-default) regardless of `task_type` — pretrain quality is fundamentally a
-detector question, not a downstream-task question. Override via
-`dataset_hunter.pretrain.eval_metric` if needed.
+All keys are optional. Without them, the corresponding features degrade
+gracefully (paper finder uses JSON API only, dataset hunter skips Roboflow, etc).
 
 ---
 
-## Adding a new task type
+## Optional dependencies
 
-1. Add a template at `skills/shared/templates/train.py.<newtype>` following
-   `train-script-spec.md` (four sections, locked variables, `inject_modules`
-   hook, canonical metric print format).
-2. Extend Stage 0 Step 6 in `yolo-research-orchestrator/SKILL.md` with a
-   branch for the new `task_type`.
-3. Add the matching `evaluation.parsing.patterns` entries to your yaml.
-4. Run `test_templates.py` — it picks up the new template and checks compliance.
+| Tool | What it enables | Install |
+|---|---|---|
+| paper2code | Generates module code from arXiv papers | `npx skills add PrathamLearnsToCode/paper2code/skills/paper2code` |
+| Firecrawl CLI | Deep scrape of PwC pages, weights URL validation, dataset URL discovery | `npm install -g firecrawl` + set `FIRECRAWL_API_KEY` in `.env` |
+
+Without paper2code, autoresearch falls back to cloning GitHub repos or having
+Claude write module code from the paper description. Without Firecrawl,
+paper finder uses PwC's JSON API only and dataset hunter skips non-direct-download
+datasets.
 
 ---
 
 ## What the pipeline guarantees
 
-These are the guarantees the v1.2 design enforces:
-
 - **Reproducibility**: `TIME_BUDGET`, `SEED`, and `IMGSZ` are locked across
-  all experiments. Changing any of them invalidates fair keep/discard
-  comparison, so orchestrator patches them once and rejects edits.
+  all experiments. Changing any of them invalidates fair keep/discard comparison.
+- **Correctness at first run**: orchestrator patches `WEIGHTS`, `DATA_YAML`,
+  and `NUM_CLASSES` to match the user's actual paths before any experiment runs.
+  Template placeholders are never left in place.
 - **Atomicity**: each experiment is one coherent idea (a paper-recommended
   module's full hyperparameter package, or one hyperparameter change), not
-  one line of code. The pipeline doesn't mix unrelated changes in one run.
+  one line of code.
 - **Autonomy**: no decision point pauses for user input. Every error has a
-  predefined resolution (crash → revert + retry, stall → expand papers,
-  missing weights → fallback). Designed for unattended overnight runs.
-- **Metric-agnosticism**: skills never hardcode `val_mAP50_95` or any other
-  specific metric. Whatever you put in `evaluation.metrics.primary` is what
-  drives keep/discard, what `pipeline_state.best_primary_value` tracks, what
-  the Stage 4 summary prints.
-- **Architecture exploration**: when 5 consecutive param-only experiments
-  fail to improve PRIMARY, the loop forces an architecture experiment. After
-  3+ architecture changes are kept, the loop combines them and re-runs
-  pretrain so module benefits show under proper pretrained features.
-- **Format stability**: `train.py` writes canonical `<key>: <value>` lines at
-  column 0; tools' raw output is reformatted inside the templates so
-  `evaluation.parsing.patterns` only ever sees a stable contract.
+  predefined resolution. Observations go to `discoveries.md`, not to chat.
+- **Metric-agnosticism**: whatever you put in `evaluation.metrics.primary`
+  drives keep/discard. No skill hardcodes `val_mAP50_95`.
+- **Architecture exploration**: after 5 stalled param-only experiments, the
+  loop forces an architecture change. After 3+ architecture keeps, it
+  combines them and re-runs pretrain.
+- **Format stability**: `train.py` always reformats tool output into
+  canonical `key: value` lines for stable regex parsing.
+
+---
+
+## Switching task types
+
+Change `task.task_type` in the yaml and update `evaluation` to match:
+
+```yaml
+task:
+  task_type: object_tracking    # scaffolds train.py + track.py
+evaluation:
+  tool: trackeval
+  metrics:
+    primary: HOTA
+    minimize: [IDSW]
+```
+
+Dataset hunter's self-eval always uses detection mAP regardless of task type.
 
 ---
 
 ## Known limitations
 
 - **Source search is detection-biased.** For tracking tasks, paper finder
-  still works (queries are user-supplied), but dataset hunter only knows
-  detection dataset sources. This is acceptable per Bug #5's design:
-  dataset hunter measures detector quality regardless of `task_type`.
-
-- **Resume is stage-level, not stage-substep.** A crash inside paper finder
-  restarts paper finder from scratch (idempotent). Dataset hunter doesn't
-  resume from a specific failed dataset.
-
-- **`base_model.md` parsing is regex-based.** Paper finder writes
-  hand-formatted markdown that orchestrator scrapes with regex. A YAML
-  frontmatter refactor (described in `file-contracts.md`) would be more
-  robust.
-
-- **No LLM/segmentation/diffusion support.** All four skills assume
-  ultralytics-YOLO. To support other framework families, see CHANGELOG's
-  "Considered but not done" section.
+  works (queries are user-supplied) but dataset hunter only knows detection
+  dataset sources.
+- **Resume is stage-level, not substep.** A crash inside paper finder
+  restarts it from scratch.
+- **`base_model.md` is regex-parsed.** A YAML frontmatter refactor would be
+  more robust.
+- **No LLM/segmentation support.** All skills assume ultralytics-YOLO.
 
 ---
 
 ## Versions
 
-See `CHANGELOG.md` for the full history.
+See `CHANGELOG.md` for full history.
 
-- **v1.2** (current): paper-faithful module application — agent now applies
-  all hyperparameters from a paper as one experiment, not split across loops.
-  Annotated example yamls.
-- **v1.1**: 5 dynamic-run bugs fixed — patience for downloads, forced
-  architecture exploration, full autonomy (no user prompts), `IMGSZ` locked,
-  `results.tsv` column alignment.
-- **v1.0**: unification pass — modules.md parser, train-script spec, file
-  contracts, metric-agnostic state, task-type aware templates.
+- **v1.5** (current): dry-run bug fixes — `DATA_YAML` and `WEIGHTS` patching,
+  `imgsz` ordering, `skills_dir` docs, `paper2code` fallback.
+- **v1.4**: external skill integration — HF Dataset Viewer preflight,
+  Firecrawl deep scrape, API keys moved to `.env`.
+- **v1.3**: `discoveries.md` mechanism, monkey-patch prohibition, expanded
+  crash diagnosis.
+- **v1.2**: paper-faithful module application, annotated yaml examples.
+- **v1.1**: 5 runtime bug fixes — download patience, forced architecture
+  exploration, full autonomy, `IMGSZ` locked, `results.tsv` alignment.
+- **v1.0**: initial unification — parser, spec, contracts, metric-agnostic state.
