@@ -74,7 +74,7 @@ USE_SMALL_OBJECT_FPN = False
 # Section ③ — inject_modules hook
 # ═══════════════════════════════════════════════════════════════════════════════
 def inject_modules(model):
-    """Apply experimental modules based on USE_* flags. Mutates model in place.
+    """Apply experimental modules based on USE_* flags.
 
     autoresearch adds new branches here when it pulls a module from modules.md.
     Each branch must be idempotent and survive being run even when its flag
@@ -82,7 +82,9 @@ def inject_modules(model):
     """
     if USE_SMALL_OBJECT_FPN:
         from custom_modules import SmallObjectFPN
-        SmallObjectFPN.replace_neck(model)
+        # If a branch returns a replaced model, the caller MUST rebind
+        # to the return value (see § inject_modules() — Contract).
+        return SmallObjectFPN.replace_neck(model)
     # Tracker-layer modules (CMC, NSA_KALMAN, ...) are applied in track.py,
     # not here — see Task-type variants.
     return model
@@ -94,7 +96,7 @@ def main():
     random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
     model = YOLO(WEIGHTS)
-    model = inject_modules(model)
+    model = inject_modules(model)   # ← REBIND REQUIRED; see § Contract
 
     model.train(
         data=DATA_YAML, epochs=1000, batch=BATCH_SIZE,
@@ -114,7 +116,8 @@ def print_metrics(metrics, model):
     print(f"val_recall:       {box.mr:.4f}")
     print(f"val_mAP50:        {box.map50:.4f}")
     print(f"val_mAP50_95:     {box.map:.4f}")
-    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    # Floor at 0.1M to prevent degenerate guard tolerance on tiny test models (D7)
+    n_params = max(sum(p.numel() for p in model.parameters()) / 1e6, 0.1)
     print(f"Model Summary: {n_params:.1f}M params")
 
 if __name__ == "__main__":
@@ -168,20 +171,48 @@ delete existing `USE_*` flags — `results.tsv` references them by name in the
 
 ---
 
-## `inject_modules()` — the hook signature
+## `inject_modules()` — the hook contract
+
+### Signature
 
 ```python
-def inject_modules(model) -> model
+def inject_modules(model):
+    ...
+    return model
 ```
 
-- Input: `model` — whatever type `WEIGHTS` loads. For ultralytics YOLO, this is a
-  `YOLO` instance; for other frameworks, it is the framework's model type.
-- Output: `model` (return the same or a replaced instance — both acceptable).
-- Called: once in Section ④ between `YOLO(WEIGHTS)` and `model.train(...)`.
-- Contract: **each branch inside is idempotent when its flag is False.** A branch
-  with an always-True side effect (e.g. monkey-patching a global) breaks the
-  ablation logic because flipping the flag off no longer actually turns the
-  module off.
+**Note:** earlier drafts wrote `def inject_modules(model) -> model` as the
+signature. That is not valid Python — `model` is a parameter name, not a type.
+The actual object returned is whatever `WEIGHTS` loads (for ultralytics YOLO
+this is a `YOLO` instance; for other frameworks, the framework's model type).
+
+### Contract — what callers and branch authors must guarantee
+
+1. **Caller rebind (C6).** Section ④ must call `inject_modules` with its
+   return value rebound:
+
+   ```python
+   model = YOLO(WEIGHTS)
+   model = inject_modules(model)   # ← MUST rebind; do not just call
+   model.train(...)
+   ```
+
+   Never write `inject_modules(model)` without the rebind. Some branches
+   return a replaced instance (e.g. `SmallObjectFPN.replace_neck(model)`
+   builds a new model around a new neck) — if the caller doesn't rebind,
+   the replacement is silently lost and `model.train(...)` runs on the old
+   model. Bug appears as "the module does nothing" and is nearly impossible
+   to diagnose from run.log alone.
+
+2. **Branch idempotency when flag is False.** Each branch inside
+   `inject_modules` must be a no-op (no mutation, no side effects) when its
+   `USE_<MODULE>` flag is False. A branch that does
+   `globals()["YOLO"] = MonkeyPatched` at import time is NOT idempotent;
+   flipping the flag back to False does not undo the monkey-patch.
+
+3. **Call site.** `inject_modules` is called exactly once, in Section ④,
+   between `YOLO(WEIGHTS)` and `model.train(...)`. It is not called from
+   pretrain scripts or from within the training loop.
 
 ### Injection technique: replace, don't wrap
 
@@ -220,6 +251,48 @@ Tracker-layer modules (CMC, NSA Kalman, re-ID) do **not** go through
 `track.py`. `inject_modules` is strictly for detector surgery (backbone / neck /
 head / loss).
 
+### Anti-patterns (will not survive ablation)
+
+**Non-idempotent: module-level monkey-patch**
+```python
+# WRONG — side effect runs at import, survives flag being False
+if USE_CMC:
+    import ultralytics
+    ultralytics.YOLO = lambda *a, **k: MonkeyPatchedYOLO(*a, **k)
+```
+
+**Non-idempotent: forward-wrapping**
+```python
+# WRONG — wrapped method not serialized in checkpoint; false positive
+if USE_ATTENTION:
+    orig_forward = model.forward
+    model.forward = lambda x: attention(orig_forward(x))
+```
+
+**Correct: subclass-based replacement**
+```python
+if USE_SMALL_OBJECT_FPN:
+    from custom_modules import SmallObjectFPN
+    return SmallObjectFPN.replace_neck(model)   # returns new instance
+return model
+```
+
+### Helper: `assert_idempotent()`
+
+When writing a new branch, verify idempotency during development. Call with
+the flag forced to False — the state dict should not change.
+
+```python
+def assert_idempotent(model, fn):
+    """Dev-only: verify fn does not mutate model when its flag is False."""
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    _ = fn(model)
+    after = model.state_dict()
+    for k in before:
+        assert torch.equal(before[k], after[k]), \
+            f"inject_modules mutated {k} when flag was False"
+```
+
 ---
 
 ## Metric output contract
@@ -235,7 +308,7 @@ If you change one you must change the other. When a skill's parser returns
 
 Example (detection, `tool: ultralytics_val`):
 
-```python
+```
 # train.py prints                       # evaluation.parsing.patterns matches
 val_mAP50_95:     0.2451                val_mAP50_95: 'val_mAP50_95:\s+([\d.]+)'
 Model Summary: 7.2M params              num_params_M: 'Model Summary:.*?([\d.]+)M params'
@@ -251,7 +324,8 @@ reformatting:
 
 - `train.py.detection` — wraps `model.val()` output via `print_metrics()`
 - `track.py.tracking` — parses TrackEval's table and re-emits
-  `HOTA:`, `MOTA:`, `IDF1:`, `IDSW:` lines (see the template for the extraction)
+  `HOTA:`, `MOTA:`, `IDF1:`, `IDSW:`, and `FPS:` lines (see the template for
+  the extraction)
 
 This means `evaluation.parsing.patterns` only ever needs to match one stable
 format: the template's canonical prints. Consumers of `run.log` do not parse
@@ -298,30 +372,6 @@ command) apply universally.
 
 ---
 
-## Deployment
-
-```
-<skills_dir>/
-├── shared/
-│   ├── modules_md.py               # P1 Theme 3 output
-│   ├── train-script-spec.md        # this file
-│   └── templates/
-│       ├── train.py.detection      # default for task_type: object_detection
-│       ├── train.py.tracking       # detector-training half of tracking
-│       └── track.py.tracking       # tracker + TrackEval half
-├── paper-finder/
-├── autoresearch/
-├── research-orchestrator/
-└── dataset-hunter/
-```
-
-Each skill reads this spec when it touches `train.py`. The orchestrator
-scaffolds a fresh `train.py` by copying the template matching `task.task_type`
-and patching `TIME_BUDGET` / `SEED`. Autoresearch and dataset hunter assume the
-resulting file conforms to this spec and do not re-validate the layout.
-
----
-
 ## How to verify a `train.py` is spec-compliant
 
 Quick checklist a skill can run before modifying:
@@ -347,3 +397,34 @@ if missing:
 Skills that mutate `train.py` must run this check before their first edit and
 abort with a clear error message if anything is missing, rather than silently
 producing broken patches.
+
+The orchestrator scaffolds a fresh `train.py` by copying the template matching
+`task.task_type` and patching `TIME_BUDGET` / `SEED`. Autoresearch and dataset
+hunter assume the resulting file conforms to this spec and do not re-validate
+the layout.
+
+---
+
+## Deployment
+
+```
+<skills_dir>/
+├── shared/
+│   ├── modules_md.py               # canonical modules.md parser
+│   ├── state_migrate.py            # pipeline_state.json schema migration
+│   ├── parse_metrics.py            # shared stdout/json/csv metric extraction
+│   ├── train-script-spec.md        # this file
+│   ├── file-contracts.md           # schemas for all cross-skill files
+│   └── templates/
+│       ├── train.py.detection      # default for task_type: object_detection
+│       ├── train.py.tracking       # detector-training half of tracking
+│       └── track.py.tracking       # tracker + TrackEval half
+├── paper-finder/
+├── autoresearch/
+├── research-orchestrator/
+└── dataset-hunter/
+```
+
+Each skill reads this spec when it touches `train.py`. The orchestrator
+scaffolds a fresh `train.py` by copying the template matching `task.task_type`
+and patching `TIME_BUDGET` / `SEED` / `IMGSZ`.

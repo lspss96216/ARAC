@@ -61,6 +61,7 @@ Each loop takes ~20 minutes (TIME_BUDGET) plus a few seconds for startup and eva
 
    PARSE_SOURCE   = ev["parsing"]["source"]                # stdout / json / csv
    PARSE_PATTERNS = ev["parsing"].get("patterns", {})      # for stdout regex
+   PARSING_CFG    = ev["parsing"]                          # full dict for B1 helper
    ```
    These variables are referenced throughout the loop. **Never hardcode `val_mAP50_95` or any other metric name** — always go through these variables.
 
@@ -92,7 +93,63 @@ Each loop takes ~20 minutes (TIME_BUDGET) plus a few seconds for startup and eva
 
    ```python
    if not pathlib.Path("discoveries.md").exists():
-       pathlib.Path("discoveries.md").write_text("# Discoveries\n\nObservations from the experiment loop. User reads these after the run.\n\n---\n\n")
+       pathlib.Path("discoveries.md").write_text(
+           "# Discoveries\n\n"
+           "Observations from the experiment loop. User reads these after the run.\n\n"
+           "---\n\n"
+       )
+   ```
+
+8. **Define `load_best_row()` helper (A2).** Step 1 (Review) and Step 7
+   (Decide) need the current best PRIMARY, TIEBREAK, and full baseline row
+   from a single consistent read:
+
+   ```python
+   import csv
+
+   def load_best_row(results_tsv: str, PRIMARY: str, MINIMIZE: set) -> dict | None:
+       """Read results.tsv and return the keep-row with the best PRIMARY.
+       Ignores crash and discard rows. Returns None if no keep rows yet."""
+       p = pathlib.Path(results_tsv)
+       if not p.exists():
+           return None
+       rows = [r for r in csv.DictReader(open(p), delimiter="\t")
+               if r.get("status") == "keep"]
+       if not rows:
+           return None
+       def keyfn(r):
+           try: return float(r[PRIMARY])
+           except (KeyError, ValueError): return float("-inf")
+       reverse = PRIMARY not in MINIMIZE
+       rows.sort(key=keyfn, reverse=reverse)
+       return rows[0]
+   ```
+
+9. **Define `log_discovery()` helper.** The loop calls this from multiple
+   places to append to `discoveries.md` without stopping (D9 — atomic write):
+
+   ```python
+   from datetime import datetime
+
+   def log_discovery(message: str, loop: int = 0, category: str = "observation") -> None:
+       """Append to discoveries.md atomically. Never blocks on user."""
+       VALID = {"observation", "limitation", "strategy_shift", "bug_workaround"}
+       if category not in VALID:
+           category = "observation"
+       entry = (
+           f"\n## Loop {loop} — {category}\n\n"
+           f"{datetime.now().isoformat(timespec='seconds')}\n\n"
+           f"{message.strip()}\n"
+       )
+       p = pathlib.Path("discoveries.md")
+       existing = p.read_text() if p.exists() else (
+           "# Discoveries\n\n"
+           "Observations from the experiment loop. User reads these after the run.\n\n"
+           "---\n"
+       )
+       tmp = p.with_suffix(".md.tmp")
+       tmp.write_text(existing + entry)
+       tmp.replace(p)   # atomic rename on POSIX
    ```
 
 ---
@@ -105,17 +162,7 @@ combination is promising, a paper's method doesn't apply to this architecture.
 
 **These are valuable observations. They are NOT a reason to stop the loop.**
 
-When you notice something, append it to `discoveries.md` and continue:
-
-```python
-from datetime import datetime
-
-def log_discovery(message: str, loop: int, category: str = "observation") -> None:
-    """Write a discovery and keep looping. NEVER stop to report to user."""
-    entry = f"\n## Loop {loop} — {category}\n\n{datetime.now().isoformat()}\n\n{message}\n"
-    with open("discoveries.md", "a") as f:
-        f.write(entry)
-```
+When you notice something, call `log_discovery(...)` (Setup Step 9) and continue.
 
 Categories: `observation` / `limitation` / `strategy_shift` / `bug_workaround`
 
@@ -157,7 +204,7 @@ LOOP (FOREVER or N times):
   6. Verify
   7. Decide: keep or discard
   8. Log
-  9. Check stall → trigger paper finder if needed
+  9. Update stall / crash / streak counters in pipeline_state
   10. Repeat
 ```
 
@@ -167,7 +214,20 @@ LOOP (FOREVER or N times):
 
 Read `results.tsv` and current `train.py` state.
 Read `stall_count` from `pipeline_state.json` — do not recompute it here.
-Note the current best **PRIMARY** value from `results.tsv` for use in Step 7 and Step 9.
+
+**Load the current best row once (A2)** and cache its values for use in
+Step 7 (decide) and Step 9 (counter updates):
+
+```python
+best_row = load_best_row("results.tsv", PRIMARY, MINIMIZE)
+best_PRIMARY  = float(best_row[PRIMARY])  if best_row else None
+best_TIEBREAK = float(best_row[TIEBREAK]) if (best_row and TIEBREAK) else None
+baseline_row  = best_row   # passed to guard_violated() in Step 7
+```
+
+`best_TIEBREAK is None` means either no keep row exists yet, or the yaml did
+not declare a tiebreak metric. Both cases are valid; Step 7's tiebreak branch
+skips when `best_TIEBREAK is None`.
 
 ---
 
@@ -216,11 +276,23 @@ elif location in TRACKER_LOCATIONS:
         # fall through to Priority B in this iteration
         chosen = None
 else:
-    # Unknown location — default to detector and log a warning
-    print(f"WARN: unknown Location {location!r} for {chosen.name}; "
-          f"defaulting to train.py + inject_modules")
-    target_file   = "train.py"
-    hook_function = "inject_modules"
+    # A5 — Unknown Location. DO NOT default to detector.
+    # Defaulting would inject a tracker-shaped module into inject_modules(model),
+    # which accepts a detector model — the resulting crash is opaque and
+    # hard to diagnose from run.log alone. Discarding here is strictly safer
+    # and tells the user via discoveries.md where the fix is needed.
+    print(f"Unknown Location {location!r} for {chosen.name}; discarding "
+          f"(paper finder should set Location to one of: "
+          f"{sorted(DETECTOR_LOCATIONS | TRACKER_LOCATIONS)})")
+    mm.update_status("modules.md", chosen.name, "discarded")
+    log_discovery(
+        f"Module {chosen.name!r} had unknown Location {location!r}. "
+        f"Fix paper finder's Location vocabulary or edit modules.md by hand. "
+        f"Valid locations: {sorted(DETECTOR_LOCATIONS | TRACKER_LOCATIONS)}",
+        loop=state.get("loop_count", 0),
+        category="observation",
+    )
+    chosen = None      # fall through to Priority B
 ```
 
 `target_file` and `hook_function` are used below when generating the injection.
@@ -249,7 +321,7 @@ the generated code, and collect every parameter the paper recommends:
 
 1. **From `modules.md`** — the `Integration notes` section lists named
    hyperparameters the paper author specified (see paper-finder's template for
-   the expected prose). Parse lines that look like `<NAME>: <value> (§<section>)`.
+   the expected prose). Parse lines that look like `<name>: <value> (§<section>)`.
 
 2. **From the generated code** — if paper2code produced a class, scan its
    `__init__` for default values the author chose:
@@ -365,8 +437,11 @@ Track the type of each experiment (param vs architecture) in `pipeline_state.jso
 
 ```python
 # At the end of Step 2, after choosing the change:
-is_architecture_change = chosen is not None  # modules.md module = architecture
-                         or change_type in ("replacement", "additive", "combination")
+# A1 — parenthesised to avoid stray `or` on a continuation line (SyntaxError).
+is_architecture_change = (
+    chosen is not None                                  # modules.md module = architecture
+    or change_type in ("replacement", "additive", "combination")
+)
 is_param_change = not is_architecture_change
 
 state = json.loads(pathlib.Path("pipeline_state.json").read_text())
@@ -439,17 +514,22 @@ The run command depends on `task_type` (read from `pipeline_state.json`). See
 `<skills_dir>/shared/train-script-spec.md` § Task-type variants for why the split
 exists.
 
+**D5 — runner auto-detection.** Orchestrator Stage 0 Step 0 picks either
+`uv run` or `python3` and stores it in `state["python_runner"]`. Use that
+value rather than hardcoding `uv`:
+
 ```bash
 TASK_TYPE=$(python3 -c "import json; print(json.load(open('pipeline_state.json'))['task_type'])")
+RUNNER=$(python3 -c "import json; print(json.load(open('pipeline_state.json')).get('python_runner', 'uv run'))")
 
 case "$TASK_TYPE" in
   object_detection)
-    uv run train.py > run.log 2>&1
+    $RUNNER train.py > run.log 2>&1
     ;;
   object_tracking)
-    uv run train.py  > run.log 2>&1
+    $RUNNER train.py  > run.log 2>&1
     # train.py writes `trained_weights: <path>` sentinel; track.py reads it back
-    uv run track.py >> run.log 2>&1
+    $RUNNER track.py >> run.log 2>&1
     ;;
   *)
     echo "Unsupported task_type: $TASK_TYPE" >&2
@@ -458,8 +538,8 @@ case "$TASK_TYPE" in
 esac
 ```
 
-If `uv` is unavailable, substitute `python`. Never pipe through `tee` — the
-parser in Step 6 reads `run.log` directly and `tee` corrupts exit codes.
+Never pipe through `tee` — the parser in Step 6 reads `run.log` directly and
+`tee` corrupts exit codes.
 
 Each loop takes ~20 minutes (TIME_BUDGET) plus a few seconds for startup and eval.
 Tracking adds maybe another minute for `track.py` inference + TrackEval.
@@ -469,11 +549,26 @@ If total runtime exceeds `TIME_BUDGET × 2`: kill and treat as crash.
 
 ### Step 6 — Verify
 
-Extract metrics using the parsing rules from `evaluation.parsing`. The exact extraction
-depends on `PARSE_SOURCE`:
+Extract metrics using the parsing rules from `evaluation.parsing`. The exact
+extraction depends on `PARSE_SOURCE`. All three branches are implemented
+(B1 fix — prior versions had json/csv as `...` stubs and silently crashed).
+
+Use the shared helper:
 
 ```python
-import re, json, csv
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(state["skills_dir"]) / "shared"))
+import parse_metrics
+
+# PARSING_CFG is the full evaluation.parsing dict loaded at Setup Step 1.
+results = parse_metrics.extract(PARSE_SOURCE, PARSING_CFG)
+```
+
+If you prefer inline implementation (not using the shared helper), the logic
+is equivalent to:
+
+```python
+import re, json as _json, csv as _csv
 
 results = {}
 
@@ -484,12 +579,35 @@ if PARSE_SOURCE == "stdout":
         results[metric_name] = float(m.group(1)) if m else None
 
 elif PARSE_SOURCE == "json":
-    # Use ev["parsing"]["json_file"] and ev["parsing"]["json_paths"]
-    ...
+    # B1 — full implementation (was `...` stub in v1.5)
+    def _pluck(obj, path):
+        cur = obj
+        for key, idx in re.findall(r"([^.\[\]]+)|\[(\d+)\]", path):
+            try:
+                if key:   cur = cur[key]
+                elif idx: cur = cur[int(idx)]
+            except (KeyError, IndexError, TypeError):
+                return None
+        return cur
+    data = _json.loads(pathlib.Path(PARSING_CFG["json_file"]).read_text())
+    for name, dotted in PARSING_CFG["json_paths"].items():
+        v = _pluck(data, dotted)
+        try: results[name] = float(v) if v is not None else None
+        except (TypeError, ValueError): results[name] = None
 
 elif PARSE_SOURCE == "csv":
-    # Use ev["parsing"]["csv_file"] and ev["parsing"]["csv_columns"]
-    ...
+    # B1 — full implementation (was `...` stub in v1.5)
+    with open(PARSING_CFG["csv_file"], newline="") as f:
+        rows = [r for r in _csv.DictReader(f)
+                if any((v or "").strip() for v in r.values())]
+    last = rows[-1] if rows else {}
+    for name, col in PARSING_CFG["csv_columns"].items():
+        raw = (last.get(col) or "").strip()
+        try: results[name] = float(raw) if raw else None
+        except ValueError: results[name] = None
+
+else:
+    raise RuntimeError(f"Unsupported parsing.source: {PARSE_SOURCE!r}")
 ```
 
 If `results[PRIMARY]` is `None` → crash. Diagnose: `tail -n 50 run.log`.
@@ -505,6 +623,51 @@ mm.update_status("modules.md", "<Module Name>",
 - Run succeeded → `injected` → `tested`
 - Run crashed or discarded → `injected` → `discarded`
 
+**Consecutive-crash handling (A3/C8).** After the decision for this iteration
+is made (Step 7) and before returning to Step 1, update crash counters and
+possibly halve `BATCH_SIZE`:
+
+```python
+import re, subprocess
+
+state = json.loads(pathlib.Path("pipeline_state.json").read_text())
+crash_pause_after = state.get("crash_pause_after", 3)
+
+if status == "crash":
+    state["consecutive_crashes"] = state.get("consecutive_crashes", 0) + 1
+else:
+    state["consecutive_crashes"] = 0
+
+if state["consecutive_crashes"] >= crash_pause_after:
+    # Policy: halve BATCH_SIZE in train.py (and track.py if present),
+    # revert the last broken commit, reset counter, log, continue.
+    for script in ("train.py", "track.py"):
+        p = pathlib.Path(script)
+        if not p.exists():
+            continue
+        src = p.read_text()
+        m = re.search(r"(?m)^BATCH_SIZE\s*=\s*(\d+)", src)
+        if m:
+            new_bs = max(1, int(m.group(1)) // 2)
+            p.write_text(re.sub(
+                r"(?m)^BATCH_SIZE\s*=.*$",
+                f"BATCH_SIZE     = {new_bs}",
+                src, count=1))
+    log_discovery(
+        f"{crash_pause_after} consecutive crashes. Halved BATCH_SIZE and "
+        f"reset counter. Continuing loop.",
+        loop=state.get("loop_count", 0),
+        category="bug_workaround",
+    )
+    state["consecutive_crashes"] = 0
+    subprocess.run(["git", "reset", "--hard", "HEAD~1"], check=False)
+
+pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+```
+
+This is the sole implementation of `autoresearch_crash_pause_after`. Without
+this block the yaml setting is advertised but inert.
+
 ---
 
 ### Step 7 — Decide
@@ -516,30 +679,47 @@ def is_better(new, old, name):
     return (new < old) if name in MINIMIZE else (new > old)
 
 def guard_violated(new, baseline):
+    """baseline is the full row dict returned by load_best_row(). When baseline
+    is None (first iteration) there are no guards to violate."""
+    if baseline is None:
+        return None
     for name, tol_pct in GUARD.items():
-        if name not in new or baseline.get(name) is None:
+        if name not in new or name not in baseline:
+            continue
+        try:
+            b = float(baseline[name])
+        except (TypeError, ValueError):
             continue
         if name in MINIMIZE:
             # smaller is better → violation if grew by more than tolerance
-            if new[name] > baseline[name] * (1 + tol_pct / 100):
+            if new[name] > b * (1 + tol_pct / 100):
                 return name
         else:
             # larger is better → violation if dropped by more than tolerance
-            if new[name] < baseline[name] * (1 - tol_pct / 100):
+            if new[name] < b * (1 - tol_pct / 100):
                 return name
     return None
 ```
 
-**Decision rule:**
+**Decision rule (C7 — crash is checked FIRST):**
 
-1. **First iteration** (`best_PRIMARY is None`) → **keep** unconditionally. There
-   is no baseline to compare against; this run establishes it.
-2. Else if `guard_violated(results, best_so_far)` returns a metric name → **discard**
-   (log the violating metric name as the reason).
+0. **Crash check (must run first).** If `status == "crash"` or
+   `results[PRIMARY] is None` → **discard** (revert via git reset). A crash
+   iteration never becomes the baseline, even when it is the first iteration.
+
+1. Else if first iteration (`best_PRIMARY is None` AND not crashed)
+   → **keep** unconditionally. This run establishes the baseline.
+
+2. Else if `guard_violated(results, baseline_row)` returns a metric name
+   → **discard** (log the violating metric name as the reason).
+
 3. Else if `is_better(results[PRIMARY], best_PRIMARY, PRIMARY)` AND
    improvement magnitude `>= MIN_IMPROVE` → **keep**.
-4. Else if PRIMARY tied (within `MIN_IMPROVE`) AND `TIEBREAK` exists AND
+
+4. Else if PRIMARY tied (within `MIN_IMPROVE`) AND `TIEBREAK` is not None
+   AND `best_TIEBREAK` is not None AND
    `is_better(results[TIEBREAK], best_TIEBREAK, TIEBREAK)` → **keep**.
+
 5. Otherwise → **discard**.
 
 Discard = revert:
@@ -617,9 +797,11 @@ is documented in `<skills_dir>/shared/file-contracts.md § results.tsv`.
 
 ---
 
-### Step 9 — Update stall count and write to pipeline state
+### Step 9 — Update counters and write to pipeline state
 
-After logging, update `stall_count` and `param_only_streak`, then write to `pipeline_state.json`:
+After logging, update `stall_count`, `param_only_streak`, `best_primary_value`,
+`best_tiebreak_value`, then write to `pipeline_state.json`:
+
 - If this round improved PRIMARY by `>= MIN_IMPROVE` (in the right direction): reset `stall_count = 0`
 - Otherwise: `stall_count += 1`
 - If this round was a param-only experiment that did not improve: `param_only_streak += 1`
@@ -628,8 +810,9 @@ After logging, update `stall_count` and `param_only_streak`, then write to `pipe
   does not start with "tune_" / "lr_" / "aug_" / "freeze_" → `architecture_keeps`
 
 ```python
-import json, pathlib
+import json, pathlib, csv
 from datetime import datetime
+
 state = json.loads(pathlib.Path("pipeline_state.json").read_text())
 state["stall_count"] = stall_count
 
@@ -639,14 +822,18 @@ if is_architecture_change:
 elif status != "keep":
     state["param_only_streak"] = state.get("param_only_streak", 0) + 1
 
-# best primary
-prev_best = state.get("best_primary_value")    # None on first iteration
-if is_better(results[PRIMARY], prev_best, PRIMARY):
-    state["best_primary_value"] = results[PRIMARY]
+# best primary / tiebreak (A2 — keep both in sync)
+if status == "keep":
+    prev_best = state.get("best_primary_value")
+    if is_better(results[PRIMARY], prev_best, PRIMARY):
+        state["best_primary_value"] = results[PRIMARY]
+    if TIEBREAK and results.get(TIEBREAK) is not None:
+        prev_tb = state.get("best_tiebreak_value")
+        if is_better(results[TIEBREAK], prev_tb, TIEBREAK):
+            state["best_tiebreak_value"] = results[TIEBREAK]
 state["primary_metric_name"] = PRIMARY
 
 # Count architecture keeps for combination trigger
-import csv
 arch_keeps = 0
 if pathlib.Path("results.tsv").exists():
     reader = csv.DictReader(open("results.tsv"), delimiter="\t")
@@ -661,14 +848,16 @@ state["last_updated"] = datetime.now().isoformat()
 pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
 ```
 
-**Do NOT call paper finder directly from here.**
-Orchestrator monitors `pipeline_state.json` and handles the stall → paper finder handoff.
-Autoresearch only writes the count; orchestrator decides when to act.
+**Stall book-keeping is delegated to orchestrator (C1/C2).** Autoresearch
+writes `stall_count` here and only here; it never decides whether to reset
+it or trigger a paper-finder expand. The orchestrator owns that state
+machine — see orchestrator's Stage 3 Step 6 for the reset / expand logic.
 
-If `stall_count >= 10` AND `modules.md` has pending entries:
-- Reset `stall_count = 5` (force-test a pending module next iteration)
-- Update `pipeline_state.json` with the new count
-- Continue the loop normally
+Previous versions had autoresearch reset `stall_count` to a hardcoded 5 when
+`stall_count >= 10 AND pending > 0`. That contradicted orchestrator's
+expand trigger and meant the reset value couldn't be tuned from yaml. Both
+responsibilities are now centralised in orchestrator and configured via
+`autoresearch.stall.force_test_reset` in yaml.
 
 ---
 
@@ -696,8 +885,8 @@ If `stall_count >= 10` AND `modules.md` has pending entries:
    are tried early because they are paper-backed. However, if `param_only_streak >= 5`,
    skip Priority B entirely and force an architecture experiment — see § Forced architecture
    exploration. The pipeline must not get stuck endlessly tuning hyperparameters.
-8. **When stuck, trigger paper finder** — After 10 stalled rounds with no pending modules, expand
-   the module pool. Never stop to ask unless truly blocked.
+8. **When stuck, trigger paper finder** — Orchestrator watches `stall_count` and
+   triggers paper-finder expand. Autoresearch just increments the counter.
 9. **Never touch `TIME_BUDGET`** — it is fixed by the user. Every run must use the same
    time budget so results are comparable. This value is read-only for autoresearch.
 10. **Never touch `SEED`** — random seed must be identical across all runs.
@@ -720,6 +909,22 @@ If `stall_count >= 10` AND `modules.md` has pending entries:
 ---
 
 ## Crash Diagnosis
+
+### How consecutive crashes are handled
+
+Every crash increments `pipeline_state.consecutive_crashes`. Every
+non-crash outcome resets it to 0. When the counter reaches
+`crash_pause_after` (default 3, from `research_config.yaml →
+orchestrator.error_policy.autoresearch_crash_pause_after`), the loop:
+
+1. Halves `BATCH_SIZE` in `train.py` (and `track.py` if present)
+2. Reverts the last broken commit (`git reset --hard HEAD~1`)
+3. Logs the event to `discoveries.md`
+4. Resets the counter to 0
+5. Continues looping — never pauses for user input
+
+This is the sole implementation of `autoresearch_crash_pause_after`. Step 6
+contains the actual code block.
 
 ### Actual crashes (fix and rerun or revert)
 
@@ -753,41 +958,3 @@ user. They are not. Write them to `discoveries.md` and keep looping.
   forced architecture exploration — if param changes aren't helping after 5
   rounds, the loop automatically switches to architecture changes. You don't
   need to report this. The mechanism handles it.
-
-**"Module X shows improving trend but didn't converge"**
-→ If PRIMARY didn't beat baseline, discard. "Improving trend" is a subjective
-  judgment; the pipeline uses mechanical verification only (Rule #4). Log the
-  trend observation to discoveries.md if you want, then discard and move on.
-
-**"I found that [strategy A] works better than [strategy B]"**
-→ Great insight. Write it to discoveries.md. Adopt the better strategy for
-  future iterations. Do not stop to tell the user.
-
-**"I think the user should increase TIME_BUDGET / change IMGSZ"**
-→ You cannot change locked parameters. The user chose them. If you believe
-  they're suboptimal, log to discoveries.md with your reasoning. The user
-  reads it later and decides. Continue looping with current settings.
-
----
-
-## Output Format Reference
-
-`train.py` must print metrics in a format matched by `evaluation.parsing.patterns`.
-
-Example for `tool: ultralytics_val` (regex on stdout):
-```
-all      548     38759      0.42   0.38   0.41   0.245
-Model Summary: 295 layers, 3.2M params, 8.7 GFLOPs
-```
-
-Example for `tool: trackeval`:
-```
-VisDrone COMBINED 0.412
-MOTA  0.587
-IDF1  0.612
-IDSW  342
-```
-
-If `train.py` does not emit metrics in the format your `evaluation.parsing.patterns` expect,
-adjust either the script's print statements or the regex — they are the contract between
-`train.py` and this skill.

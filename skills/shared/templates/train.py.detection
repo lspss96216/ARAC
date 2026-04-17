@@ -59,12 +59,18 @@ def inject_modules(model):
 
     autoresearch appends new branches here when pulling modules from modules.md.
     Do not reorder existing branches — order must stay stable for reproducibility.
+
+    Contract: callers MUST rebind to the return value:
+        model = inject_modules(model)
+    Some branches return a replaced instance (e.g. backbone swap). Calling
+    inject_modules(model) without assignment silently loses the replacement.
+    See train-script-spec.md § inject_modules() for the full contract.
     """
     # Branches go here. Example shape:
     #
     # if USE_SMALL_OBJECT_FPN:
     #     from custom_modules import SmallObjectFPN
-    #     SmallObjectFPN.replace_neck(model)
+    #     return SmallObjectFPN.replace_neck(model)
 
     return model
 
@@ -119,7 +125,11 @@ def print_metrics(metrics, model) -> None:
     print(f"val_mAP50:        {box.map50:.4f}")
     print(f"val_mAP50_95:     {box.map:.4f}")
 
-    n_params_m = sum(p.numel() for p in model.parameters()) / 1e6
+    # D7 — floor at 0.1M. Printing `0.0M params` makes the num_params_M
+    # guard's percent-tolerance degenerate (5% of 0 = 0, so any non-zero
+    # growth triggers the guard). This only matters for tiny sanity-check
+    # models; real models are well above this.
+    n_params_m = max(sum(p.numel() for p in model.parameters()) / 1e6, 0.1)
     print(f"Model Summary: {n_params_m:.1f}M params")
 
     peak_vram_mb = (torch.cuda.max_memory_allocated() / 1e6
@@ -136,6 +146,10 @@ def main() -> int:
         print(f"FATAL: failed to load weights {WEIGHTS}: {e}", file=sys.stderr)
         return 1
 
+    # C6 — Rebind is REQUIRED. Some branches in inject_modules() return a
+    # replaced instance (e.g. backbone swap). Calling inject_modules(model)
+    # without assignment silently loses the replacement.
+    # See train-script-spec.md § inject_modules() — Contract.
     model = inject_modules(model)
 
     try:

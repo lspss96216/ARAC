@@ -1,5 +1,11 @@
-"""Verify train.py templates comply with train-script-spec.md."""
-import pathlib, re, sys
+"""Verify train.py templates comply with train-script-spec.md.
+
+D3 fix: templates directory is resolved relative to this test file, with
+optional PIPELINE_TEMPLATES_DIR env var override. Previous version
+hardcoded /home/claude/shared/templates which worked nowhere but the
+author's machine.
+"""
+import os, pathlib, re, sys
 
 REQUIRED_SECTIONS  = ["Section ①", "Section ②", "Section ③", "Section ④"]
 REQUIRED_VARIABLES = ["TIME_BUDGET", "SEED", "BATCH_SIZE", "WEIGHTS",
@@ -32,14 +38,24 @@ def check(path, kind="train"):
 
 
 if __name__ == "__main__":
+    # D3 — resolve templates dir relative to this file (shared/), with env override
+    HERE = pathlib.Path(__file__).resolve().parent
+    TEMPLATES = pathlib.Path(
+        os.environ.get("PIPELINE_TEMPLATES_DIR", HERE / "templates")
+    )
+
     failed = 0
     for path, kind in [
-        ("/home/claude/shared/templates/train.py.detection", "train"),
-        ("/home/claude/shared/templates/train.py.tracking",  "train"),
-        ("/home/claude/shared/templates/track.py.tracking",  "track"),
+        (TEMPLATES / "train.py.detection", "train"),
+        (TEMPLATES / "train.py.tracking",  "train"),
+        (TEMPLATES / "track.py.tracking",  "track"),
     ]:
-        missing = check(path, kind)
-        name = pathlib.Path(path).name
+        if not path.exists():
+            print(f"✗ {path.name}: file not found at {path}")
+            failed += 1
+            continue
+        missing = check(str(path), kind)
+        name = path.name
         if missing:
             print(f"✗ {name}: missing {missing}")
             failed += 1

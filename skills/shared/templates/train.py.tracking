@@ -53,7 +53,12 @@ CKPT_DIR       = Path("runs/train")
 # ═══════════════════════════════════════════════════════════════════════════════
 def inject_modules(model):
     """Detector-layer modules only. Tracker-layer modules go in track.py.
-    Each branch must be idempotent when its flag is False."""
+    Each branch must be idempotent when its flag is False.
+
+    Contract: callers MUST rebind to the return value:
+        model = inject_modules(model)
+    See train-script-spec.md § inject_modules() — Contract.
+    """
     return model
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -113,7 +118,8 @@ def print_metrics(metrics, model, best_ckpt: str) -> None:
     print(f"val_mAP50:        {box.map50:.4f}")
     print(f"val_mAP50_95:     {box.map:.4f}")
 
-    n_params_m = sum(p.numel() for p in model.parameters()) / 1e6
+    # D7 — floor at 0.1M (see train.py.detection for rationale)
+    n_params_m = max(sum(p.numel() for p in model.parameters()) / 1e6, 0.1)
     print(f"Model Summary: {n_params_m:.1f}M params")
     peak_vram_mb = (torch.cuda.max_memory_allocated() / 1e6
                     if torch.cuda.is_available() else 0)
@@ -132,6 +138,7 @@ def main() -> int:
         print(f"FATAL: failed to load weights {WEIGHTS}: {e}", file=sys.stderr)
         return 1
 
+    # C6 — rebind is REQUIRED (see train.py.detection for rationale)
     model = inject_modules(model)
 
     try:

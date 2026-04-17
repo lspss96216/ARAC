@@ -54,7 +54,7 @@ paths:
 evaluation:
   tool: ultralytics_val            # [required] Evaluation backend. Options: ultralytics_val / trackeval / pycocotools / custom_script
 
-  ultralytics_val:                 # [required if tool=ultralytics_val] Settings passed to ultralytics model.val(). Skip block if using a different tool.
+  ultralytics_val:                 # [required if tool=ultralytics_val] Settings passed to ultralytics model.val().
     split: val                     # Which dataset split to evaluate on. val / test
     imgsz: 1920                    # Inference image size. Locked across runs — orchestrator copies this to train.py's IMGSZ.
     batch: 8                       # Eval batch size. Lower if OOM during val.
@@ -122,7 +122,10 @@ paper_finder:
 # dataset_hunter — public dataset search + pretrain corpus
 # -----------------------------------------------------------------------------
 dataset_hunter:
-  enabled: true                    # [required] Set to false to skip Stage 2 entirely (no pretrain).
+  enabled: true                    # [required] Set to false to skip Stage 2 entirely.
+                                   # C10: When false, pretrain is never run, never auto-triggered mid-loop,
+                                   # and autoresearch starts from the base model weights directly.
+                                   # Stage 2 short-circuits; pipeline_state.stage advances to "autoresearch".
   sources:                         # [optional] Which dataset sources to query. Disable any you don't have access to.
     local: true                    # Scan paths.local_datasets_dir if set
     huggingface: true              # HuggingFace Datasets, tag=object-detection
@@ -163,7 +166,9 @@ autoresearch:
     seed: 42                       # Random seed. Locked across runs for reproducibility.
   stall:                           # [optional] When to escalate after no-improvement streaks.
     threshold: 10                  # Consecutive non-improving rounds before triggering paper_finder expand.
-    force_test_reset: 5            # When stall hits threshold AND modules.md has pending entries, reset stall to this and force-test next pending module.
+    force_test_reset: 5            # When stall hits threshold AND modules.md has pending entries,
+                                   # reset stall_count to this so the pipeline force-tests a pending
+                                   # module next iteration. Set equal to threshold to disable force-test.
   module_priority:                 # [optional] Order autoresearch picks experiment types. Lower index = tried first.
     - modules_md_pending           # A: paper-backed modules from modules.md
     - zero_param_changes           # B: hyperparameters, LR, augmentation (no param count change)
@@ -183,7 +188,19 @@ orchestrator:
     stalled_loops_required: 5      # Trigger after this many consecutive no-improvement loops.
   error_policy:                    # [optional] How to handle expected failures.
     paper_finder_retries: 1        # Retry paper finder this many times before falling back to default base model.
-    autoresearch_crash_pause_after: 3  # After this many consecutive crashes, halve BATCH_SIZE and continue (does NOT pause for user input).
+    autoresearch_crash_pause_after: 3  # After N consecutive crashes, halve BATCH_SIZE in train.py
+                                   # (and track.py if present), revert the last commit, reset
+                                   # the crash counter, log to discoveries.md, and continue
+                                   # looping. Does NOT pause for user input. Set to a very large
+                                   # number to effectively disable. (A3/C8 — now actually wired up.)
+  stopping:                        # [optional] Autonomous Stage 4 triggers. Unattended runs need at least one
+                                   # of these configured, otherwise the loop runs forever.
+    stop_flag_file: "stop_pipeline.flag"   # If this file appears in the project root, orchestrator
+                                           # enters Stage 4 after the current loop iteration. Lets external
+                                           # schedulers (cron, systemd timer) request a clean shutdown.
+    max_paper_finder_expansions: 3 # After this many expansions with no new pending modules, stop —
+                                   # further expansion is not finding new ideas.
+    # Also honours autoresearch.loop.iterations if set (bounded run terminates naturally).
   git:                             # [optional] Git automation.
     auto_init: true                # Run `git init` if project isn't a repo. Required for autoresearch's commit/revert flow.
     branch_prefix: "autoresearch/" # All experiment commits go on a branch named <prefix><run_tag>.

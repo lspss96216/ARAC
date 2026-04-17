@@ -11,7 +11,7 @@ Top of file: registry header
     # Modules Registry
 
     Task: <task description>
-    Base model: <name>
+    Base model: <n>
     Last updated: <iso date>
     Total modules: <n>
 
@@ -85,26 +85,45 @@ class Module:
 # ---------------------------------------------------------------------------
 
 def parse(path: str | pathlib.Path) -> list[Module]:
-    """Parse modules.md. Returns [] if file missing or has no modules."""
+    """Parse modules.md. Returns [] if file missing or has no modules.
+
+    D8 fix: only look for module headers AFTER the registry header's
+    first `---` separator. Without this, any `## ` sequence appearing
+    in the registry header block would be parsed as a module.
+
+    Known limitation: if a module's free-text section body contains a
+    line starting with `## ` at column 0, it WILL be parsed as a new
+    module. Callers should write section bodies via `append_module` and
+    avoid starting lines with `## ` at column 0 (indent or use a
+    different heading level for body content).
+    """
     p = pathlib.Path(path)
     if not p.exists():
         return []
 
     text = p.read_text()
-    # Split on level-2 headers. Leading \n prevents accidental mid-line matches.
-    # First chunk (before any ##) is the registry header — skip it.
-    chunks = re.split(r"(?m)^## ", text)
+
+    # D8 — skip past the registry header. The spec guarantees a `---`
+    # line (horizontal rule) between the registry header and the first
+    # module. If absent, fall back to parsing from the start.
+    sep_m = re.search(r"(?m)^-{3,}\s*$", text)
+    body = text[sep_m.end():] if sep_m else text
+
+    # Split on level-2 headers. Require `## ` followed by a non-space
+    # character so lines like `##` in code blocks (e.g. `##` in a bash
+    # heredoc) aren't treated as headers.
+    chunks = re.split(r"(?m)^## (?=\S)", body)
     modules: list[Module] = []
-    for chunk in chunks[1:]:
+    for chunk in chunks[1:]:       # chunk 0 is whatever was before the first module
         lines = chunk.splitlines()
         if not lines:
             continue
         name = lines[0].strip()
-        body = "\n".join(lines[1:])
+        mbody = "\n".join(lines[1:])
         modules.append(Module(
             name=name,
-            fields=_parse_pipe_table(body),
-            sections=_parse_sections(body),
+            fields=_parse_pipe_table(mbody),
+            sections=_parse_sections(mbody),
         ))
     return modules
 
@@ -183,9 +202,12 @@ def find_by_name(path, name: str) -> Optional[Module]:
 # ---------------------------------------------------------------------------
 
 def update_status(path, module_name: str, new_status: str) -> bool:
-    """Update Status field for a named module. Returns True if a change was made."""
+    """Update Status field for a named module.
+    Returns True if a change was made."""
     if new_status not in VALID_STATUSES:
-        raise ValueError(f"Invalid status {new_status!r}; must be one of {sorted(VALID_STATUSES)}")
+        raise ValueError(
+            f"Invalid status {new_status!r}; must be one of {sorted(VALID_STATUSES)}"
+        )
 
     p = pathlib.Path(path)
     text = p.read_text()
@@ -198,8 +220,8 @@ def update_status(path, module_name: str, new_status: str) -> bool:
     new_text, n = pattern.subn(rf"\1\2{new_status}\4", text, count=1)
     if n == 0:
         return False
-    _refresh_header(new_text_list := [new_text], p)   # refresh "Last updated"
-    p.write_text(new_text_list[0])
+    # C4 — pure-function refresh, no list-mutation tricks.
+    p.write_text(_refresh_header(new_text))
     return True
 
 
@@ -231,9 +253,18 @@ def append_module(path, module: Module | dict) -> None:
         return
 
     text = p.read_text()
-    # Update header counters
-    new_count = len(parse(p)) + 1
-    text = re.sub(r"(?m)^Total modules:\s*\d+\s*$", f"Total modules: {new_count}", text)
+
+    # D4 — read Total modules counter directly from the header instead of
+    # re-parsing the whole file. Each append is now O(1) in existing module
+    # count, not O(n).
+    m = re.search(r"(?m)^Total modules:\s*(\d+)\s*$", text)
+    current = int(m.group(1)) if m else 0
+    new_count = current + 1
+    text = re.sub(
+        r"(?m)^Total modules:\s*\d+\s*$",
+        f"Total modules: {new_count}",
+        text,
+    )
     text = re.sub(
         r"(?m)^Last updated:\s*\S+\s*$",
         f"Last updated: {date.today().isoformat()}",
@@ -256,10 +287,13 @@ def _render(module: Module) -> str:
     return "\n".join(lines)
 
 
-def _refresh_header(text_list: list[str], path: pathlib.Path) -> None:
-    """Refresh 'Last updated' in the registry header (in place on text_list[0])."""
-    text_list[0] = re.sub(
+def _refresh_header(text: str) -> str:
+    """C4 — pure function: return text with 'Last updated' in the registry
+    header set to today. Previous version mutated a list passed in as arg,
+    which was an awkward workaround for Python not having pass-by-reference
+    for strings. Pure is clearer."""
+    return re.sub(
         r"(?m)^Last updated:\s*\S+\s*$",
         f"Last updated: {date.today().isoformat()}",
-        text_list[0],
+        text,
     )

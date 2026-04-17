@@ -81,7 +81,7 @@ evaluation:
       MOTA: 'MOTA:\s+([\d.]+)'
       IDF1: 'IDF1:\s+([\d.]+)'
       IDSW: 'IDSW:\s+(\d+)'
-      FPS:  '([\d.]+)\s*FPS'
+      FPS:  'FPS:\s+([\d.]+)'               # D10 — track.py now emits "FPS: <value>" (prefix), matching this pattern.
       val_mAP50_95: 'val_mAP50_95:\s+([\d.]+)'  # [tracking-only] Required for dataset hunter's self-eval (always uses detection mAP, regardless of task_type).
       num_params_M: 'Model Summary:.*?([\d.]+)M params'
 
@@ -134,6 +134,8 @@ paper_finder:
 # -----------------------------------------------------------------------------
 dataset_hunter:
   enabled: true                    # [required] Set false to skip Stage 2.
+                                   # C10: When false, pretrain never runs and autoresearch starts from the base model weights.
+                                   # Stage 2 short-circuits; pipeline_state.stage advances to "autoresearch".
   sources:                         # [optional] Note: dataset hunter searches DETECTION datasets even for tracking, because it measures detector quality only.
     local: true
     huggingface: true
@@ -164,11 +166,12 @@ autoresearch:
   loop:
     time_budget_sec: 1200          # 20 min per experiment. Locked across runs.
     max_runtime_multiplier: 2      # Kill as crashed if exceeds budget × this.
-    iterations: null               # null = run forever until interrupted.
+    iterations: null               # null = run forever until interrupted (see orchestrator.stopping).
     seed: 42                       # Locked across runs.
   stall:
     threshold: 10                  # Consecutive no-improvement rounds before triggering paper finder expand.
     force_test_reset: 5            # When stalled with pending modules, reset stall to this and force-test next pending.
+                                   # Actually read from yaml now (C1 — was hardcoded in v1.5).
   module_priority:                 # Order autoresearch picks experiment types.
     - modules_md_pending
     - zero_param_changes
@@ -188,7 +191,10 @@ orchestrator:
     stalled_loops_required: 5
   error_policy:
     paper_finder_retries: 1
-    autoresearch_crash_pause_after: 3  # After this many consecutive crashes, halve BATCH_SIZE and continue (does not pause for user).
+    autoresearch_crash_pause_after: 3  # After N consecutive crashes, halve BATCH_SIZE and continue (A3/C8).
+  stopping:                        # [optional] Autonomous Stage 4 triggers. Unattended runs need at least one (C9).
+    stop_flag_file: "stop_pipeline.flag"   # External scheduler drops this file to request clean shutdown.
+    max_paper_finder_expansions: 3 # After this many expansions with no new modules, stop.
   git:
     auto_init: true
     branch_prefix: "autoresearch/"

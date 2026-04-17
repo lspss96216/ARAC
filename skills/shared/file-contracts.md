@@ -28,34 +28,49 @@ JSON spec only: `string`, `number` (int or finite float), `bool`, `null`, `array
 
 ```jsonc
 {
+  // ---------------------------------------------------------------------
   // Identity
+  // ---------------------------------------------------------------------
   "project_name":               "string",          // from meta.project_name
   "run_tag":                    "string | null",
   "task":                       "string",          // task.description
   "task_type":                  "string",          // object_detection | object_tracking | ...
-  "dataset":                    "string",
+  "dataset_root":               "string",          // C3 — renamed from "dataset"
   "stage":                      "string",          // init | paper_finder | dataset_hunter | autoresearch | done
 
+  // ---------------------------------------------------------------------
   // Skill progress flags
+  // ---------------------------------------------------------------------
   "paper_finder_done":          "bool",
   "base_model_md_ready":        "bool",
   "modules_md_ready":           "bool",
   "pretrain_done":              "bool",
   "pretrain_skipped":           "bool",
   "pretrain_offer_declined":    "bool",
+  "pretrain_attempt_failed":    "bool",            // B3 — distinguishes "tried and crashed" from "tried and not worth it"
   "pretrain_weights":           "string | null",
   "base_weights_local":         "string | null",
   "autoresearch_running":       "bool",
 
+  // ---------------------------------------------------------------------
   // Metric tracking (metric-agnostic by design)
+  // ---------------------------------------------------------------------
   "primary_metric_name":        "string",          // from evaluation.metrics.primary
   "best_primary_value":         "number | null",   // null until first keep
+  "best_tiebreak_value":        "number | null",   // A2 — null until first keep with a tiebreak metric
   "stall_count":                "int",
   "loop_count":                 "int",
   "seed":                       "int",
   "paper_finder_expansions":    "int",
+  "param_only_streak":          "int",             // consecutive param-only experiments without improvement
+  "architecture_keeps":         "int",             // count of kept architecture changes (for re-pretrain trigger)
+  "consecutive_crashes":        "int",             // A3/C8 — reset on non-crash; triggers BATCH_SIZE halving at crash_pause_after
+  "rebase_marker_loops":        "array[int]",      // B4 — loop numbers where a re-pretrain cycle occurred; Stage 4 segments results.tsv by these
+  "baseline_snapshot":          "object | null",   // reserved for future B2 guard-metric baseline fix; currently unused
 
+  // ---------------------------------------------------------------------
   // Paths
+  // ---------------------------------------------------------------------
   "local_papers_dir":           "string | null",
   "local_datasets_dir":         "string | null",
   "skills_dir":                 "string",
@@ -63,32 +78,56 @@ JSON spec only: `string`, `number` (int or finite float), `bool`, `null`, `array
   "custom_modules_file":        "string",
   "weights_dir":                "string",
 
+  // ---------------------------------------------------------------------
   // Time budgets (seconds)
+  // ---------------------------------------------------------------------
   "pretrain_time_budget":       "int",
   "self_eval_time_budget":      "int",
   "loop_time_budget":           "int",
   "pretrain_improvement_threshold": "number",
 
+  // ---------------------------------------------------------------------
   // Dataset hunter knobs
+  // ---------------------------------------------------------------------
   "dataset_hunter_enabled":     "bool",
   "disk_budget_gb":             "int",
   "roboflow_api_key":           "string | null",
 
+  // ---------------------------------------------------------------------
   // Autoresearch knobs
+  // ---------------------------------------------------------------------
   "stall_threshold":            "int",
+  "stall_force_test_reset":     "int",             // C1 — from autoresearch.stall.force_test_reset (default 5)
   "improvement_threshold":      "number",
   "loop_iterations":            "int | null",
 
+  // ---------------------------------------------------------------------
   // Orchestrator knobs
-  "crash_pause_after":          "int",
+  // ---------------------------------------------------------------------
+  "crash_pause_after":          "int",             // consecutive crashes before BATCH_SIZE halve
+  "python_runner":              "string",          // D5 — "uv run" or "python3"; chosen at Stage 0 Step 0
+  "stop_flag_file":             "string",          // C9 — path to sentinel file that triggers Stage 4
+  "max_paper_finder_expansions": "int",            // C9 — after this many expansions with no new modules, stop
+  "stop_requested":             "bool",            // C9 — set when any Stage 4 trigger fires
+  "stop_reason":                "string | null",   // C9 — human-readable reason printed in summary
 
+  // ---------------------------------------------------------------------
   // Advanced paths
+  // ---------------------------------------------------------------------
   "results_tsv":                "string",
   "modules_md_path":            "string",
   "base_model_md_path":         "string",
   "pretrain_ckpt_dir":          "string",
 
+  // ---------------------------------------------------------------------
+  // Re-pretrain signaling (autoresearch -> orchestrator)
+  // ---------------------------------------------------------------------
+  "request_repretrain":         "bool",            // autoresearch raises; orchestrator clears after Step 6.5
+  "repretrain_reason":          "string | null",
+
+  // ---------------------------------------------------------------------
   // Timestamps
+  // ---------------------------------------------------------------------
   "started_at":                 "iso-8601 string",
   "last_updated":               "iso-8601 string"
 }
@@ -102,6 +141,45 @@ JSON spec only: `string`, `number` (int or finite float), `bool`, `null`, `array
 - `json.dump(state, f, indent=2)` with default settings. If you need to serialize
   something the encoder cannot handle, convert to a native type first — never
   pass `default=str` (hides bugs like serializing `float("inf")`).
+
+### State migration on resume
+
+Schemas evolve. Orchestrator Stage 0 reads `pipeline_state.json` and runs the
+`migrate()` helper at `<skills_dir>/shared/state_migrate.py` which:
+
+1. Adds any missing keys from the current schema with the documented default.
+2. Renames legacy keys — specifically `"dataset"` → `"dataset_root"`.
+3. Coerces any `float("inf")` / `NaN` sentinels to `null`.
+4. Writes the normalized state back in-place.
+
+Callers obtain a schema-complete state with:
+
+```python
+from shared.state_migrate import migrate
+state = migrate("pipeline_state.json")
+```
+
+New fields added in this version (all have safe defaults — resume of an older
+state file will auto-fill them):
+
+| Field | Default | Fix ID |
+|---|---|---|
+| `consecutive_crashes` | 0 | A3 / C8 |
+| `best_tiebreak_value` | null | A2 |
+| `pretrain_attempt_failed` | false | B3 |
+| `rebase_marker_loops` | [] | B4 |
+| `stall_force_test_reset` | 5 | C1 |
+| `dataset_root` (rename of `dataset`) | — | C3 |
+| `python_runner` | "uv run" | D5 |
+| `stop_flag_file` | "stop_pipeline.flag" | C9 |
+| `max_paper_finder_expansions` | 3 | C9 |
+| `stop_requested` | false | C9 |
+| `stop_reason` | null | C9 |
+| `baseline_snapshot` | null | (reserved for future B2) |
+| `param_only_streak` | 0 | (existing, schema-documented now) |
+| `architecture_keeps` | 0 | (existing, schema-documented now) |
+| `request_repretrain` | false | (existing, schema-documented now) |
+| `repretrain_reason` | null | (existing, schema-documented now) |
 
 ---
 
@@ -169,8 +247,20 @@ and index by column name, not by position.
 
 - Metrics → float, 4 decimal places for fractions (`0.4523`), integers for counts (`342`)
 - Crashed experiments → `0.0000` / `0` in metric columns, `crash` in status
-- `status` column → one of `keep`, `discard`, `crash`
+- `status` column → one of `keep`, `discard`, `crash`, or `rebase` (B4 — marks a re-pretrain boundary)
 - `description` → free text, no tabs or newlines (sanitize before writing)
+
+### Rebase markers (B4)
+
+When orchestrator re-runs pretrain mid-loop (Stage 3 Step 6.5), it writes a
+sentinel row to results.tsv:
+
+```
+<loop>\trebase\t<zeros for all metric cols>\t0.0000\trebase\tre-pretrain: <reason>
+```
+
+Stage 4 summary segments the file at each `status == "rebase"` row and prints
+"Top 5 per pretrain generation" rather than pooling across different baselines.
 
 ---
 
@@ -233,5 +323,6 @@ in checkpoint. Switched to subclass-based injection.
 Categories: `observation` / `limitation` / `strategy_shift` / `bug_workaround`
 
 This file has no schema enforcement — it is human-readable notes, not
-machine-parsed state. The only contract is: autoresearch appends to it,
+machine-parsed state. The only contract is: autoresearch appends to it (atomic
+via write-and-rename to prevent partial reads during concurrent access — D9),
 orchestrator reads and prints it.

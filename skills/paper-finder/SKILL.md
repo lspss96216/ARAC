@@ -60,7 +60,7 @@ and abstract snippets. Do not download full PDFs yet — that happens in Phase 3
 
 ```bash
 # Search via arXiv API (no key required)
-curl "https://export.arxiv.org/api/query?search_query=all:<query>&max_results=30&sortBy=relevance" 
+curl "https://export.arxiv.org/api/query?search_query=all:<query>&max_results=30&sortBy=relevance"
 ```
 
 Use multiple targeted queries based on Phase 1 output. Examples for drone detection:
@@ -84,8 +84,8 @@ Focus on papers with associated code repos and benchmark results on relevant dat
 
 The PwC JSON API returns basic metadata (title, abstract, URL) but misses
 repo README details, exact benchmark numbers, and pretrained weights links.
-If `firecrawl` CLI is installed, scrape each paper's PwC page to extract richer
-data:
+If the `firecrawl` CLI is installed, scrape each paper's PwC page to extract
+richer data:
 
 ```bash
 # Check if firecrawl is available
@@ -121,11 +121,25 @@ def extract_pwc_details(scraped_md: str) -> dict:
     return details
 ```
 
-If Firecrawl is not installed, the pipeline falls back to the JSON API alone —
-no data is lost, just less detail available for scoring. Install with:
-`npm install -g firecrawl` + set `FIRECRAWL_API_KEY` in `.env` (see
-orchestrator Stage 0 Step 1.5). The CLI reads the key from `os.environ`
-automatically.
+**Note on Firecrawl CLI (D1/D2):** Firecrawl is primarily a hosted API
+service. There is no official `firecrawl` CLI binary shipped by the vendor,
+so `command -v firecrawl` will normally return nothing and this block is
+skipped. If you want Firecrawl's richer scraping here, install the Python
+package and call it programmatically:
+
+```python
+# pip install firecrawl-py
+from firecrawl import FirecrawlApp
+app = FirecrawlApp(api_key=os.environ["FIRECRAWL_API_KEY"])
+result = app.scrape_url(page_url, params={"formats": ["markdown"]})
+scraped_md = result.get("markdown", "")
+```
+
+The current CLI-based path is best-effort and designed to degrade
+silently when firecrawl is not installed.
+
+If Firecrawl is not available, the pipeline falls back to the JSON API alone —
+no data is lost, just less detail available for scoring.
 
 ### Semantic Scholar
 
@@ -236,31 +250,56 @@ A paper qualifies as a base model candidate if:
 
 Select the single highest-scoring candidate as base model.
 
-#### Validate weights URL via Firecrawl (optional)
+#### Validate weights URL (D1/D2)
 
 Before writing the weights URL to `base_model.md`, verify the link is alive.
-Dead links cause orchestrator Stage 2 to `wget` a 404 and silently fall back
+Dead links cause orchestrator Stage 2 to download a 404 and silently fall back
 to `yolo26x.pt`, wasting the entire base model selection.
 
 ```python
-import subprocess, shutil
+import subprocess
 
 def validate_weights_url(url: str) -> bool:
-    """Check if a weights URL is reachable. Uses firecrawl if available,
-    falls back to curl HEAD request."""
+    """Check if a weights URL is reachable.
+
+    Strategy (D1/D2):
+      1. Primary: HTTP HEAD via curl. Fast, no API cost, works for the vast
+         majority of direct weights downloads (.pt / .pth / .safetensors).
+      2. Fallback: if HEAD returns ambiguous status (e.g. 403 because the
+         host doesn't allow HEAD, or a redirect that the default curl didn't
+         follow), try a range GET for the first byte.
+      3. Firecrawl is NOT used here. It is an HTML-scraping service and
+         misclassifies binary downloads. Kept only for PwC deep scrape
+         elsewhere in the pipeline.
+    """
     if not url or url == "reconstruct via paper2code":
         return True   # paper2code path — no URL to check
 
-    if shutil.which("firecrawl"):
-        # Firecrawl scrape returns non-zero on unreachable pages
-        r = subprocess.run(["firecrawl", "scrape", url, "--format", "links"],
-                           capture_output=True, text=True, timeout=30)
-        return r.returncode == 0
-    else:
-        # Fallback: curl HEAD
-        r = subprocess.run(["curl", "-sI", "-o", "/dev/null", "-w", "%{http_code}", url],
-                           capture_output=True, text=True, timeout=15)
-        return r.stdout.strip().startswith("2")
+    # Step 1: HEAD with redirect-follow
+    try:
+        r = subprocess.run(
+            ["curl", "-sIL", "-o", "/dev/null",
+             "-w", "%{http_code}", "--max-time", "15", url],
+            capture_output=True, text=True, timeout=20,
+        )
+        code = r.stdout.strip()
+        if code.startswith("2"):
+            return True
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    # Step 2: GET first byte (some hosts reject HEAD with 403)
+    try:
+        r = subprocess.run(
+            ["curl", "-sSL", "-o", "/dev/null",
+             "-r", "0-0", "-w", "%{http_code}",
+             "--max-time", "15", url],
+            capture_output=True, text=True, timeout=20,
+        )
+        code = r.stdout.strip()
+        return code.startswith("2")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
 
 # After selecting the base model, before writing base_model.md:
 if not validate_weights_url(weights_url):
@@ -327,6 +366,16 @@ Prioritise modules with:
 - Clear improvement aspect matching the task's key challenges
 - paper2code compatible = yes
 
+Location vocabulary for the `Location` field (A5 depends on this being one of
+the recognised values — autoresearch will `discard` any module with an
+unknown Location rather than guess a default):
+
+- Detector locations: `backbone`, `neck`, `head`, `loss`, `label_assignment`
+- Tracker locations: `tracker`, `post_processing`, `association`, `reid`
+
+Use the exact lower-case spelling above. If uncertain, pick the closest match
+and note the ambiguity in `Integration notes`.
+
 ---
 
 ## Phase 6 — Write modules.md
@@ -357,7 +406,7 @@ mm.append_module("modules.md", {
         "arXiv":       "https://arxiv.org/abs/<id>",     # or omit if not on arXiv
         "Published":   "<year>",
         "Authors":     "<first author et al.>",
-        "Location":    "backbone",                        # backbone / neck / head / loss / tracker / post_processing
+        "Location":    "backbone",                        # see Location vocabulary above
         "Improves":    "small objects",                   # free text; describes what it targets
         "Complexity":  "low",                             # low / medium / high
         "paper2code":  "yes",                             # yes / yes (GitHub repo: <url>) / no (not on arXiv) / no (no public repo)
@@ -367,7 +416,7 @@ mm.append_module("modules.md", {
     "sections": {
         "What it does":     "<2–3 sentences from abstract, in your own words>",
         "Integration notes": (
-            "<Where does this go in train.py? Use the vocabulary from "
+            "Where does this go in train.py? Use the vocabulary from "
             "train-script-spec.md § File layout:\n"
             " - Main toggle: USE_<MODULE> flag name to append\n"
             " - Target file: train.py (detector) or track.py (tracker)\n"
@@ -381,7 +430,6 @@ mm.append_module("modules.md", {
             "'recommended', or uses in the main experiment.\n"
             "If the paper leaves a parameter unspecified, omit it — autoresearch "
             "will fall back to the code's __init__ default."
-            ">"
         ),
         "paper2code command": "/paper2code https://arxiv.org/abs/<id>\nExtract: `<ClassName>` from `src/model.py`",
     },
@@ -455,7 +503,7 @@ Sources searched: arXiv, Papers with Code, Semantic Scholar
 Papers evaluated: XX
 Papers kept (top 20): 20
 
-Base model selected: <name>
+Base model selected: <n>
   arXiv: <url>
   Weights: available / reconstruct via paper2code
 

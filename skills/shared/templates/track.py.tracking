@@ -88,7 +88,13 @@ def read_trained_weights_from_log(log_path: str = "run.log") -> str:
 
 def run_tracker(weights: str) -> int:
     """Run detector + tracker on every val sequence; write MOT-challenge-format
-    predictions to TRACKER_OUT. Return total number of frames processed."""
+    predictions to TRACKER_OUT. Return total number of frames processed.
+
+    D10 fix: FPS is computed per-sequence (seq_frames / elapsed), not
+    cumulative (frames_total / elapsed). The original cumulative form made
+    later samples carry earlier sequences' frame counts divided by only the
+    current sequence's elapsed time, inflating FPS by an order of magnitude.
+    """
     import yaml as _yaml
     tracker_cfg = _yaml.safe_load(Path(TRACKER_CONFIG).read_text())
     tracker_cfg = apply_tracker_modules(tracker_cfg)
@@ -105,6 +111,7 @@ def run_tracker(weights: str) -> int:
     for seq_dir in sorted(Path(VAL_SEQUENCES).iterdir()):
         if not seq_dir.is_dir():
             continue
+        seq_frames = 0                       # D10 — per-sequence counter
         t0 = time.time()
         results = model.track(
             source=str(seq_dir),
@@ -125,13 +132,18 @@ def run_tracker(weights: str) -> int:
                     # MOT-challenge format: frame,id,x,y,w,h,conf,cls,vis
                     f.write(f"{frame_idx},{tid},{x - w/2:.2f},{y - h/2:.2f},"
                             f"{w:.2f},{h:.2f},1,{cls},1\n")
-                    frames_total += 1
+                    seq_frames += 1
         elapsed = max(time.time() - t0, 1e-6)
-        fps_samples.append(frames_total / elapsed)
+        if seq_frames > 0:
+            fps_samples.append(seq_frames / elapsed)   # D10 — per-sequence FPS
+        frames_total += seq_frames
 
     avg_fps = sum(fps_samples) / len(fps_samples) if fps_samples else 0.0
     print(f"tracker_frames:   {frames_total}")
-    print(f"{avg_fps:.1f} FPS")
+    # D10 — prefix "FPS:" so evaluation.parsing pattern `FPS:\s+([\d.]+)` matches.
+    # The previous format `{avg_fps:.1f} FPS` put the number first and would
+    # never match the documented yaml regex.
+    print(f"FPS:              {avg_fps:.1f}")
     return frames_total
 
 
