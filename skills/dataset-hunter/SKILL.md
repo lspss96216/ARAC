@@ -884,9 +884,19 @@ def patch_section_2(src_path: str, dst_path: str, overrides: dict[str, str]) -> 
 pretrain_yaml = "pretrain_data/merged/dataset.yaml"
 num_classes   = len(_yaml.safe_load(open(pretrain_yaml))["names"])
 
+# v1.7.2 — pull IMGSZ from pipeline_state, where orchestrator Stage 3 Step 3
+# canonically resolved it from research_config.yaml. Before v1.7.2,
+# pretrain.py silently ran at the detection template's default IMGSZ
+# (1920), ignoring user-configured 1280 / 640 / etc. — the self-eval
+# comparison against the user's IMGSZ then operated at different
+# resolutions in pretrain vs finetune, making the pretrain-improves-or-not
+# signal unreliable.
+imgsz = state.get("imgsz", 1920)   # fallback if orchestrator pre-v1.7.2
+
 patch_section_2(SELF_EVAL_SOURCE, "pretrain.py", {
     "DATA_YAML":     repr(pretrain_yaml),
     "WEIGHTS":       repr(PRETRAIN_WEIGHTS),
+    "IMGSZ":         str(imgsz),
     "FREEZE_LAYERS": "0",
     "CKPT_DIR":      f"Path({state['pretrain_ckpt_dir']!r})",
     "TIME_BUDGET":   str(state["pretrain_time_budget"]),

@@ -713,6 +713,13 @@ for script in scripts_to_lock:
     lock_variable(script, "TIME_BUDGET", state["loop_time_budget"])
     lock_variable(script, "SEED",        state.get("seed", 42))
     lock_variable(script, "IMGSZ",       imgsz)
+
+# v1.7.2 — persist the resolved IMGSZ in pipeline_state so downstream skills
+# (dataset-hunter's pretrain.py scaffold, autoresearch's Step 5.5 repair
+# probes) don't each have to re-read research_config.yaml and re-implement
+# the same fallback chain. One canonical resolution lives here.
+state["imgsz"] = imgsz
+pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
 ```
 
 These three values (TIME_BUDGET, SEED, IMGSZ) are fixed for the entire pipeline

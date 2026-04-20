@@ -806,7 +806,15 @@ target_ins = spec["insertions"][0]        # usually only one
 # 3. Probe upstream shape at the insertion point
 #    (upstream_idx is where the module would be inserted AFTER)
 upstream_idx = ...   # determined from the spec's position/scope
-imgsz = state["imgsz"]
+# v1.7.2 — orchestrator Stage 3 Step 3 writes state["imgsz"]. Fall back to
+# re-reading research_config.yaml for pre-v1.7.2 state files on resume.
+imgsz = state.get("imgsz")
+if imgsz is None:
+    _cfg = yaml.safe_load(pathlib.Path("research_config.yaml").read_text())
+    _ev = _cfg.get("evaluation", {})
+    imgsz = (_ev.get("ultralytics_val", {}).get("imgsz")
+             or _ev.get("trackeval", {}).get("imgsz")
+             or 1920)
 upstream = wt.get_shape_at_index(base.model, upstream_idx, imgsz)
 
 # 4. Probe the module in isolation to find its in/out shape

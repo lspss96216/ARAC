@@ -9,8 +9,21 @@ keeping what improves the primary metric.
 Supports `task_type: object_detection` and `object_tracking`, driven entirely
 by `research_config.yaml`. No skill hardcodes a specific metric.
 
-**This is v1.7.1** — adds an adaptive repair loop (Step 5.5). When a
-yaml_inject or hook experiment crashes, autoresearch now classifies the
+**This is v1.7.2** — bug fix for a cross-skill `IMGSZ` handoff gap.
+`research_config.yaml → evaluation.ultralytics_val.imgsz` was correctly
+locked into `train.py` by orchestrator Stage 3, but was silently lost
+when dataset-hunter derived `pretrain.py` from the detection template
+(stuck at 1920 regardless of user config), and referenced as
+`state["imgsz"]` in v1.7.1's yaml_inject repair loop without anyone
+writing it. Both sites now read a canonical `state["imgsz"]` that
+orchestrator persists. See `CHANGELOG_v1.7.2.md`.
+
+This is purely a cross-skill state-handoff fix. No schema changes, no
+new features, no library changes. 51 tests still green, drop-in on top
+of v1.7.1.
+
+**v1.7.1 features remain** — adaptive repair loop (Step 5.5). When a
+yaml_inject or hook experiment crashes, autoresearch classifies the
 error: code bugs (Tier 1) are patched and retried, shape/channel
 mismatches (Tier 2) are adapted by auto-inserting 1×1 Conv adapters
 around the experimental module, and architectural impossibilities
@@ -27,19 +40,18 @@ out explicitly with reciprocal "asymmetric cost" guidance in
 paper-finder; (Q3) a stale historical note about stall_count in
 autoresearch has been removed.
 
-Drop-in on top of v1.7: no state schema migration, no breaking
-changes. Builds on v1.7's architectural injection (yaml_inject mode):
+**v1.7 features remain** — architectural injection (yaml_inject mode):
 modules that insert a new layer mid-backbone work end-to-end via
 `weight_transfer.py`, which generates a modified YAML, builds the
 model, transfers weights from the base `.pt` per a computed layer_map,
 and forces lazy modules to build before the optimizer captures
 parameters. See `CHANGELOG_v1.7.md`.
 
-v1.6 → v1.7 → v1.7.1 is a pure-addition chain: every existing code
-path, contract, and state file is preserved. Modules without the
-`Integration mode` field default to `hook` (the v1.6 path). State
-files from v1.5 / v1.6 / v1.7 resume transparently via
-`shared/state_migrate.py`.
+v1.6 → v1.7 → v1.7.1 → v1.7.2 is a pure-addition-and-fix chain: every
+existing code path, contract, and state file is preserved. Modules
+without the `Integration mode` field default to `hook` (the v1.6
+path). State files from v1.5 / v1.6 / v1.7 / v1.7.1 resume
+transparently via `shared/state_migrate.py`.
 
 ---
 
@@ -76,6 +88,7 @@ examples/
 CHANGELOG_v1.6.md                           · 26 bug fixes on top of v1.5
 CHANGELOG_v1.7.md                           · yaml_inject feature addition
 CHANGELOG_v1.7.1.md                         · Step 5.5 repair loop + Q2/Q3 patches
+CHANGELOG_v1.7.2.md                         · IMGSZ state-handoff fix
 ```
 
 ---
@@ -248,10 +261,16 @@ SDK (`pip install firecrawl-py`) per the caveat in paper-finder Phase 2.
 
 ## Versions
 
-See `CHANGELOG_v1.7.1.md`, `CHANGELOG_v1.7.md`, and `CHANGELOG_v1.6.md`
-for recent release notes.
+See `CHANGELOG_v1.7.2.md`, `CHANGELOG_v1.7.1.md`, `CHANGELOG_v1.7.md`,
+and `CHANGELOG_v1.6.md` for recent release notes.
 
-- **v1.7.1** (current): adaptive repair loop — Step 5.5 in autoresearch.
+- **v1.7.2** (current): cross-skill `IMGSZ` handoff fix. Orchestrator
+  now persists the resolved `imgsz` into `pipeline_state.json`;
+  dataset-hunter's `pretrain.py` and autoresearch's Step 5.5 read from
+  there instead of the template default (1920) or a missing
+  `state["imgsz"]`. No new features, no schema change, all 51 tests
+  still green.
+- **v1.7.1**: adaptive repair loop — Step 5.5 in autoresearch.
   `weight_transfer.py` gains ~350 lines of repair primitives (crash
   classification, shape probing, adapter planning, loss validation). Test
   count 19 → 36. Also patches hook-mode silent-failure warning (Q2) and
