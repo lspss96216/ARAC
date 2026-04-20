@@ -230,6 +230,79 @@ Write: `mm.append_module(path, module_dict)`, `mm.update_status(path, name, new_
 Valid statuses: `pending`, `injected`, `tested`, `discarded` (enforced by parser).
 Valid complexities: `low`, `medium`, `high` (enforced by parser).
 
+### Field conventions
+
+| Field | Required? | Values | Notes |
+|---|---|---|---|
+| `Paper` | yes | free text | Paper title |
+| `arXiv` | recommended | URL | `https://arxiv.org/abs/...` |
+| `Published` | optional | year string | |
+| `Location` | yes | `backbone` / `neck` / `head` / `loss` / `label_assignment` / `tracker` / `post_processing` / `association` / `reid` | Determines hook vs tracker dispatch, and scope for yaml_inject (A5) |
+| `Complexity` | yes | `low` / `medium` / `high` | Affects `find_pending` sort order; `high` is tried last |
+| `paper2code` | yes | `yes` / `yes (GitHub repo: <url>)` / `no (not on arXiv)` / `no (no public repo)` | How autoresearch gets the module's code |
+| `pdf_path` | only for local PDFs | file path | Used by `list_pdf_paths` for dedup in Mode B |
+| `Status` | yes | `pending` / `injected` / `tested` / `discarded` | Default `pending` on append |
+| `Integration mode` | optional | `hook` / `yaml_inject` / `full_yaml` | **v1.7.** Omit or set `hook` for hook-style modules (v1.6 default). Use `yaml_inject` for modules that need YAML-level insertion + weight transfer (see `train-script-spec.md § Architecture injection`). `full_yaml` is reserved for v1.8+ and raises `NotImplementedError` in v1.7. Unknown values warn to stderr and fall back to `hook` (warn-not-reject). |
+
+### yaml_inject module extras
+
+When `Integration mode: yaml_inject`, the module's `Integration notes`
+section should additionally specify the injection parameters — at minimum
+`module_class` (the name of the lazy wrapper class in `custom_modules.py`),
+`position` (`after_class: <class>` or `at_index: <int>`), and `scope`
+(`backbone` / `neck` / `head` / `all`). Autoresearch extracts these and
+writes `arch_spec.json` before running `train.py`.
+
+---
+
+## `arch_spec.json` (v1.7)
+
+Written by autoresearch when it picks a module with
+`Integration mode: yaml_inject`. Read by `weight_transfer.py` at
+`train.py` run time.
+
+Lives at the path `train.py`'s Section ② `ARCH_INJECTION_SPEC_FILE` points
+to — default `arch_spec.json` in the project root. It IS git-tracked (unlike
+`pipeline_state.json`) so the experiment is fully reproducible from the
+commit alone.
+
+Schema in `shared/templates/arch_spec.schema.json`. Two modes:
+
+```jsonc
+// v1.7 — insertions mode
+{
+  "mode": "insertions",
+  "insertions": [
+    {
+      "module_class":  "string, class name in custom_modules.py",
+      "position": {
+        "kind": "after_class" | "at_index",
+        "class_name": "string (if after_class)",
+        "index":      "int (if at_index)"
+      },
+      "scope":         "backbone" | "neck" | "head" | "all",
+      "yaml_args":     ["list of literals, first is channel hint"],
+      "module_kwargs": { "optional": "dict of kwargs" }
+    }
+  ],
+  "strict": true   // per-entry: every layer_map entry must transfer ≥1 tensor
+}
+
+// v1.8+ — full_yaml mode (NotImplementedError in v1.7)
+{
+  "mode": "full_yaml",
+  "custom_yaml_path":   "exp_bifpn.yaml",
+  "layer_map_override": null
+}
+```
+
+Rules:
+- `position.kind: at_index` uses **base-YAML indices**, not custom-YAML indices.
+  `weight_transfer` handles offsets.
+- `scope` is enforced as an assertion in `at_index` mode — out-of-scope raises.
+- `strict: true` is the default; set false only if you deliberately expect
+  some layers to transfer zero tensors.
+
 ---
 
 ## `results.tsv`

@@ -45,6 +45,14 @@ CKPT_DIR       = Path("runs/train")
 EVAL_CONF      = 0.001
 EVAL_IOU       = 0.6
 
+# Architecture injection (v1.7) — YAML-level module insertion via weight_transfer.
+# Default False: the hook path below (inject_modules) is used.
+# When True: weight_transfer.build_custom_model_with_injection replaces
+# YOLO(WEIGHTS) with a custom-YAML model that has pretrained weights transferred.
+# See train-script-spec.md § Architecture injection and arch_spec.schema.json.
+ARCH_INJECTION_ENABLED   = False
+ARCH_INJECTION_SPEC_FILE = "arch_spec.json"
+
 # Module toggles — autoresearch flips and appends these one at a time.
 # Each flag corresponds to one branch inside inject_modules().
 # (empty on first scaffold; populated as experiments progress)
@@ -141,7 +149,23 @@ def main() -> int:
     set_seed(SEED)
 
     try:
-        model = YOLO(WEIGHTS)
+        if ARCH_INJECTION_ENABLED:
+            # v1.7 — weight_transfer does:
+            #   (1) read ARCH_INJECTION_SPEC_FILE
+            #   (2) generate custom YAML from the base model's yaml + insertions
+            #   (3) build YOLO from custom YAML
+            #   (4) Stage 1 transfer pretrained weights → custom
+            #   (5) force lazy modules to build (so optimizer sees their params)
+            #   (6) register Stage 2 on_train_epoch_start callback for re-transfer
+            # See weight_transfer.py and train-script-spec.md § Architecture injection.
+            import json
+            from weight_transfer import build_custom_model_with_injection
+            spec = json.loads(Path(ARCH_INJECTION_SPEC_FILE).read_text())
+            model = build_custom_model_with_injection(
+                WEIGHTS, spec, imgsz=IMGSZ,
+            )
+        else:
+            model = YOLO(WEIGHTS)
     except Exception as e:
         print(f"FATAL: failed to load weights {WEIGHTS}: {e}", file=sys.stderr)
         return 1

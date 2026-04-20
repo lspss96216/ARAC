@@ -64,6 +64,11 @@ NUM_CLASSES    = 10
 FREEZE_LAYERS  = 0
 CKPT_DIR       = Path("runs/train")
 
+# Architecture injection (v1.7) — flips on for experiments that modify the
+# model's layer graph via weight_transfer.py. See § Architecture injection.
+ARCH_INJECTION_ENABLED   = False
+ARCH_INJECTION_SPEC_FILE = "arch_spec.json"
+
 # Module toggles — autoresearch flips these one at a time
 USE_CMC              = False
 USE_NSA_KALMAN       = False
@@ -95,13 +100,24 @@ def inject_modules(model):
 def main():
     random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
-    model = YOLO(WEIGHTS)
+    # v1.7 — architectural modifications go via weight_transfer (see
+    # § Architecture injection). Hook-style modules still go through
+    # inject_modules() below.
+    if ARCH_INJECTION_ENABLED:
+        import json
+        from weight_transfer import build_custom_model_with_injection
+        spec = json.loads(Path(ARCH_INJECTION_SPEC_FILE).read_text())
+        model = build_custom_model_with_injection(WEIGHTS, spec, imgsz=IMGSZ)
+    else:
+        model = YOLO(WEIGHTS)
+
     model = inject_modules(model)   # ← REBIND REQUIRED; see § Contract
 
     model.train(
         data=DATA_YAML, epochs=1000, batch=BATCH_SIZE,
         time=TIME_BUDGET / 3600,         # ultralytics wants hours
         freeze=FREEZE_LAYERS, project=str(CKPT_DIR), seed=SEED,
+        pretrained=False,                # weight_transfer handles transfer manually
     )
 
     # For object_detection, evaluate and print metrics here.
@@ -159,7 +175,9 @@ IMGSZ       = 1920
 | `NUM_CLASSES` | Rarely; only when changing `DATA_YAML` |
 | `FREEZE_LAYERS` | Transfer-learning experiments, or `0` in pretrain |
 | `CKPT_DIR` | Avoid checkpoint-dir collisions (e.g. pretrain vs finetune) |
-| `USE_<MODULE>` | Every autoresearch loop flips exactly one of these |
+| `USE_<MODULE>` | Every autoresearch hook-mode loop flips exactly one of these |
+| `ARCH_INJECTION_ENABLED` | **v1.7** — flipped True when autoresearch picks a module with `Integration mode: yaml_inject` (see § Architecture injection) |
+| `ARCH_INJECTION_SPEC_FILE` | **v1.7** — rarely changed; path to the JSON spec file (default `arch_spec.json`). autoresearch writes the spec file, not this variable. |
 
 ### Appendable by autoresearch
 
@@ -295,7 +313,148 @@ def assert_idempotent(model, fn):
 
 ---
 
-## Metric output contract
+## Architecture injection (v1.7)
+
+`inject_modules()` covers **hook-mode** changes: swap a layer, replace the
+neck, wrap a forward pass. It cannot do **structural** changes — inserting a
+new layer mid-backbone shifts every downstream layer index, and pretrained
+weights stop aligning. That's what `weight_transfer.py` handles.
+
+### Two injection modes
+
+Autoresearch picks one per iteration based on the module's `Integration mode`
+field in `modules.md`:
+
+| Integration mode | Mechanism | What changes |
+|---|---|---|
+| `hook` (default, v1.6) | `inject_modules(model)` branch | Layer swap, forward wrap, block replacement (same index layout) |
+| `yaml_inject` (v1.7) | `weight_transfer.build_custom_model_with_injection` | Insert new layer(s) into YAML, rebuild model, transfer pretrained weights according to computed layer_map |
+| `full_yaml` (reserved v1.8+) | Agent writes full custom YAML | Arbitrary structural changes — NotImplementedError in v1.7 |
+
+Unknown `Integration mode` values fall back to `hook` with a stderr warning
+(warn-not-reject policy in `modules_md.py`).
+
+### How `yaml_inject` works
+
+When autoresearch picks a pending module with `Integration mode: yaml_inject`:
+
+1. autoresearch writes `ARCH_INJECTION_SPEC_FILE` (default `arch_spec.json`)
+   containing the module's insertion spec — see
+   `shared/templates/arch_spec.schema.json` for the schema.
+2. autoresearch flips `ARCH_INJECTION_ENABLED = True` in Section ②.
+3. autoresearch runs `train.py`. Section ④ branches on
+   `ARCH_INJECTION_ENABLED` and calls
+   `weight_transfer.build_custom_model_with_injection(WEIGHTS, spec, imgsz=IMGSZ)`.
+4. The helper:
+   - Reads the base model's YAML from `WEIGHTS` (a .pt file).
+   - Generates a new YAML by applying the spec's insertions (position + scope).
+   - Builds a fresh `YOLO(new_yaml)` and computes `layer_map` (base-index →
+     custom-index) using the insertion bookkeeping.
+   - Stage 1: transfers matching tensors per layer_map with per-entry strict
+     mode. Any layer_map entry that transfers zero tensors raises — this is
+     how misaligned maps get caught instead of silently producing a
+     random-init layer.
+   - Forces every `Lazy*` wrapper to build its inner module (see § Lazy-wrapper
+     contract below) so the optimizer sees their parameters.
+   - Registers a Stage 2 `on_train_epoch_start` callback that re-transfers
+     before epoch 0 begins, in case the trainer's own init re-initialised
+     any layers during Stage 1.
+5. The returned `YOLO` instance is then passed through `inject_modules(model)`
+   for any hook-mode modules that coexist in the same run.
+
+### `ARCH_INJECTION_SPEC_FILE` format
+
+Pointed to by Section ② `ARCH_INJECTION_SPEC_FILE`. JSON, validated by
+`shared/templates/arch_spec.schema.json`. Minimal example (insertion mode):
+
+```json
+{
+  "mode": "insertions",
+  "insertions": [
+    {
+      "module_class": "LazyCBAM",
+      "position": {"kind": "after_class", "class_name": "Conv"},
+      "scope": "backbone",
+      "yaml_args": [64],
+      "module_kwargs": {"kernel_size": 7}
+    }
+  ],
+  "strict": true
+}
+```
+
+Positions:
+- `{"kind": "after_class", "class_name": "Conv"}` — inserts after **every**
+  layer of that class within `scope`.
+- `{"kind": "at_index", "index": 5}` — inserts after base-yaml index 5. The
+  index is relative to the **base** YAML, not the custom YAML being built;
+  the helper handles offsets. `at_index` must fall within `scope` or raises.
+
+Scopes: `backbone`, `neck`, `head`, `all`. For `at_index` mode, `scope` is
+enforced as an assertion (out-of-scope index raises).
+
+### Lazy-wrapper contract
+
+`yaml_inject` requires the inserted class to be a **lazy wrapper** whose
+`__init__` is side-effect-free and whose inner module is built on the first
+`forward`. Reasons:
+
+1. Ultralytics' `parse_model` resolves unknown modules by calling
+   `cls(*yaml_args)` — **not** prepending the input channel count. The lazy
+   wrapper reads the real channel count from `x.shape[1]` at forward time.
+2. `build_custom_model_with_injection` calls `force_lazy_build(model, imgsz)`
+   after Stage 1 transfer. This runs one forward pass so the inner module is
+   built and its parameters appear in `model.parameters()` before the
+   trainer's `build_optimizer()` captures the parameter list. Without this
+   step, the new module is silently excluded from training — loss is
+   identical to baseline, no crash.
+
+The helper moves the model to GPU before the dummy forward if available, so
+the inner module is built on the right device.
+
+Minimal lazy wrapper:
+
+```python
+import torch.nn as nn
+
+class LazyCBAM(nn.Module):
+    def __init__(self, _c_hint=None, kernel_size=7):
+        # Side-effect-free: no nn.Conv2d, no nn.Linear.
+        # _c_hint is the YAML's first positional arg; ignored here, the real
+        # channel count comes from x.shape[1] below.
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.cbam = None
+
+    def forward(self, x):
+        if self.cbam is None:
+            from ultralytics.nn.modules.conv import CBAM as _CBAM
+            self.cbam = _CBAM(x.shape[1], self.kernel_size).to(x.device)
+        return self.cbam(x)
+```
+
+Register in `custom_modules.py` the same way as hook-mode modules (see
+`paper-finder/SKILL.md § register_custom_modules`). The name used in the
+YAML insertion (`LazyCBAM` above) must match the registered class name
+exactly.
+
+### Coexistence with `inject_modules()`
+
+`yaml_inject` runs first, producing a structurally modified `model`. Then
+`inject_modules(model)` runs on the result — hook modules apply on top of
+the new structure. Most experiments use one mode or the other, but both
+paths are live every iteration.
+
+### Failure modes and how they surface
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `RuntimeError: transfer_weights strict mode: N layer_map entries transferred 0 tensors` | Insertion spec caused layer misalignment (wrong class, wrong scope, or multiple insertions with overlapping indices) | Autoresearch records crash → discard → revert. Paper-finder may need to refine the module's insertion spec. |
+| `NotImplementedError: mode='full_yaml' is reserved for v1.8+` | Someone wrote `"mode": "full_yaml"` in the JSON spec | v1.7 only supports `insertions`. Either downgrade the spec or wait for v1.8. |
+| Training runs but loss identical to baseline | `force_lazy_build` skipped or lazy wrapper's `__init__` has side effects that pre-built params | Ensure the module class is a spec-compliant lazy wrapper (see above). `build_custom_model_with_injection` calls `force_lazy_build` automatically. |
+
+---
+
 
 `train.py`'s stdout is the canonical source of metrics. Whatever it prints must be
 parseable by the regex / JSONPath / CSV rules defined in
@@ -382,13 +541,18 @@ src = pathlib.Path("train.py").read_text()
 
 required_sections  = ["Section ①", "Section ②", "Section ③", "Section ④"]
 required_variables = ["TIME_BUDGET", "SEED", "BATCH_SIZE", "WEIGHTS",
-                      "DATA_YAML", "NUM_CLASSES", "CKPT_DIR"]
+                      "DATA_YAML", "NUM_CLASSES", "CKPT_DIR",
+                      # v1.7 — architecture injection surface
+                      "ARCH_INJECTION_ENABLED", "ARCH_INJECTION_SPEC_FILE"]
 required_functions = ["def inject_modules", "def main"]
+required_branches  = ["if ARCH_INJECTION_ENABLED",
+                      "build_custom_model_with_injection"]
 
 missing = []
 missing += [s for s in required_sections  if s not in src]
 missing += [v for v in required_variables if not re.search(rf"(?m)^{v}\s*=", src)]
 missing += [f for f in required_functions if f not in src]
+missing += [b for b in required_branches  if b not in src]
 
 if missing:
     raise RuntimeError(f"train.py is not spec-compliant. Missing: {missing}")
@@ -413,12 +577,15 @@ the layout.
 │   ├── modules_md.py               # canonical modules.md parser
 │   ├── state_migrate.py            # pipeline_state.json schema migration
 │   ├── parse_metrics.py            # shared stdout/json/csv metric extraction
+│   ├── weight_transfer.py          # v1.7 — yaml_inject + pretrained transfer
+│   ├── test_weight_transfer.py     # v1.7 — weight_transfer unit tests
 │   ├── train-script-spec.md        # this file
 │   ├── file-contracts.md           # schemas for all cross-skill files
 │   └── templates/
 │       ├── train.py.detection      # default for task_type: object_detection
 │       ├── train.py.tracking       # detector-training half of tracking
-│       └── track.py.tracking       # tracker + TrackEval half
+│       ├── track.py.tracking       # tracker + TrackEval half
+│       └── arch_spec.schema.json   # v1.7 — JSON schema for ARCH_INJECTION_SPEC
 ├── paper-finder/
 ├── autoresearch/
 ├── research-orchestrator/
@@ -427,4 +594,6 @@ the layout.
 
 Each skill reads this spec when it touches `train.py`. The orchestrator
 scaffolds a fresh `train.py` by copying the template matching `task.task_type`
-and patching `TIME_BUDGET` / `SEED` / `IMGSZ`.
+and patching `TIME_BUDGET` / `SEED` / `IMGSZ`. Autoresearch adds `USE_<MODULE>`
+flags (hook mode) or writes `arch_spec.json` + flips `ARCH_INJECTION_ENABLED`
+(yaml_inject mode).

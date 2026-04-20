@@ -376,6 +376,86 @@ unknown Location rather than guess a default):
 Use the exact lower-case spelling above. If uncertain, pick the closest match
 and note the ambiguity in `Integration notes`.
 
+### Integration mode (v1.7)
+
+A per-module field telling autoresearch **how** to apply the module. The
+three legal values:
+
+- `hook` (default, v1.6) — autoresearch adds a `USE_<MODULE>` flag in
+  `train.py` Section ② and a branch in `inject_modules()`. Good for layer
+  swaps, forward wraps, and block replacements that preserve the model's
+  layer index layout.
+- `yaml_inject` (v1.7) — autoresearch writes `arch_spec.json` and flips
+  `ARCH_INJECTION_ENABLED = True`. At train time,
+  `weight_transfer.build_custom_model_with_injection` programmatically
+  generates a new YAML with inserted layers and transfers pretrained
+  weights per-entry strict. Good for inserting attention blocks, SE
+  modules, extra heads — anything that shifts downstream indices.
+- `full_yaml` — reserved for v1.8. Emit this only if you need an
+  architectural change `weight_transfer` can't do (e.g. BiFPN replacing
+  PAFPN). Autoresearch will discard such modules in v1.7.
+
+Heuristic for picking the mode from paper text:
+
+| Paper language suggests | Mode |
+|---|---|
+| "we wrap the existing X with ..." / "after X, apply ..." on forward pass | `hook` |
+| "we modify X's forward to ..." | `hook` |
+| "we replace the SE block with ..." (same layer, different implementation) | `hook` |
+| "we insert <module> after every <class>" / "add <module> at stage N" | `yaml_inject` |
+| "we add a new detection head at P2" | `yaml_inject` |
+| "we add an auxiliary branch from <layer>" | `yaml_inject` (if the branch is a new layer) |
+| "we replace the entire neck with BiFPN" / major structural redesign | `full_yaml` (not yet supported) |
+
+When both modes could apply, prefer `hook` — it's simpler and cheaper.
+Reserve `yaml_inject` for cases where the paper's method genuinely requires
+a new layer in the graph with shifted indices.
+
+**Asymmetric cost of misclassification (v1.7.1).** If you can't decide,
+**prefer `yaml_inject`**. The failure modes are not symmetric:
+
+- **Hook wrongly applied to a yaml_inject-needing module** (e.g. CBAM tagged
+  hook, inserted via forward monkey-patch): training completes with no
+  crash, loss looks reasonable, metrics match baseline — a whole
+  `TIME_BUDGET` consumed for nothing. autoresearch discards it with no
+  warning that this was a misclassification.
+- **yaml_inject wrongly applied to a hook-only module** (e.g. a loss-swap
+  module tagged yaml_inject with no layer to insert): the insertion spec
+  typically fails either at YAML-parse time or at the per-entry strict
+  weight transfer — autoresearch gets a clear crash, Step 5.5 classifies
+  as `unfixable_*`, the experiment is discarded AND a `discoveries.md`
+  entry records the misclassification for human review.
+
+Loud failures are better than silent ones. When unsure, tag `yaml_inject`.
+
+### yaml_inject modules need injection spec fields
+
+When you pick `yaml_inject`, the module's `Integration notes` in modules.md
+**must** include the injection spec — otherwise autoresearch has nothing to
+put in `arch_spec.json`. Required fields:
+
+```
+### Integration notes
+module_class:  <ClassName matching a Lazy* class in custom_modules.py>
+position:      <after_class: ClassName>   OR   <at_index: N>
+scope:         <backbone | neck | head | all>
+yaml_args:     [<first_is_channel_hint>, <optional_extras>]
+module_kwargs: {<optional_kwargs_dict>}
+```
+
+- `module_class` — the name of the lazy wrapper you're writing (paper2code
+  output + a Lazy* wrapper on top, per `train-script-spec.md § Lazy-wrapper
+  contract`).
+- `position.at_index` — always base-YAML index. `weight_transfer` handles
+  offsets when multiple insertions apply.
+- `scope` — enforces where in the model the module can go. For `at_index`,
+  scope is an assertion (out-of-scope raises).
+
+Without these fields, paper-finder should leave `Integration mode` as `hook`
+or mark the module `paper2code: no (incomplete)` so the user knows to fill
+in the details manually before autoresearch picks it up.
+
+
 ---
 
 ## Phase 6 — Write modules.md
@@ -412,6 +492,7 @@ mm.append_module("modules.md", {
         "paper2code":  "yes",                             # yes / yes (GitHub repo: <url>) / no (not on arXiv) / no (no public repo)
         "pdf_path":    "<local pdf path>",                # only set for local PDFs
         "Status":      "pending",                         # default if omitted
+        "Integration mode": "hook",                       # v1.7: hook / yaml_inject / full_yaml; default hook
     },
     "sections": {
         "What it does":     "<2–3 sentences from abstract, in your own words>",
@@ -435,6 +516,49 @@ mm.append_module("modules.md", {
     },
 })
 ```
+
+**yaml_inject variant (v1.7).** When `Integration mode: yaml_inject`, the
+`Integration notes` section must instead carry the injection spec — the
+hook-mode USE_* / Section ③ language doesn't apply. Template:
+
+```python
+mm.append_module("modules.md", {
+    "name": "CBAM after backbone Convs",
+    "fields": {
+        "Paper":       "CBAM: Convolutional Block Attention Module",
+        "arXiv":       "https://arxiv.org/abs/1807.06521",
+        "Location":    "backbone",
+        "Complexity":  "medium",
+        "paper2code":  "yes",
+        "Status":      "pending",
+        "Integration mode": "yaml_inject",                # v1.7 — triggers weight_transfer path
+    },
+    "sections": {
+        "What it does": "Channel + spatial attention block inserted after each Conv.",
+        "Integration notes": (
+            "yaml_inject spec — autoresearch extracts these fields verbatim to "
+            "write arch_spec.json. All five are REQUIRED; omit any and "
+            "autoresearch will discard the module.\n"
+            " - module_class:  LazyCBAM\n"
+            " - position:      after_class: Conv\n"
+            " - scope:         backbone\n"
+            " - yaml_args:     [64]\n"
+            " - module_kwargs: {\"kernel_size\": 7}\n\n"
+            "The lazy wrapper must conform to train-script-spec.md § "
+            "Lazy-wrapper contract: side-effect-free __init__, inner module "
+            "built on first forward from x.shape[1], .to(x.device) at build "
+            "time. paper2code output goes into custom_modules.py; we add "
+            "LazyCBAM as a thin wrapper around it."
+        ),
+        "paper2code command": "/paper2code https://arxiv.org/abs/1807.06521\nExtract: `CBAM` from `src/model.py`",
+    },
+})
+```
+
+Field reference for `position`:
+- `after_class: <ClassName>` — insert after every layer of that class in `scope`
+- `at_index: <N>` — insert after base-yaml index N (helper handles offset);
+  N must be within `scope` or raises at train time
 
 **Validation handled by parser:**
 - `Status` defaults to `"pending"` if omitted, and must be one of

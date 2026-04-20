@@ -44,6 +44,14 @@ NUM_CLASSES    = 10
 FREEZE_LAYERS  = 0
 CKPT_DIR       = Path("runs/train")
 
+# Architecture injection (v1.7) — YAML-level module insertion via weight_transfer.
+# Default False: the hook path below (inject_modules) is used.
+# When True: weight_transfer.build_custom_model_with_injection replaces
+# YOLO(WEIGHTS) with a custom-YAML model that has pretrained weights transferred.
+# See train-script-spec.md § Architecture injection and arch_spec.schema.json.
+ARCH_INJECTION_ENABLED   = False
+ARCH_INJECTION_SPEC_FILE = "arch_spec.json"
+
 # Detector-level module toggles. Tracker-level toggles (CMC, NSA Kalman, re-ID)
 # live at the top of track.py, not here — see train-script-spec.md § Task-type
 # variants for the split.
@@ -133,7 +141,16 @@ def main() -> int:
     set_seed(SEED)
 
     try:
-        model = YOLO(WEIGHTS)
+        if ARCH_INJECTION_ENABLED:
+            # v1.7 — see train.py.detection for rationale
+            import json
+            from weight_transfer import build_custom_model_with_injection
+            spec = json.loads(Path(ARCH_INJECTION_SPEC_FILE).read_text())
+            model = build_custom_model_with_injection(
+                WEIGHTS, spec, imgsz=IMGSZ,
+            )
+        else:
+            model = YOLO(WEIGHTS)
     except Exception as e:
         print(f"FATAL: failed to load weights {WEIGHTS}: {e}", file=sys.stderr)
         return 1

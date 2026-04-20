@@ -4,13 +4,23 @@ D3 fix: templates directory is resolved relative to this test file, with
 optional PIPELINE_TEMPLATES_DIR env var override. Previous version
 hardcoded /home/claude/shared/templates which worked nowhere but the
 author's machine.
+
+v1.7 additions:
+- ARCH_INJECTION_ENABLED / ARCH_INJECTION_SPEC_FILE in train.py Section ②
+- conditional `if ARCH_INJECTION_ENABLED:` branch in train.py main()
 """
 import os, pathlib, re, sys
 
 REQUIRED_SECTIONS  = ["Section ①", "Section ②", "Section ③", "Section ④"]
 REQUIRED_VARIABLES = ["TIME_BUDGET", "SEED", "BATCH_SIZE", "WEIGHTS",
-                      "DATA_YAML", "NUM_CLASSES", "CKPT_DIR"]
+                      "DATA_YAML", "NUM_CLASSES", "CKPT_DIR",
+                      # v1.7 — architecture injection surface
+                      "ARCH_INJECTION_ENABLED", "ARCH_INJECTION_SPEC_FILE"]
 REQUIRED_FUNCTIONS = ["def inject_modules", "def main"]
+# v1.7 — main() must branch on ARCH_INJECTION_ENABLED so the weight-transfer
+# path is reachable. Presence of the literal substring is a necessary but not
+# sufficient check — template_smoke test covers the full flow end-to-end.
+REQUIRED_BRANCHES = ["if ARCH_INJECTION_ENABLED", "build_custom_model_with_injection"]
 
 
 def check(path, kind="train"):
@@ -24,6 +34,7 @@ def check(path, kind="train"):
     if kind == "train":
         missing += [v for v in REQUIRED_VARIABLES if not re.search(rf"(?m)^{v}\s*=", src)]
         missing += [f for f in REQUIRED_FUNCTIONS if f not in src]
+        missing += [b for b in REQUIRED_BRANCHES if b not in src]
     elif kind == "track":
         # track.py only needs SEED (for RNG) and TIME_BUDGET (spec placeholder)
         for v in ["SEED", "TIME_BUDGET"]:

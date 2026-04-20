@@ -300,9 +300,81 @@ Both files share the Section ② / Section ③ structure from
 `train-script-spec.md`, so the patching logic is identical — only the file path
 and hook name differ.
 
+#### Dispatch on Integration mode (v1.7)
+
+Before applying any change, check the module's `Integration mode` field. This
+decides whether autoresearch edits Section ②/③ code (hook mode) or writes an
+`arch_spec.json` and flips `ARCH_INJECTION_ENABLED` (yaml_inject mode).
+
+**Hook-mode scope limit (v1.7+).** Hook mode applies changes via
+`inject_modules(model)`, which runs after the model is built — it can wrap a
+layer's `forward`, replace a block with a subclass, or swap a loss. It
+**cannot** insert a new parameterised layer between existing layers, because
+any layer index shift invalidates pretrained weight alignment AND the
+monkey-patched forward of an inserted layer is not serialised into the
+checkpoint (weights vanish on save/reload). Symptom of mis-using hook this
+way: training runs, loss looks normal, but metrics are identical to
+baseline and the saved checkpoint is the baseline. Nothing crashes — the
+loop completes, spends the full TIME_BUDGET, and discards as "no
+improvement". This is the failure that motivated v1.7's `yaml_inject` mode.
+
+If paper-finder's heuristic was wrong and CBAM-style "insert between layers"
+modules end up as `hook`, the iteration will silently fail as described. v1.7's
+Step 5.5f detects shape mismatches in hook mode and logs a `discoveries.md`
+note prompting manual re-tagging to `yaml_inject`.
+
+```python
+mode = chosen.integration_mode   # parser returns "hook" for missing/blank
+
+KNOWN_HOOK       = {"hook"}
+KNOWN_YAML_INJECT = {"yaml_inject"}
+KNOWN_FULL_YAML   = {"full_yaml"}   # v1.8+ — not implemented yet
+
+if mode in KNOWN_HOOK:
+    pass   # fall through to § Apply the change (hook path)
+elif mode in KNOWN_YAML_INJECT:
+    if target_file != "train.py":
+        # yaml_inject only makes sense for detector modules. Tracker-location
+        # modules with yaml_inject set were misconfigured by paper-finder —
+        # discard with a clear reason.
+        mm.update_status("modules.md", chosen.name, "discarded")
+        log_discovery(
+            f"Module {chosen.name!r} has Integration mode 'yaml_inject' "
+            f"but Location {location!r} routes to {target_file}. "
+            f"yaml_inject requires a detector Location (backbone/neck/head/loss).",
+            loop=state.get("loop_count", 0),
+            category="observation",
+        )
+        chosen = None   # fall through to Priority B
+    # else: proceed to § Apply the change (yaml_inject path) below
+elif mode in KNOWN_FULL_YAML:
+    # Reserved for v1.8. weight_transfer.build_custom_model_with_injection
+    # will raise NotImplementedError at train.py run time, but it's cleaner
+    # to discard now and log the mismatch than to crash the run.
+    mm.update_status("modules.md", chosen.name, "discarded")
+    log_discovery(
+        f"Module {chosen.name!r} has Integration mode 'full_yaml' — reserved "
+        f"for v1.8+. Not supported in this release. Discarded.",
+        loop=state.get("loop_count", 0),
+        category="limitation",
+    )
+    chosen = None   # fall through to Priority B
+else:
+    # Unknown mode — parser already warned. Fall back to hook (the v1.6 default)
+    # rather than skip, so forward-compat mode values don't block work.
+    log_discovery(
+        f"Module {chosen.name!r} has unknown Integration mode {mode!r}; "
+        f"falling back to hook injection.",
+        loop=state.get("loop_count", 0),
+        category="observation",
+    )
+    mode = "hook"
+```
+
 #### Apply the change
 
-Process the chosen module using the branch that matches its `paper2code` field value:
+Process the chosen module using the branch that matches its `paper2code` field
+value (for code generation) and `Integration mode` (for code placement):
 
 Before touching `train.py`, the layout rules in
 `<skills_dir>/shared/train-script-spec.md` apply. Section ② is the only part of
@@ -366,7 +438,10 @@ the toggle (no supporting hyperparams), use the module's code defaults as-is
 — don't invent values, don't leave parameters at the template default when the
 paper specified otherwise.
 
-##### Branches
+##### Branches (hook mode)
+
+These branches apply when `mode == "hook"`. For `yaml_inject`, skip past
+them to § Branches (yaml_inject mode) below.
 
 1. If `paper2code: yes` → run paper2code to generate the module code:
    ```
@@ -397,7 +472,7 @@ paper specified otherwise.
    paper description in modules.md, using citation-anchoring comments (`# §3.2 — ...`).
    Follow the same injection pattern as branch 1.
 
-4. Regardless of which branch above was taken:
+4. Regardless of which hook branch above was taken:
    - Set `USE_<MODULE> = True` in `target_file` Section ② as the experiment
      change for this iteration.
    - Update the module's status via the parser (do not sed/grep/hand-edit
@@ -407,6 +482,83 @@ paper specified otherwise.
      ```
      Valid statuses: `pending / injected / tested / discarded`. The parser rejects
      typos at runtime, which is how we keep the four skills agreeing on status values.
+
+##### Branches (yaml_inject mode, v1.7)
+
+When `mode == "yaml_inject"`, autoresearch does **not** edit `custom_modules.py`
+new classes or append `USE_*` flags. Instead:
+
+1. **Get the lazy wrapper class** into `custom_modules.py` using whichever of
+   paper2code / GitHub clone / manual-write applies — same code-acquisition
+   logic as hook branches 1–3 above. The class must be a lazy wrapper
+   conforming to `train-script-spec.md § Lazy-wrapper contract`:
+   - Side-effect-free `__init__`
+   - Inner module built on first `forward` using `x.shape[1]` as channel count
+   - `.to(x.device)` applied at build time
+
+   Register it in `custom_modules.py`'s `register_custom_modules()` function
+   the same way any other module is registered.
+
+2. **Extract the injection spec** from the module's `Integration notes` in
+   `modules.md`. Paper-finder Phase 5 is responsible for writing these fields;
+   autoresearch parses them here. Expected shape:
+
+   ```
+   ### Integration notes
+   module_class: LazyCBAM
+   position:     after_class: Conv
+   scope:        backbone
+   yaml_args:    [64]
+   module_kwargs: {"kernel_size": 7}
+   ```
+
+   If any field is missing, mark the module `discarded` and
+   `log_discovery` — don't invent values. Paper-finder should be fixed to
+   write complete specs.
+
+3. **Write `arch_spec.json`** (path per `ARCH_INJECTION_SPEC_FILE` in
+   `train.py`'s Section ②; default `arch_spec.json`):
+
+   ```python
+   import json, pathlib
+   spec = {
+       "mode": "insertions",
+       "insertions": [{
+           "module_class": extracted_class_name,
+           "position": extracted_position_dict,   # {"kind": ..., ...}
+           "scope":    extracted_scope,
+           "yaml_args":      extracted_yaml_args,
+           "module_kwargs":  extracted_module_kwargs,
+       }],
+       "strict": True,
+   }
+   spec_path = pathlib.Path("arch_spec.json")   # matches ARCH_INJECTION_SPEC_FILE default
+   spec_path.write_text(json.dumps(spec, indent=2))
+   ```
+
+4. **Flip `ARCH_INJECTION_ENABLED = True`** in `train.py` Section ② using the
+   standard patch_variable helper from orchestrator (reuse the same regex).
+   Leave all hook-mode `USE_*` flags at their current value — they still
+   take effect after `build_custom_model_with_injection` returns the
+   structurally modified model.
+
+5. **Commit files together**: `arch_spec.json`, `train.py`, `custom_modules.py`.
+   The spec file is git-tracked so `git reset --hard HEAD~1` on discard
+   rewinds everything, including the spec. Previous spec content is restored.
+
+6. **Update module status**:
+   ```python
+   mm.update_status("modules.md", chosen.name, "injected")
+   ```
+
+**Strict-mode crash handling.** If `weight_transfer` raises at train.py run
+time ("transfer_weights strict mode: N layer_map entries transferred 0
+tensors"), that counts as a crash in Step 7. autoresearch's standard crash
+flow applies: increment `consecutive_crashes`, log to `run.log`, Step 6
+verify extracts no metrics, Step 7 discards, Step 9 bumps counter. If the
+paper-finder spec was genuinely wrong (e.g. `after_class: "Conv"` but the
+base model has no Conv under that scope — also a crash path), the module
+ends up `discarded` and won't be retried.
 
 After Step 5 (Run) completes, Step 6 (Verify) is responsible for flipping
 `injected → tested` on success, or `injected → discarded` on crash/discard. The
@@ -544,6 +696,249 @@ Never pipe through `tee` — the parser in Step 6 reads `run.log` directly and
 Each loop takes ~20 minutes (TIME_BUDGET) plus a few seconds for startup and eval.
 Tracking adds maybe another minute for `track.py` inference + TrackEval.
 If total runtime exceeds `TIME_BUDGET × 2`: kill and treat as crash.
+
+---
+
+### Step 5.5 — Repair check (v1.7.1)
+
+**Purpose.** When `train.py` crashes, not every crash means "the experiment
+was a bad idea". Some are code bugs (missing import, typo in lazy wrapper)
+that have nothing to do with the paper's method. Others are shape / channel
+mismatches that can be resolved by inserting small adapter layers around
+the experimental module — the paper's core idea is kept, the glue code is
+adjusted. v1.7.1 formalises the repair flow so one crash doesn't necessarily
+mean discarding the whole iteration.
+
+**When this step runs.** Only when Step 5 exited non-zero AND the current
+experiment involves a module injection (hook or yaml_inject). If a plain
+hyperparameter change crashes, skip this step and go straight to Step 7
+discard — there's nothing to repair.
+
+**Attempts.** Up to **3** repair attempts. Each uses a short test budget
+(`REPAIR_TEST_BUDGET = 120s` — patches `TIME_BUDGET` for the retry only,
+restored after). Success = run.log contains a first-epoch loss triple where
+all three losses are finite positive (not NaN, not Inf). Failure to produce
+valid loss after 3 attempts → treat as architectural incompatibility,
+discard via Step 7.
+
+If repair succeeds within 3 attempts, **re-run with the full TIME_BUDGET**
+to produce the real experiment. The short-test run is throwaway — its
+purpose is only to confirm "this architecture can run".
+
+#### Step 5.5a — Classify the crash
+
+```python
+import sys, pathlib, json
+state = json.loads(pathlib.Path("pipeline_state.json").read_text())
+sys.path.insert(0, str(pathlib.Path(state["skills_dir"]) / "shared"))
+import weight_transfer as wt
+
+stderr_tail = pathlib.Path("run.log").read_text()[-8000:]   # last ~8 KB is plenty
+category = wt.classify_crash(stderr_tail)
+```
+
+Categories the classifier returns:
+
+| Category | Meaning | Repair action |
+|---|---|---|
+| `tier1_missing_register` | `NameError: name 'X' is not defined` — lazy wrapper class not registered in `parse_model.__globals__` | Append class to `register_custom_modules()` in `custom_modules.py` |
+| `tier1_missing_import`   | `ModuleNotFoundError` / `ImportError` | Add `import` line or `pip install` |
+| `tier1_init_signature`   | `TypeError: ...__init__() got unexpected kwarg` / `missing required arg` | Read stderr's class name, inspect the class, adjust `yaml_args` or `module_kwargs` in `arch_spec.json` (yaml_inject) or the `USE_*` branch's call site (hook) |
+| `tier1_syntax`           | `SyntaxError` in agent-written file | Read file, fix syntax |
+| `tier2_shape_mismatch`   | `RuntimeError: Given groups=1, weight of size [...]` / tensor-size-mismatch / mat1/mat2 shape | Tier-2 adapter repair — see Step 5.5c |
+| `oom`                    | `CUDA out of memory` | Existing v1.6 OOM path — halve `BATCH_SIZE`, not counted against repair attempts. |
+| `unfixable_layer_map`    | `transfer_weights strict mode: N entries 0 tensors` | Go straight to Step 7 discard. The insertion spec is architecturally wrong (scope too wide, wrong class name, position disagreeing with the base model's layer layout). |
+| `unfixable_weight_transfer` | `size mismatch for model.N.*` during state_dict load | Same — discard. |
+| `unfixable_dtype_device` | 2D vs 3D conv confusion, CPU/GPU mixing | Discard. |
+| `unknown`                | Didn't match any pattern | Discard (conservative default). |
+
+Rule of thumb for the split: **if the fix would change the paper's method
+(swap the module, change its hyperparameters, pick a different position),
+it's unfixable. If the fix is glue code around the method, it's repairable.**
+
+#### Step 5.5b — Tier 1 repair (code bugs)
+
+Cheap fixes that don't touch the experimental variable. Examples:
+
+```python
+# tier1_missing_register — append class to custom_modules.py's registry.
+# Do NOT change the class itself, only add it to the registry dict.
+cls_name = re.search(r"name '(\w+)' is not defined", stderr_tail).group(1)
+# Edit custom_modules.py: add cls_name to register_custom_modules()'s registry
+
+# tier1_missing_import — add the import.
+# Read ModuleNotFoundError's message, add "import X" at top of the file
+# that imported it, or add X to the pip install step.
+
+# tier1_init_signature — inspect the class signature and adjust the call site.
+# For yaml_inject: edit arch_spec.json's yaml_args / module_kwargs.
+# For hook: edit the USE_* branch in inject_modules() to match the signature.
+```
+
+**Fix commits go in their own commit**, separate from the experiment commit:
+
+```bash
+git add custom_modules.py
+git commit -m "fix: register LazyX in custom_modules (repair attempt 1)"
+```
+
+This way, if the experiment is ultimately discarded, `git reset --hard HEAD~1`
+rewinds only the experiment commit and the fix stays — future experiments
+benefit from it. The experiment commit itself comes later (Step 8) after
+the real full-budget run.
+
+#### Step 5.5c — Tier 2 repair (shape / channel mismatch, yaml_inject only)
+
+For `tier2_shape_mismatch`, probe the upstream / module / downstream shapes
+and synthesize an adapter spec:
+
+```python
+from ultralytics import YOLO
+# 1. Load the model WITHOUT the experimental insertion, just to read shapes
+base = YOLO(state["base_weights_local"])
+
+# 2. Find the insertion point. For after_class position, pick the first
+#    match (or whichever one crashed — run.log's traceback tells you).
+spec_path = pathlib.Path("arch_spec.json")
+spec = json.loads(spec_path.read_text())
+target_ins = spec["insertions"][0]        # usually only one
+
+# 3. Probe upstream shape at the insertion point
+#    (upstream_idx is where the module would be inserted AFTER)
+upstream_idx = ...   # determined from the spec's position/scope
+imgsz = state["imgsz"]
+upstream = wt.get_shape_at_index(base.model, upstream_idx, imgsz)
+
+# 4. Probe the module in isolation to find its in/out shape
+from custom_modules import *   # ensure class is registered
+mod_in, mod_out = wt.probe_module_io(
+    target_ins["module_class"],
+    upstream,                             # assume it accepts upstream's shape
+    target_ins["yaml_args"],
+    target_ins["module_kwargs"],
+)
+
+# 5. Downstream expected shape is whatever the base layer right AFTER the
+#    insertion point expects — probe at upstream_idx + 1 to get its OUTPUT
+#    shape (which on an unmodified model equals its input shape topologically
+#    when layers are channel-preserving; for non-preserving, use the layer's
+#    input dimension directly).
+downstream = wt.get_shape_at_index(base.model, upstream_idx + 1, imgsz)
+
+# 6. Plan the adapter
+plan = wt.plan_adapter(upstream, mod_in, mod_out, downstream)
+
+if plan.needs_adaptation:
+    new_spec = wt.extend_spec_with_adapters(spec, plan, insertion_idx=0)
+    spec_path.write_text(json.dumps(new_spec, indent=2))
+    repair_note = f"adapter: {plan.reason}"
+else:
+    # probe said no adapter needed but the run still crashed — likely
+    # a deeper architectural issue. Treat as unfixable.
+    repair_note = None
+```
+
+If `plan.needs_adaptation` is False **and** Step 5 crashed with shape
+mismatch, Tier 2 can't help — fall through to Step 7 discard.
+
+#### Step 5.5d — Short-test retry
+
+After the repair, re-run `train.py` with a reduced budget to verify the
+architecture can run at all:
+
+```bash
+# Patch TIME_BUDGET in train.py's Section ②, run, restore.
+python3 -c "
+import pathlib, re
+src = pathlib.Path('train.py').read_text()
+src = re.sub(r'(?m)^TIME_BUDGET\s*=.*', 'TIME_BUDGET = 120', src, count=1)
+pathlib.Path('train.py').write_text(src)
+"
+$RUNNER train.py > run.log 2>&1
+
+# Restore TIME_BUDGET — orchestrator's value comes from research_config.yaml
+python3 -c "
+import pathlib, re, json
+state = json.load(open('pipeline_state.json'))
+tb = state['time_budget_sec']
+src = pathlib.Path('train.py').read_text()
+src = re.sub(r'(?m)^TIME_BUDGET\s*=.*', f'TIME_BUDGET = {tb}', src, count=1)
+pathlib.Path('train.py').write_text(src)
+"
+```
+
+Check success with `wt.loss_first_value_is_valid`:
+
+```python
+ok, msg = wt.loss_first_value_is_valid(pathlib.Path("run.log").read_text())
+if ok:
+    # Architecture can run. Proceed to the REAL run with full TIME_BUDGET.
+    print(f"[repair] short test passed: {msg}")
+    # Run again with the restored TIME_BUDGET
+    subprocess.run(["bash", "-c", f"{RUNNER} train.py > run.log 2>&1"], check=False)
+    # Then fall through to Step 6 Verify
+else:
+    # Short test failed — record, retry (up to 3 attempts), or give up
+    attempts += 1
+    if attempts >= 3:
+        print(f"[repair] 3 attempts exhausted; discarding")
+        # fall through to Step 7 discard
+    else:
+        # back to Step 5.5a to classify this new crash
+        ...
+```
+
+#### Step 5.5e — Record what was repaired
+
+Successful repair runs append to the eventual `description` in `results.tsv`
+(written in Step 8). Track repair notes through the attempts:
+
+```python
+# Track across attempts (local var, not persisted until Step 8)
+repair_notes = []
+# On each successful repair tier:
+repair_notes.append("tier1: registered LazyCBAM")
+repair_notes.append("adapter: pre-Conv 256→64, post-Conv 32→256")
+
+# In Step 8:
+description = "CBAM (yaml_inject)"
+if repair_notes:
+    description += f" [adapted: {'; '.join(repair_notes)}]"
+# results.tsv row gets "CBAM (yaml_inject) [adapted: ...]"
+```
+
+This flags the keep/discard decision as **not paper-faithful** — the
+experiment tested a module close to the paper's but not identical. Priority
+E combinations in later iterations should prefer kept experiments without
+`[adapted:` in description when there's a choice.
+
+#### Step 5.5f — Hook-mode repair is Tier 1 only
+
+Hook mode can't use Tier 2 (no YAML to inject adapters into). When a hook
+crash is Tier 2 category, the real problem is usually that paper-finder
+mis-classified the module — it should have been `yaml_inject`. Log to
+`discoveries.md` and discard:
+
+```python
+log_discovery(
+    f"Module {chosen.name!r} crashed with shape mismatch under hook mode. "
+    f"This usually means the module inserts a new layer (shifting downstream "
+    f"indices) and should be tagged Integration mode: yaml_inject in "
+    f"modules.md. Manual fix: edit modules.md, set Status back to pending, "
+    f"set Integration mode to yaml_inject, resume.",
+    loop=state.get("loop_count", 0),
+    category="observation",
+)
+# → Step 7 discard
+```
+
+#### Step 5.5g — When NOT to enter repair
+
+- Plain hyperparameter changes (Priority B/C) that crash → straight to Step 7
+- Combination experiments (Priority E) — discard whole combination rather
+  than trying to fix; it's cheaper to test components individually
+- OOM — goes through v1.6 OOM path (halve BATCH_SIZE in orchestrator's
+  re-queue), not through repair. OOM is not a code bug.
 
 ---
 
@@ -851,13 +1246,11 @@ pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
 **Stall book-keeping is delegated to orchestrator (C1/C2).** Autoresearch
 writes `stall_count` here and only here; it never decides whether to reset
 it or trigger a paper-finder expand. The orchestrator owns that state
-machine — see orchestrator's Stage 3 Step 6 for the reset / expand logic.
-
-Previous versions had autoresearch reset `stall_count` to a hardcoded 5 when
-`stall_count >= 10 AND pending > 0`. That contradicted orchestrator's
-expand trigger and meant the reset value couldn't be tuned from yaml. Both
-responsibilities are now centralised in orchestrator and configured via
-`autoresearch.stall.force_test_reset` in yaml.
+machine — see orchestrator's Stage 3 Step 6 for the reset / expand logic
+configured via `autoresearch.stall.force_test_reset` in
+`research_config.yaml`. Step 2 Priority A automatically picks a pending
+module on the next iteration if `modules.md` has one, so no "force test"
+mechanism is needed from autoresearch's side.
 
 ---
 

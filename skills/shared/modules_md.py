@@ -51,6 +51,15 @@ VALID_STATUSES = {"pending", "injected", "tested", "discarded"}
 VALID_COMPLEXITIES = {"low", "medium", "high"}
 _COMPLEXITY_ORDER = {"low": 0, "medium": 1, "high": 2}
 
+# v1.7 — integration_mode declares how autoresearch should apply the module.
+# WARN-NOT-REJECT policy: unknown values are tolerated (just logged) so adding
+# new modes in future versions doesn't break old modules.md files.
+#   "hook"       — existing v1.6 path: append USE_X flag + branch in inject_modules()
+#   "yaml_inject" — v1.7: architectural insertion via weight_transfer.py
+#   "full_yaml"  — reserved for v1.8+: agent writes complete custom YAML
+KNOWN_INTEGRATION_MODES = {"hook", "yaml_inject", "full_yaml"}
+DEFAULT_INTEGRATION_MODE = "hook"
+
 
 @dataclass
 class Module:
@@ -78,6 +87,15 @@ class Module:
     @property
     def pdf_path(self) -> Optional[str]:
         return self.fields.get("pdf_path")
+
+    @property
+    def integration_mode(self) -> str:
+        """v1.7 — returns DEFAULT_INTEGRATION_MODE if field absent, blank,
+        or whitespace-only. Unknown values are returned as-is (warn-not-reject);
+        callers dispatch on known values and fall back to hook for unknown."""
+        raw = self.fields.get("Integration mode") or ""
+        stripped = raw.strip()
+        return stripped if stripped else DEFAULT_INTEGRATION_MODE
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +256,21 @@ def append_module(path, module: Module | dict) -> None:
         raise ValueError(f"Invalid Status {module.fields['Status']!r}")
     if "Complexity" in module.fields and module.fields["Complexity"] not in VALID_COMPLEXITIES:
         raise ValueError(f"Invalid Complexity {module.fields['Complexity']!r}")
+
+    # v1.7 — integration_mode is optional; default "hook" keeps v1.6 behaviour.
+    # Unknown values are WARNED but not rejected, so future values (added by
+    # later skill versions) don't break old modules.md files.
+    mode = module.fields.get("Integration mode")
+    if mode is not None:
+        mode = mode.strip()
+        if mode and mode not in KNOWN_INTEGRATION_MODES:
+            import sys as _sys
+            print(
+                f"WARN: Integration mode {mode!r} for module {module.name!r} "
+                f"is not one of {sorted(KNOWN_INTEGRATION_MODES)}. "
+                f"Autoresearch will fall back to {DEFAULT_INTEGRATION_MODE!r}.",
+                file=_sys.stderr,
+            )
 
     p = pathlib.Path(path)
     rendered = _render(module)

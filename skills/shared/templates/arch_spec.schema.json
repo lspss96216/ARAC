@@ -1,0 +1,116 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "arch_spec.schema.json",
+  "title": "ARCH_INJECTION_SPEC",
+  "description": "Architectural modification spec for weight_transfer.py. Pointed to by ARCH_INJECTION_SPEC_FILE in train.py Section ②. Consumed by build_custom_model_with_injection() at runtime.",
+
+  "type": "object",
+  "required": ["mode"],
+
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["insertions", "full_yaml"],
+      "description": "Strategy selector. 'insertions' is the v1.7 supported mode (weight_transfer programmatically generates a new YAML from a list of insertions). 'full_yaml' is reserved for v1.8+ (agent writes a complete YAML; helper only computes layer_map and transfers). Using 'full_yaml' in v1.7 raises NotImplementedError."
+    }
+  },
+
+  "oneOf": [
+    {
+      "properties": {
+        "mode":       { "const": "insertions" },
+        "insertions": {
+          "type": "array",
+          "minItems": 1,
+          "items":   { "$ref": "#/definitions/Insertion" },
+          "description": "List of module insertions to apply to the base model's YAML. Multiple insertions at different positions are allowed. Helper processes them in descending-index order to keep base-YAML indices stable."
+        },
+        "strict": {
+          "type": "boolean",
+          "default": true,
+          "description": "Per-entry strict mode. When true, every entry in the computed layer_map must transfer at least one tensor, otherwise weight_transfer raises. Disable only if you know some custom layers genuinely have no counterpart in the pretrained model."
+        }
+      },
+      "required": ["mode", "insertions"],
+      "additionalProperties": false
+    },
+    {
+      "properties": {
+        "mode":             { "const": "full_yaml" },
+        "custom_yaml_path": { "type": "string" },
+        "layer_map_override": {
+          "type": ["object", "null"],
+          "description": "Reserved for v1.8. When null, helper auto-computes via class-name pairing. When dict, keys/values are stringified integers."
+        }
+      },
+      "required": ["mode", "custom_yaml_path"],
+      "additionalProperties": false
+    }
+  ],
+
+  "definitions": {
+
+    "Insertion": {
+      "type": "object",
+      "required": ["module_class", "position", "scope"],
+
+      "properties": {
+
+        "module_class": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Za-z0-9_]*$",
+          "description": "Class name as it will appear in the generated YAML and in custom_modules.py's register_custom_modules() registry. Must be a Lazy* wrapper (see train-script-spec.md § Lazy-wrapper contract)."
+        },
+
+        "position": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["kind", "class_name"],
+              "properties": {
+                "kind":       { "const": "after_class" },
+                "class_name": { "type": "string" }
+              },
+              "additionalProperties": false,
+              "description": "Insert after every occurrence of a layer of class `class_name` within the given `scope`. e.g. after_class='Conv' + scope='backbone' inserts after every Conv in the backbone."
+            },
+            {
+              "type": "object",
+              "required": ["kind", "index"],
+              "properties": {
+                "kind":  { "const": "at_index" },
+                "index": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Index in the BASE YAML, not the generated custom YAML. Helper computes offsets internally."
+                }
+              },
+              "additionalProperties": false,
+              "description": "Insert after the layer at the given index in the base YAML. Helper validates that this index falls within `scope`; raises if out of scope."
+            }
+          ]
+        },
+
+        "scope": {
+          "type": "string",
+          "enum": ["backbone", "neck", "head", "all"],
+          "description": "Which part of the YAML to modify. 'neck' and 'head' are split by position relative to the first Detect layer (head = Detect + anything feeding directly into it; neck = everything between backbone end and head). When position.kind='at_index', scope is enforced as an assertion: the index must fall within scope."
+        },
+
+        "yaml_args": {
+          "type": "array",
+          "description": "Positional args for the YAML line, e.g. [64] for [-1, 1, LazyCBAM, [64]]. The first element is conventionally the channel count; Lazy* wrappers ignore it and read x.shape[1] at forward time (see train-script-spec.md § Lazy-wrapper contract). Still required for parse_model's c2 computation.",
+          "default": []
+        },
+
+        "module_kwargs": {
+          "type": "object",
+          "description": "Keyword args to pass to the Lazy* wrapper's __init__ via the YAML line. Not commonly used — most hyperparameters go in yaml_args. Reserved for wrappers that explicitly accept **kwargs.",
+          "default": {}
+        }
+      },
+
+      "additionalProperties": false
+    }
+  }
+}

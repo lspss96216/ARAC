@@ -185,6 +185,76 @@ def test_invalid_status_rejected():
     print("✓ test_invalid_status_rejected")
 
 
+# ---------------------------------------------------------------------------
+# v1.7 — integration_mode
+# ---------------------------------------------------------------------------
+
+def test_integration_mode_default():
+    """Module without Integration mode field defaults to 'hook' (v1.6 behaviour)."""
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+        f.write(SAMPLE)
+        path = f.name
+    mods = mm.parse(path)
+    assert mods[0].integration_mode == "hook", mods[0].integration_mode
+    print("✓ test_integration_mode_default")
+
+
+def test_integration_mode_yaml_inject():
+    """Module with Integration mode: yaml_inject is parsed correctly."""
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+        path = f.name
+    pathlib.Path(path).write_text("")
+    mm.append_module(path, {
+        "name": "CBAM Backbone",
+        "fields": {
+            "Location": "backbone",
+            "Complexity": "medium",
+            "paper2code": "yes",
+            "Integration mode": "yaml_inject",
+        },
+    })
+    mods = mm.parse(path)
+    assert mods[0].integration_mode == "yaml_inject"
+    print("✓ test_integration_mode_yaml_inject")
+
+
+def test_integration_mode_unknown_warns_but_accepts():
+    """Unknown Integration mode is warned about but not rejected.
+    This is the warn-not-reject policy so forward-compatible.
+    """
+    import io, contextlib
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+        path = f.name
+    pathlib.Path(path).write_text("")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        mm.append_module(path, {
+            "name": "Future Module",
+            "fields": {
+                "Complexity": "low",
+                "Integration mode": "telepathy",   # not in KNOWN_INTEGRATION_MODES
+            },
+        })
+    stderr = buf.getvalue()
+    assert "telepathy" in stderr, f"warning missing: {stderr!r}"
+    assert "WARN" in stderr
+    # Still appended
+    mods = mm.parse(path)
+    assert len(mods) == 1
+    assert mods[0].integration_mode == "telepathy"   # returned as-is, not rewritten
+    print("✓ test_integration_mode_unknown_warns_but_accepts")
+
+
+def test_integration_mode_blank_is_default():
+    """Empty string or whitespace-only → DEFAULT_INTEGRATION_MODE."""
+    m = mm.Module(name="x", fields={"Integration mode": "   "})
+    assert m.integration_mode == mm.DEFAULT_INTEGRATION_MODE
+    m2 = mm.Module(name="y", fields={"Integration mode": ""})
+    assert m2.integration_mode == mm.DEFAULT_INTEGRATION_MODE
+    print("✓ test_integration_mode_blank_is_default")
+
+
 if __name__ == "__main__":
     test_parse_basic()
     test_count_pending()
@@ -194,4 +264,9 @@ if __name__ == "__main__":
     test_append_module()
     test_append_to_empty_file()
     test_invalid_status_rejected()
+    # v1.7
+    test_integration_mode_default()
+    test_integration_mode_yaml_inject()
+    test_integration_mode_unknown_warns_but_accepts()
+    test_integration_mode_blank_is_default()
     print("\nall tests passed")
