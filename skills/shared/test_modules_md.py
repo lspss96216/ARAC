@@ -255,6 +255,139 @@ def test_integration_mode_blank_is_default():
     print("✓ test_integration_mode_blank_is_default")
 
 
+# ---------------------------------------------------------------------------
+# v1.7.3 — preferred_locations secondary sort
+# ---------------------------------------------------------------------------
+
+# A fixture with several modules at the same complexity but different
+# Location — so the secondary key actually has something to order.
+_LOC_SAMPLE = """# Modules Registry
+
+Task: test
+Last updated: 2026-04-20
+Total modules: 5
+
+---
+
+## M_head_low
+
+| Field | Value |
+|-------|-------|
+| Location | head |
+| Complexity | low |
+| Status | pending |
+
+## M_loss_low
+
+| Field | Value |
+|-------|-------|
+| Location | loss |
+| Complexity | low |
+| Status | pending |
+
+## M_backbone_low
+
+| Field | Value |
+|-------|-------|
+| Location | backbone |
+| Complexity | low |
+| Status | pending |
+
+## M_neck_low
+
+| Field | Value |
+|-------|-------|
+| Location | neck |
+| Complexity | low |
+| Status | pending |
+
+## M_backbone_medium
+
+| Field | Value |
+|-------|-------|
+| Location | backbone |
+| Complexity | medium |
+| Status | pending |
+"""
+
+
+def _write_loc_sample():
+    f = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False)
+    f.write(_LOC_SAMPLE)
+    f.close()
+    return f.name
+
+
+def test_preferred_locations_orders_within_complexity():
+    """preferred_locations=[backbone, neck, head, loss] should order the
+    four low-complexity modules accordingly, THEN put medium after all lows."""
+    path = _write_loc_sample()
+    pending = mm.find_pending(path, preferred_locations=["backbone", "neck", "head", "loss"])
+    got = [m.name for m in pending]
+    assert got == [
+        "M_backbone_low",     # low, backbone (rank 0)
+        "M_neck_low",         # low, neck (rank 1)
+        "M_head_low",         # low, head (rank 2)
+        "M_loss_low",         # low, loss (rank 3)
+        "M_backbone_medium",  # medium, backbone — still after all lows
+    ], got
+    print("✓ test_preferred_locations_orders_within_complexity")
+
+
+def test_preferred_locations_reversed():
+    """Reversing preferred_locations reverses the secondary order."""
+    path = _write_loc_sample()
+    pending = mm.find_pending(path, preferred_locations=["loss", "head", "neck", "backbone"])
+    got_low = [m.name for m in pending if m.complexity == "low"]
+    assert got_low == ["M_loss_low", "M_head_low", "M_neck_low", "M_backbone_low"], got_low
+    print("✓ test_preferred_locations_reversed")
+
+
+def test_preferred_locations_partial_list_puts_unlisted_last():
+    """Modules whose Location is not in preferred_locations sort after those
+    that are, in write order (stable sort)."""
+    path = _write_loc_sample()
+    # Only rank backbone and neck; head and loss are unlisted → rank 2 each
+    pending = mm.find_pending(path, preferred_locations=["backbone", "neck"])
+    got_low = [m.name for m in pending if m.complexity == "low"]
+    # Listed ones come first in preference order, then unlisted in write order
+    # (write order: head, loss, backbone, neck → unlisted slice is head, loss)
+    assert got_low[:2] == ["M_backbone_low", "M_neck_low"], got_low
+    assert set(got_low[2:]) == {"M_head_low", "M_loss_low"}, got_low[2:]
+    print("✓ test_preferred_locations_partial_list_puts_unlisted_last")
+
+
+def test_preferred_locations_none_preserves_v172_behaviour():
+    """preferred_locations=None → same as v1.7.2: single key on complexity,
+    write order preserved within tie."""
+    path = _write_loc_sample()
+    pending = mm.find_pending(path)   # preferred_locations defaults to None
+    got_low = [m.name for m in pending if m.complexity == "low"]
+    # Write order of low modules: head, loss, backbone, neck
+    assert got_low == ["M_head_low", "M_loss_low", "M_backbone_low", "M_neck_low"], got_low
+    print("✓ test_preferred_locations_none_preserves_v172_behaviour")
+
+
+def test_preferred_locations_case_insensitive():
+    """Location field values and preferred_locations entries are compared
+    case-insensitively (paper-finder sometimes writes 'Backbone')."""
+    path = _write_loc_sample()
+    pending = mm.find_pending(path, preferred_locations=["BACKBONE", "Neck"])
+    got_low = [m.name for m in pending if m.complexity == "low"]
+    assert got_low[0] == "M_backbone_low", got_low
+    assert got_low[1] == "M_neck_low", got_low
+    print("✓ test_preferred_locations_case_insensitive")
+
+
+def test_preferred_locations_empty_list_same_as_none():
+    """preferred_locations=[] behaves identically to None."""
+    path = _write_loc_sample()
+    a = [m.name for m in mm.find_pending(path, preferred_locations=[])]
+    b = [m.name for m in mm.find_pending(path, preferred_locations=None)]
+    assert a == b, (a, b)
+    print("✓ test_preferred_locations_empty_list_same_as_none")
+
+
 if __name__ == "__main__":
     test_parse_basic()
     test_count_pending()
@@ -269,4 +402,11 @@ if __name__ == "__main__":
     test_integration_mode_yaml_inject()
     test_integration_mode_unknown_warns_but_accepts()
     test_integration_mode_blank_is_default()
+    # v1.7.3
+    test_preferred_locations_orders_within_complexity()
+    test_preferred_locations_reversed()
+    test_preferred_locations_partial_list_puts_unlisted_last()
+    test_preferred_locations_none_preserves_v172_behaviour()
+    test_preferred_locations_case_insensitive()
+    test_preferred_locations_empty_list_same_as_none()
     print("\nall tests passed")

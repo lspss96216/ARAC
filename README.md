@@ -9,7 +9,29 @@ keeping what improves the primary metric.
 Supports `task_type: object_detection` and `object_tracking`, driven entirely
 by `research_config.yaml`. No skill hardcodes a specific metric.
 
-**This is v1.7.2** — bug fix for a cross-skill `IMGSZ` handoff gap.
+**This is v1.7.4** — documentation bug fix. Adds a Tie-breaking rule
+to `autoresearch/SKILL.md` Step 2 so the loop always has a
+deterministic fallback when multiple pending modules look equally
+valid. Before v1.7.4, autoresearch's agent sometimes paused mid-loop
+to ask the user "which should I try first?" despite Critical Rule #13
+saying "never talk to the user mid-loop" — because the rules didn't
+spell out what to do *instead* when genuinely tied. The new rule
+names the 4-step tie-breaker (write order → lower complexity →
+preferred_locations → alphabetical) and lists the common
+rationalisations that are NOT valid reasons to stop. Pure SKILL.md
+prose change, all 57 tests still green. See `CHANGELOG_v1.7.4.md`.
+
+**This is v1.7.3** — bug fix making `paper_finder.modules.preferred_locations`
+actually affect autoresearch iteration order. The yaml field had been
+read only by paper-finder (Stage 1 search filtering); autoresearch's
+`find_pending` sorted purely on complexity and ignored the yaml
+entirely, so `[backbone, neck, head, loss]` looked meaningful but
+didn't influence which pending module got picked first. v1.7.3 adds
+`preferred_locations` as a secondary sort key (complexity → location
+rank → write order). Unlisted locations still get picked, they just
+sort after listed ones. 57 tests green (+6). See `CHANGELOG_v1.7.3.md`.
+
+**v1.7.2** — bug fix for a cross-skill `IMGSZ` handoff gap.
 `research_config.yaml → evaluation.ultralytics_val.imgsz` was correctly
 locked into `train.py` by orchestrator Stage 3, but was silently lost
 when dataset-hunter derived `pretrain.py` from the detection template
@@ -89,6 +111,8 @@ CHANGELOG_v1.6.md                           · 26 bug fixes on top of v1.5
 CHANGELOG_v1.7.md                           · yaml_inject feature addition
 CHANGELOG_v1.7.1.md                         · Step 5.5 repair loop + Q2/Q3 patches
 CHANGELOG_v1.7.2.md                         · IMGSZ state-handoff fix
+CHANGELOG_v1.7.3.md                         · preferred_locations secondary sort
+CHANGELOG_v1.7.4.md                         · tie-breaking rule (don't ask, pick one)
 ```
 
 ---
@@ -261,10 +285,22 @@ SDK (`pip install firecrawl-py`) per the caveat in paper-finder Phase 2.
 
 ## Versions
 
-See `CHANGELOG_v1.7.2.md`, `CHANGELOG_v1.7.1.md`, `CHANGELOG_v1.7.md`,
-and `CHANGELOG_v1.6.md` for recent release notes.
+See `CHANGELOG_v1.7.4.md`, `CHANGELOG_v1.7.3.md`, `CHANGELOG_v1.7.2.md`,
+`CHANGELOG_v1.7.1.md`, `CHANGELOG_v1.7.md`, and `CHANGELOG_v1.6.md`
+for recent release notes.
 
-- **v1.7.2** (current): cross-skill `IMGSZ` handoff fix. Orchestrator
+- **v1.7.4** (current): autoresearch tie-breaking rule added to Step 2.
+  When Priority A–E leaves multiple candidates at the same sort rank,
+  apply write order → lower complexity → preferred_locations →
+  alphabetical, and NEVER stop to ask the user. Pure SKILL.md prose,
+  all 57 tests still green.
+- **v1.7.3**: `preferred_locations` in `research_config.yaml`
+  now actually sorts autoresearch's pending-module picks. Before
+  v1.7.3, the yaml field was read only by paper-finder for Stage 1
+  search filtering; autoresearch ignored it, so the yaml promise
+  wasn't kept. Secondary sort key added after complexity. +6 tests,
+  total 57 green.
+- **v1.7.2**: cross-skill `IMGSZ` handoff fix. Orchestrator
   now persists the resolved `imgsz` into `pipeline_state.json`;
   dataset-hunter's `pretrain.py` and autoresearch's Step 5.5 read from
   there instead of the template default (1920) or a missing

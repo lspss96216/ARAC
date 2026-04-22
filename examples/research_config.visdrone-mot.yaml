@@ -120,7 +120,7 @@ paper_finder:
     allow_paper2code_reconstruct: true
   modules:
     max_complexity: high           # Options: low / medium / high
-    preferred_locations:           # [tracking-only] Includes tracker/post_processing for tracker-layer modules.
+    preferred_locations:           # [v1.7.3] Paper-finder filters search to these locations; autoresearch also uses this as secondary sort key within each complexity tier. [tracking-only] Includes tracker/post_processing for tracker-layer modules.
       - backbone
       - neck
       - head

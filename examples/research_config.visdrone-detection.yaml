@@ -111,7 +111,7 @@ paper_finder:
     allow_paper2code_reconstruct: true     # If only paper exists (no weights), reconstruct from arXiv via paper2code.
   modules:                         # [optional] Constraints on improvement modules paper finder writes to modules.md.
     max_complexity: high           # Skip modules harder than this. Options: low / medium / high
-    preferred_locations:           # Module insertion points to prioritize. For tracking add: tracker / post_processing
+    preferred_locations:           # [v1.7.3] Paper-finder filters search to these locations; autoresearch also uses this as secondary sort key within each complexity tier. For tracking add: tracker / post_processing
       - backbone
       - neck
       - head

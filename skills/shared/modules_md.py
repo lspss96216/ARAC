@@ -193,10 +193,45 @@ def _parse_sections(body: str) -> dict:
 # Queries
 # ---------------------------------------------------------------------------
 
-def find_pending(path, sort_by_complexity: bool = True) -> list[Module]:
+def find_pending(
+    path,
+    sort_by_complexity: bool = True,
+    preferred_locations: list[str] | None = None,
+) -> list[Module]:
+    """Return pending modules, optionally sorted.
+
+    Sort keys (applied as a tuple in order):
+      1. Complexity — low (0), medium (1), high (2), missing → 99
+         Disable with sort_by_complexity=False.
+      2. Location rank — index of Location in preferred_locations
+         (case-insensitive). Locations not in the list rank after all
+         listed ones. Pass None or [] to skip this key.
+      3. Write order — stable tiebreak, preserves modules.md write order
+         for modules that tie on the above keys.
+
+    v1.7.3 — added preferred_locations secondary key. Pre-v1.7.3 behaviour
+    is preserved when preferred_locations is None or empty (single-key
+    sort by complexity).
+    """
     pending = [m for m in parse(path) if m.status == "pending"]
-    if sort_by_complexity:
-        pending.sort(key=lambda m: _COMPLEXITY_ORDER.get(m.complexity or "high", 99))
+    if not sort_by_complexity:
+        return pending
+
+    # Build case-insensitive location → rank map
+    loc_rank: dict[str, int] = {}
+    if preferred_locations:
+        for i, loc in enumerate(preferred_locations):
+            if isinstance(loc, str):
+                loc_rank[loc.strip().lower()] = i
+    unknown_rank = len(loc_rank)   # unlisted locations sort after listed
+
+    def key(m: Module):
+        c = _COMPLEXITY_ORDER.get(m.complexity or "high", 99)
+        location = (m.fields.get("Location") or "").strip().lower()
+        r = loc_rank.get(location, unknown_rank)
+        return (c, r)
+
+    pending.sort(key=key)
     return pending
 
 

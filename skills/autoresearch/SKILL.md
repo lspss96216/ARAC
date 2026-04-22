@@ -241,12 +241,27 @@ Read `modules.md` via the canonical parser — never grep for `Status: pending`,
 never parse the pipe-table format manually:
 
 ```python
-import sys, pathlib, json
+import sys, pathlib, json, yaml
 state = json.loads(pathlib.Path("pipeline_state.json").read_text())
 sys.path.insert(0, str(pathlib.Path(state["skills_dir"]) / "shared"))
 import modules_md as mm
 
-pending = mm.find_pending("modules.md")   # already sorted low → medium → high
+# v1.7.3 — pull preferred_locations from research_config.yaml so the
+# yaml field actually influences iteration order. Without this, the yaml
+# key was read only by paper-finder (for Stage 1 search filtering) and
+# had zero effect on which pending module autoresearch picks first —
+# making `preferred_locations: [backbone, neck, head, loss]` look
+# meaningful but actually ignored.
+_cfg = yaml.safe_load(pathlib.Path("research_config.yaml").read_text()) or {}
+preferred = (_cfg.get("paper_finder", {})
+                 .get("modules", {})
+                 .get("preferred_locations")) or None
+
+pending = mm.find_pending("modules.md", preferred_locations=preferred)
+# Sort keys applied, in order:
+#   1. Complexity (low < medium < high)
+#   2. Location rank (index in preferred_locations; unlisted → after listed)
+#   3. Write order in modules.md (stable tiebreak)
 ```
 
 If `pending` is empty, fall through to Priority B. Otherwise take `pending[0]`.
@@ -582,6 +597,59 @@ Only if A, B, C are exhausted. Prefer the lightest option that could plausibly h
 **Priority E — combinations**
 
 After finding what works individually, combine compatible wins (max 2 things at once).
+
+#### Tie-breaking — pick one, never ask
+
+After walking Priority A → E, you may still end up with multiple equally
+valid candidates (two modules at the same complexity+location rank, two
+hyperparameters of similar plausibility, two combinations worth trying).
+**You must pick one deterministically and continue.** Never stop to ask
+the user which to try first.
+
+Why: asking the user breaks autonomy (Rule #13). Worse, it trades a
+definite ~20-minute iteration for an indefinite wait — the iteration
+would almost certainly complete before the user gets back. Picking
+"wrong" costs at most one iteration; picking "ask" costs an unbounded
+amount of wall-clock time. **A deterministic wrong-seeming choice beats
+the right choice obtained by asking.**
+
+Apply these tie-breakers in order, stopping as soon as one resolves the
+tie:
+
+| # | Tie-breaker | Rationale |
+|---|---|---|
+| 1 | modules.md **write order** (earliest line wins, within matching complexity and location rank) | Matches `find_pending`'s stable sort; reproducible; paper-finder's discovery order is already a prioritised signal |
+| 2 | **Lower complexity** first | Cheaper to test, so if wrong, discard sooner |
+| 3 | `preferred_locations` order from `research_config.yaml` (already enforced by `find_pending`, listed here as reminder) | User's declared architectural priority |
+| 4 | Alphabetical by module / description string | Deterministic across runs — same modules.md always yields same tie-break |
+
+For non-modules.md ties (e.g. "which hyperparameter to tune first"):
+
+| # | Tie-breaker | Rationale |
+|---|---|---|
+| 1 | **Lightest change** (smallest parameter delta, no architecture change) first | Cheap experiments come first |
+| 2 | Change touching **more basic** settings (LR → augmentation → loss weight → freeze) | Gradient of invasiveness |
+| 3 | Alphabetical by variable name | Deterministic fallback |
+
+Whichever candidate you pick, **commit to it for this iteration**. If it
+doesn't improve PRIMARY, Step 7 discards it and Step 2 of the next
+iteration picks the next candidate. You never owe the user a
+justification for which tied option you chose — the git log and
+`results.tsv` record what was tried.
+
+Things that are NOT tie-breakers — don't use these to justify stopping
+to ask:
+
+- "Which approach does the user think is more promising?" — user doesn't
+  know; that's why they're running autoresearch
+- "This is a strategic choice that needs human input" — no iteration is
+  strategic; each is one data point
+- "These two options test fundamentally different hypotheses" — good,
+  pick one, the other will come up next iteration
+- "VRAM is tight, should I use a smaller module first?" — yes, apply
+  tie-breaker #2 (lower complexity), continue
+- "I want to confirm the user agrees with my priority" — do not confirm,
+  apply the rules above, continue
 
 #### Forced architecture exploration
 
