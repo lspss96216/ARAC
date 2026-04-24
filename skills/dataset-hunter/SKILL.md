@@ -860,12 +860,18 @@ def patch_section_2(src_path: str, dst_path: str, overrides: dict[str, str]) -> 
 
     Raises RuntimeError if src is not spec-compliant or any variable is
     missing from Section ②.
+
+    v1.7.5 — Section-header matching now uses regex tolerating ASCII digits
+    (`Section 2`), circled digits (`Section ②`), and case variations. This
+    removes the hard dependency on exact `Section ②` literal strings.
     """
     src = pathlib.Path(src_path).read_text()
-    s2 = src.find("Section ②")
-    s3 = src.find("Section ③")
-    if s2 < 0 or s3 < 0:
+    # Match section N with optional comment prefix and flexible spacing
+    sec2_m = re.search(r"(?mi)^#?\s*Section\s*[②2]\b", src)
+    sec3_m = re.search(r"(?mi)^#?\s*Section\s*[③3]\b", src)
+    if not sec2_m or not sec3_m:
         raise RuntimeError(f"{src_path} is not spec-compliant (see train-script-spec.md)")
+    s2, s3 = sec2_m.start(), sec3_m.start()
 
     before, section2, after = src[:s2], src[s2:s3], src[s3:]
     for name, value_expr in overrides.items():

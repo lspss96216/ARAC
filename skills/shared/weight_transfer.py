@@ -249,6 +249,24 @@ def generate_custom_yaml(
     new_neck     = [line for sec, _, line in flat_mut if sec == "neck"]
     new_head     = [line for sec, _, line in flat_mut if sec == "head"]
 
+    # ── v1.7.7 Fix #13 — shift head's absolute from-references ──
+    # Build flat_positions early so we can pass it to update_head_refs (and
+    # also return it via InsertionRecord at the end).
+    base_pos_counts: dict[int, int] = {}
+    for after_idx, _ in resolved:
+        base_pos_counts[after_idx] = base_pos_counts.get(after_idx, 0) + 1
+    flat_positions: list[int] = []
+    for pos in sorted(base_pos_counts):
+        flat_positions.extend([pos] * base_pos_counts[pos])
+
+    # Apply head ref shifting. Without this, an inserted CBAM in backbone
+    # (shifting all downstream indices by +1) leaves head's `Concat [-1, 6]`
+    # pointing at the wrong layer — head 6 was a P3 feature in the base
+    # model but is now the inserted CBAM. Forward then crashes with
+    # `Sizes of tensors must match except in dimension 1` at the Concat.
+    new_head = update_head_refs(new_head, flat_positions)
+    new_neck = update_head_refs(new_neck, flat_positions)
+
     custom = _reassemble(new_backbone, new_neck, new_head)
 
     # Preserve non-layer keys (nc, scales, depth_multiple, etc.) from base
@@ -258,19 +276,85 @@ def generate_custom_yaml(
 
     # Record base positions where insertions occurred, sorted ascending
     inserted_positions = sorted({after_idx for after_idx, _ in resolved})
-    # Multiple insertions at same after_idx → multiple new lines, but same
-    # base position. Need to count them for layer_map offsetting.
-    base_pos_counts: dict[int, int] = {}
-    for after_idx, _ in resolved:
-        base_pos_counts[after_idx] = base_pos_counts.get(after_idx, 0) + 1
-
-    # Flatten into a list where each base position appears once per insertion
-    # at that position, sorted ascending.
-    flat_positions: list[int] = []
-    for pos in sorted(base_pos_counts):
-        flat_positions.extend([pos] * base_pos_counts[pos])
+    # (flat_positions already computed above for the ref-shift pass)
 
     return custom, InsertionRecord(inserted_base_positions=flat_positions)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v1.7.7 Fix #13 — head/neck absolute-reference shifting
+# ──────────────────────────────────────────────────────────────────────────────
+
+def update_head_refs(
+    section_lines: list,
+    inserted_base_positions: list[int],
+) -> list:
+    """Shift absolute from-references in YAML lines after insertions.
+
+    A YOLO YAML line looks like:
+        [from, repeats, module_class, args]
+    where `from` is either:
+      - an integer: -1 (previous), -N (N back), or N >= 0 (absolute base index)
+      - a list of integers: e.g. [-1, 6] (Concat takes previous AND layer 6)
+
+    When insertions happen in backbone/neck, every downstream **absolute**
+    reference (>= 0) needs to be incremented by the count of insertions
+    that landed at-or-before the referenced position. Negative references
+    (-1, -2, ...) are positional relative to the line itself and stay correct
+    automatically.
+
+    Args:
+      section_lines:           list of YAML lines (head or neck) — mutated copies returned
+      inserted_base_positions: ascending-sorted list of base indices where
+                               insertions happened (one entry per inserted layer,
+                               so 2 insertions at same base position appears twice)
+
+    Returns:
+      A new list of lines with from-refs updated. Original lines untouched.
+
+    Edge cases:
+      - Empty inserted_base_positions → returns the input unchanged (deep-ish
+        copy preserves caller's identity).
+      - from is None or missing → line passed through.
+      - Non-integer from (e.g. someone wrote a string) → passed through.
+      - from list mixing absolute and negative → only absolute entries shift.
+    """
+    if not inserted_base_positions:
+        return list(section_lines)
+
+    def shift_one(ref: int) -> int:
+        """How many insertions landed at base position <= ref - 1?
+        (i.e. at-or-before the previous index, which would have shifted
+        the referenced layer's new position by +shifts.)
+        Note: an insertion AT position p produces a new layer at p+1, so
+        any base ref r > p is now r+1. Equivalently, r shifts by
+        sum(1 for p in inserted if p < r).
+        """
+        if ref < 0:
+            return ref   # negative refs are layer-relative, untouched
+        return ref + sum(1 for p in inserted_base_positions if p < ref)
+
+    out: list = []
+    for line in section_lines:
+        if not isinstance(line, list) or len(line) < 1:
+            out.append(line)
+            continue
+        from_spec = line[0]
+        new_from: object
+        if isinstance(from_spec, int):
+            new_from = shift_one(from_spec)
+        elif isinstance(from_spec, list):
+            new_from = [shift_one(r) if isinstance(r, int) else r for r in from_spec]
+        else:
+            new_from = from_spec   # unknown type — pass through
+
+        # Build a new line; don't mutate the caller's list-of-lists
+        new_line = [new_from, *line[1:]]
+        out.append(new_line)
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 # ──────────────────────────────────────────────────────────────────────────────

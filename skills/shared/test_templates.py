@@ -11,11 +11,22 @@ v1.7 additions:
 """
 import os, pathlib, re, sys
 
-REQUIRED_SECTIONS  = ["Section ①", "Section ②", "Section ③", "Section ④"]
+# v1.7.5 — regex tolerates both Unicode circled digits and ASCII digits so
+# a template like `# Section 2 — Tunables` is accepted alongside
+# `# Section ② — Tunables`. Keeps tests passing when SKILL.md-level regex
+# (check_spec_compliance / patch_section_2) likewise tolerates both.
+REQUIRED_SECTION_PATS = [
+    ("Section 1", re.compile(r"(?mi)^#?\s*Section\s*[①1]\b")),
+    ("Section 2", re.compile(r"(?mi)^#?\s*Section\s*[②2]\b")),
+    ("Section 3", re.compile(r"(?mi)^#?\s*Section\s*[③3]\b")),
+    ("Section 4", re.compile(r"(?mi)^#?\s*Section\s*[④4]\b")),
+]
 REQUIRED_VARIABLES = ["TIME_BUDGET", "SEED", "BATCH_SIZE", "WEIGHTS",
                       "DATA_YAML", "NUM_CLASSES", "CKPT_DIR",
                       # v1.7 — architecture injection surface
-                      "ARCH_INJECTION_ENABLED", "ARCH_INJECTION_SPEC_FILE"]
+                      "ARCH_INJECTION_ENABLED", "ARCH_INJECTION_SPEC_FILE",
+                      # v1.7.7 — explicit optimizer (never 'auto')
+                      "OPTIMIZER", "LR0", "MOMENTUM"]
 REQUIRED_FUNCTIONS = ["def inject_modules", "def main"]
 # v1.7 — main() must branch on ARCH_INJECTION_ENABLED so the weight-transfer
 # path is reachable. Presence of the literal substring is a necessary but not
@@ -27,7 +38,7 @@ def check(path, kind="train"):
     src = pathlib.Path(path).read_text()
     missing = []
 
-    missing += [s for s in REQUIRED_SECTIONS if s not in src]
+    missing += [name for name, pat in REQUIRED_SECTION_PATS if not pat.search(src)]
 
     # track.py has a different hook name and no detector variables — check only
     # what the spec requires for its role.

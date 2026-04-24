@@ -28,6 +28,19 @@ try:
 except ImportError:
     pass
 
+# ── v1.7.5 Environment shielding ───────────────────────────────────────────────
+# See train.py.detection for full rationale. Same three calls here: reset
+# ULTRALYTICS_RUNS_DIR to ./runs, default WANDB_MODE=offline, update SETTINGS.
+import os as _os
+_os.environ.pop("ULTRALYTICS_RUNS_DIR", None)
+_os.environ.setdefault("WANDB_MODE", "offline")
+try:
+    from ultralytics.utils import SETTINGS as _SETTINGS
+    _SETTINGS.update({"runs_dir": str(Path("runs").resolve())})
+except Exception:
+    pass
+# ───────────────────────────────────────────────────────────────────────────────
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Section ② — Tunables (the contract surface)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -36,8 +49,14 @@ TIME_BUDGET = 1200
 SEED        = 42
 IMGSZ       = 1920      # locked; halve BATCH_SIZE for OOM, never change resolution
 
+# v1.7.7 — explicit optimizer; never "auto" (silently overrides LR0/MOMENTUM).
+# Permitted: SGD, AdamW, Adam, RMSProp, NAdam, RAdam.
+OPTIMIZER   = "SGD"
+
 # Modifiable.
 BATCH_SIZE     = 16
+LR0            = 0.01
+MOMENTUM       = 0.937
 WEIGHTS        = "weights/yolo26x.pt"
 DATA_YAML      = "data/dataset.yaml"           # frame-level labels in YOLO format
 NUM_CLASSES    = 10
@@ -63,9 +82,14 @@ def inject_modules(model):
     """Detector-layer modules only. Tracker-layer modules go in track.py.
     Each branch must be idempotent when its flag is False.
 
-    Contract: callers MUST rebind to the return value:
-        model = inject_modules(model)
-    See train-script-spec.md § inject_modules() — Contract.
+    Contract:
+      (1) Callers MUST rebind to the return value:
+              model = inject_modules(model)
+      (2) Hooks MUST be PicklableHook subclasses (no closures).
+      (3) Branches that attach hooks MUST also call reapply_on_rebuild
+          so hooks survive trainer rebuild (#14).
+
+    See train-script-spec.md § Lazy-wrapper contract and shared/hook_utils.py.
     """
     return model
 
@@ -92,6 +116,12 @@ def set_seed(seed: int) -> None:
 
 def train(model) -> str:
     """Train and return the path to the best checkpoint."""
+    if str(OPTIMIZER).lower() == "auto":
+        raise ValueError(
+            "OPTIMIZER='auto' would silently override LR0 and MOMENTUM. "
+            "Set OPTIMIZER to a concrete optimizer (SGD/AdamW/Adam/etc). "
+            "See train-script-spec.md § Tunable contract."
+        )
     results = model.train(
         data=DATA_YAML,
         epochs=10000,
@@ -102,6 +132,9 @@ def train(model) -> str:
         project=str(CKPT_DIR.parent),
         name=CKPT_DIR.name,
         seed=SEED,
+        optimizer=OPTIMIZER,
+        lr0=LR0,
+        momentum=MOMENTUM,
         exist_ok=True,
     )
     best = Path(results.save_dir) / "weights" / "best.pt"

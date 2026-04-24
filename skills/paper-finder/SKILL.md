@@ -49,6 +49,59 @@ Read the task description and extract:
 
 Use these to build targeted search queries for each source.
 
+### v1.7.5 — User-specified base model (short-circuit Phase 2–4)
+
+If `research_config.yaml → task` contains `preferred_base_model` and
+`preferred_base_weights_url`, **skip Phase 2–4 entirely** and write
+`base_model.md` directly. This handles cases like:
+- Model exists but has no formal arXiv paper (ultralytics releases,
+  private models)
+- User wants to pin a specific model for reproducibility
+- Scoring/benchmarking infrastructure unavailable (`.env` missing keys)
+
+```python
+import yaml, pathlib, json
+cfg = yaml.safe_load(pathlib.Path("research_config.yaml").read_text())
+task = cfg.get("task", {})
+pref_name = task.get("preferred_base_model")
+pref_url  = task.get("preferred_base_weights_url")
+
+if pref_name and pref_url:
+    pref_arxiv = task.get("preferred_base_arxiv_id")   # optional
+    md = f"""# Base Model: {pref_name}
+
+## Selected: {pref_name} (user-specified)
+
+**Source**: user override via `research_config.yaml → task.preferred_base_model`
+
+**Weights URL**: {pref_url}
+"""
+    if pref_arxiv:
+        md += f"\n**arXiv**: https://arxiv.org/abs/{pref_arxiv}\n"
+    md += """
+**Score**: n/a (user override, Phases 2-4 skipped)
+**Benchmark**: n/a
+**Reason**: User specified this model directly in research_config.yaml.
+
+Paper finder did not evaluate alternatives. To re-enable automatic
+selection, remove `preferred_base_model` from the yaml and re-run.
+"""
+    pathlib.Path("base_model.md").write_text(md)
+
+    # Mark state so orchestrator Stage 1 doesn't think paper-finder failed
+    state = json.loads(pathlib.Path("pipeline_state.json").read_text())
+    state["base_model_md_ready"] = True
+    state["base_model_user_override"] = True
+    pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+
+    print(f"[paper-finder] user-specified base: {pref_name}")
+    print(f"[paper-finder] skipping Phase 2-4, proceeding to Phase 5")
+    # Continue directly to Phase 5 (modules collection)
+else:
+    # Normal flow — proceed to Phase 2
+    pass
+```
+
 ---
 
 ## Phase 2 — Search sources
@@ -411,8 +464,9 @@ When both modes could apply, prefer `hook` — it's simpler and cheaper.
 Reserve `yaml_inject` for cases where the paper's method genuinely requires
 a new layer in the graph with shifted indices.
 
-**Asymmetric cost of misclassification (v1.7.1).** If you can't decide,
-**prefer `yaml_inject`**. The failure modes are not symmetric:
+**Asymmetric cost of misclassification (v1.7.1, refined v1.7.7).** If you
+can't decide, **prefer `yaml_inject`**. The failure modes are not
+symmetric:
 
 - **Hook wrongly applied to a yaml_inject-needing module** (e.g. CBAM tagged
   hook, inserted via forward monkey-patch): training completes with no
@@ -427,6 +481,25 @@ a new layer in the graph with shifted indices.
   entry records the misclassification for human review.
 
 Loud failures are better than silent ones. When unsure, tag `yaml_inject`.
+
+**v1.7.7 — yaml_inject head reference shifting (Fix #13).** Versions
+v1.7 through v1.7.6 had a latent bug in `weight_transfer.generate_custom_yaml`
+where head's absolute `Concat [-1, N]` references were NOT updated when an
+insertion in backbone/neck shifted downstream layer indices. Symptom: the
+inserted CBAM/SE/etc. would build successfully and pass weight transfer,
+then crash on the FIRST forward pass with
+`RuntimeError: Sizes of tensors must match except in dimension 1`.
+
+**This is fixed in v1.7.7.** `update_head_refs` now runs as part of
+`generate_custom_yaml` and shifts every absolute from-reference in head
+and neck by the count of insertions before it. yaml_inject for
+backbone/neck modules now works end-to-end. Existing modules.md entries
+tagged yaml_inject that were previously failing (and were workaround-tagged
+as `hook` in user's modules.md) can be returned to `yaml_inject`.
+
+If you tagged a yaml_inject module as `hook` between v1.7 and v1.7.6 as
+a workaround for this bug, the original `yaml_inject` choice is now the
+correct one and should be restored.
 
 ### yaml_inject modules need injection spec fields
 

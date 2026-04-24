@@ -27,6 +27,30 @@ try:
 except ImportError:
     pass                                # OK on first run — no modules injected yet
 
+# ── v1.7.5 Environment shielding ───────────────────────────────────────────────
+# These three calls run at import time, BEFORE any YOLO() instantiation, so
+# ultralytics honours them. Do not move below Section ② — user/env settings
+# will have already applied by then.
+#
+# (a) ULTRALYTICS_RUNS_DIR: an env var or user-wide settings.json can force
+#     `runs/` to a directory outside this project, making ckpt paths
+#     unpredictable for autoresearch's Step 6. Reset it to ./runs here so
+#     best.pt always lands where the pipeline expects.
+# (b) WANDB_MODE=offline (default): ultralytics auto-attaches a wandb callback
+#     if the user has logged in globally. This creates a new run per iteration
+#     and pollutes the project dashboard. Override to offline unless the user
+#     explicitly wants online runs (set WANDB_MODE=online externally or edit
+#     this line).
+import os as _os
+_os.environ.pop("ULTRALYTICS_RUNS_DIR", None)
+_os.environ.setdefault("WANDB_MODE", "offline")
+try:
+    from ultralytics.utils import SETTINGS as _SETTINGS
+    _SETTINGS.update({"runs_dir": str(Path("runs").resolve())})
+except Exception:
+    pass   # older ultralytics may not expose SETTINGS; env var reset alone helps
+# ───────────────────────────────────────────────────────────────────────────────
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Section ② — Tunables (the contract surface)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -35,8 +59,19 @@ TIME_BUDGET = 1200      # seconds per training run
 SEED        = 42        # random seed
 IMGSZ       = 1920      # image size — locked; halve BATCH_SIZE for OOM, never change resolution
 
+# v1.7.7 — explicit optimizer instead of ultralytics' default 'auto'.
+# Critical: 'auto' silently picks SGD/AdamW/MuSGD by model size AND ignores any
+# user-supplied lr0/momentum, only printing one log line ("optimizer=auto found,
+# ignoring 'lr0=...' and 'momentum=...'"). Any LR experiment under 'auto' would
+# silently no-op. SKILL must never set this back to 'auto'.
+# Permitted values: SGD, AdamW, Adam, RMSProp, NAdam, RAdam.
+# autoresearch CAN change this to test different optimizers, but NEVER to 'auto'.
+OPTIMIZER   = "SGD"     # never "auto"
+
 # Modifiable by autoresearch and dataset hunter.
 BATCH_SIZE     = 16
+LR0            = 0.01      # initial learning rate; honoured because OPTIMIZER != "auto"
+MOMENTUM       = 0.937     # SGD momentum / Adam beta1; honoured because OPTIMIZER != "auto"
 WEIGHTS        = "weights/yolo26x.pt"
 DATA_YAML      = "data/dataset.yaml"
 NUM_CLASSES    = 10
@@ -68,13 +103,40 @@ def inject_modules(model):
     autoresearch appends new branches here when pulling modules from modules.md.
     Do not reorder existing branches — order must stay stable for reproducibility.
 
-    Contract: callers MUST rebind to the return value:
-        model = inject_modules(model)
-    Some branches return a replaced instance (e.g. backbone swap). Calling
-    inject_modules(model) without assignment silently loses the replacement.
-    See train-script-spec.md § inject_modules() for the full contract.
+    Contract:
+      (1) Callers MUST rebind to the return value:
+              model = inject_modules(model)
+          Some branches return a replaced instance (e.g. backbone swap).
+          Calling inject_modules(model) without assignment silently loses
+          the replacement.
+
+      (2) Hooks MUST be PicklableHook subclasses (not closures) — see
+          shared/hook_utils.py. Closures break ckpt save (#15). Direct
+          `layer.forward = wrapper` assignment is forbidden — always use
+          PicklableHook.attach (#18).
+
+      (3) If ANY branch attaches a hook, you MUST also call reapply_on_rebuild
+          (also from hook_utils) so hooks survive ultralytics' Trainer
+          rebuild. Without this, hooks bind to the original model and the
+          fresh model that trainer.setup_model creates has no hooks at all.
+          Symptom: training completes, mAP equals baseline, summary line
+          shows baseline param count not the augmented count (#14).
+
+      See train-script-spec.md § Lazy-wrapper contract for details.
     """
-    # Branches go here. Example shape:
+    # Branches go here. Example shape using the v1.7.7 PicklableHook contract:
+    #
+    # if USE_CBAM:
+    #     from custom_modules import CBAMHook       # subclass of PicklableHook
+    #     from hook_utils import reapply_on_rebuild
+    #     # Initial attach to the model that exists right now
+    #     for idx in (4, 6, 8):                      # backbone Conv layers
+    #         CBAMHook.attach(model.model.model[idx], channels=256)
+    #     # Re-attach after trainer rebuilds the model in setup_model
+    #     def _reapply(rebuilt):
+    #         for idx in (4, 6, 8):
+    #             CBAMHook.attach(rebuilt.model[idx], channels=256)
+    #     reapply_on_rebuild(model, _reapply)
     #
     # if USE_SMALL_OBJECT_FPN:
     #     from custom_modules import SmallObjectFPN
@@ -94,6 +156,14 @@ def set_seed(seed: int) -> None:
 
 
 def train(model) -> None:
+    # v1.7.7 — runtime guard. If autoresearch ever sets OPTIMIZER='auto'
+    # (in violation of contract), fail fast rather than silently dropping LR0.
+    if str(OPTIMIZER).lower() == "auto":
+        raise ValueError(
+            "OPTIMIZER='auto' would silently override LR0 and MOMENTUM. "
+            "Set OPTIMIZER to a concrete optimizer (SGD/AdamW/Adam/etc). "
+            "See train-script-spec.md § Tunable contract."
+        )
     model.train(
         data=DATA_YAML,
         epochs=10000,                        # time-bounded, epochs is just an upper bound
@@ -104,6 +174,9 @@ def train(model) -> None:
         project=str(CKPT_DIR.parent),
         name=CKPT_DIR.name,
         seed=SEED,
+        optimizer=OPTIMIZER,                 # v1.7.7 — explicit; never 'auto'
+        lr0=LR0,                             # v1.7.7 — honoured because optimizer != 'auto'
+        momentum=MOMENTUM,                   # v1.7.7 — honoured because optimizer != 'auto'
         exist_ok=True,
         verbose=True,
     )

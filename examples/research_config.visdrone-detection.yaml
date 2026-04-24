@@ -20,6 +20,10 @@ task:
     imagery at 1920x1080, with heavy occlusion and long-tail class distribution.
   task_type: object_detection      # [required] Decides which template to scaffold. Options: object_detection / object_tracking
   framework: ultralytics-yolo      # [required] Framework family. Currently only ultralytics-yolo supported.
+  # --- v1.7.5: user-specified base model (optional, skips paper-finder Phase 2-4) ---
+  # preferred_base_model: YOLO26X              # [optional] If set with preferred_base_weights_url, paper finder writes base_model.md directly and skips scoring. Useful when model has no arXiv paper or scoring infrastructure (.env) is unavailable.
+  # preferred_base_weights_url: https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26x.pt
+  # preferred_base_arxiv_id: 2305.09972        # [optional, optional] arXiv ID if known; omit otherwise
   domain: aerial_drone             # [optional] Hint for paper finder query generation. e.g. aerial_drone / medical / autonomous / satellite / general
   detection_targets:               # [optional] Class names being detected. Used in paper finder query generation.
     - pedestrian
@@ -39,7 +43,7 @@ task:
 # -----------------------------------------------------------------------------
 paths:
   project_root: "."                # [required] Project working directory. Almost always "." (current dir).
-  skills_dir: "~/.claude/skills"   # [required] Where the four skills + shared/ live. Use absolute path; ~ may not be expanded by all callers.
+  skills_dir: "./skills"           # [required] Where the four skills + shared/ live. Relative to this yaml. Absolute paths also accepted.
   pipeline_state: "pipeline_state.json"  # [optional] Where orchestrator stores cross-stage state. Default ok.
   train_script: "train.py"         # [optional] The script autoresearch iterates on. Default ok.
   custom_modules_file: "custom_modules.py"  # [optional] Where autoresearch puts paper-extracted module classes.
@@ -148,7 +152,7 @@ dataset_hunter:
   openimages_max_samples: 50000    # [optional] Cap OpenImages download size. Full dataset is ~1.5TB — usually want a subset.
   val_split_ratio: 0.1             # [optional] When a dataset has no val split, reserve this fraction (deterministic by filename hash).
   pretrain:                        # [required] Pretrain settings.
-    time_budget_sec: 21600         # How long pretrain may run. Default 21600 = 6 hours.
+    time_budget_sec: 21600         # How long pretrain may run. Default 21600 = 6 hours. v1.7.5: set to 0 to skip pretrain entirely (dataset search still runs; use dataset_hunter.enabled: false to skip search too).
     eval_time_budget_sec: 1800     # How long each self-eval finetune may run (one for baseline, one for pretrained). Default 1800 = 30 min each.
     improvement_threshold: 0.002   # Pretrained must beat baseline by this much (absolute) to recommend use_pretrained.
     skip_if_corpus_empty: true     # If all downloads failed and corpus is empty, skip pretrain rather than crash.
@@ -164,6 +168,7 @@ autoresearch:
     max_runtime_multiplier: 2      # If a run exceeds time_budget_sec * this, kill it as crashed. Default 2.
     iterations: null               # null = loop forever until interrupted. Set integer for bounded run.
     seed: 42                       # Random seed. Locked across runs for reproducibility.
+  optimizer: SGD                   # [v1.7.7] Initial optimizer for train.py. Permitted: SGD/AdamW/Adam/RMSProp/NAdam/RAdam. Cannot be 'auto' (silently overrides LR0/MOMENTUM). autoresearch may swap during experiments but never to 'auto'.
   stall:                           # [optional] When to escalate after no-improvement streaks.
     threshold: 10                  # Consecutive non-improving rounds before triggering paper_finder expand.
     force_test_reset: 5            # When stall hits threshold AND modules.md has pending entries,

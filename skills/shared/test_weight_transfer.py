@@ -673,6 +673,174 @@ def test_shapeinfo_rejects_non_4d():
 # Runner
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────────────
+# v1.7.7 — update_head_refs (Fix #13: head/neck absolute-ref shifting)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_update_head_refs_no_insertions_passthrough():
+    """No insertions → returns input unchanged."""
+    lines = [[-1, 1, "Conv", [64]], [6, 1, "Concat", [1]]]
+    out = wt.update_head_refs(lines, [])
+    assert out == lines
+    print("✓ test_update_head_refs_no_insertions_passthrough")
+
+
+def test_update_head_refs_empty_section():
+    """Empty list returns empty list."""
+    assert wt.update_head_refs([], [3]) == []
+    print("✓ test_update_head_refs_empty_section")
+
+
+def test_update_head_refs_negative_refs_untouched():
+    """from=-1, -2, etc. are layer-relative — never shift."""
+    lines = [[-1, 1, "Conv", [64]], [-2, 1, "Conv", [128]]]
+    out = wt.update_head_refs(lines, [3, 5, 8])
+    assert out == lines
+    print("✓ test_update_head_refs_negative_refs_untouched")
+
+
+def test_update_head_refs_single_absolute_shifts():
+    """Concat [-1, 6] with insertion at base index 3 → [-1, 7]."""
+    lines = [[[-1, 6], 1, "Concat", [1]]]
+    out = wt.update_head_refs(lines, [3])
+    assert out == [[[-1, 7], 1, "Concat", [1]]]
+    print("✓ test_update_head_refs_single_absolute_shifts")
+
+
+def test_update_head_refs_multiple_insertions_compound():
+    """3 insertions all before ref 6 → 6 + 3 = 9."""
+    lines = [[6, 1, "Conv", [64]]]
+    out = wt.update_head_refs(lines, [2, 3, 5])
+    assert out == [[9, 1, "Conv", [64]]]
+    print("✓ test_update_head_refs_multiple_insertions_compound")
+
+
+def test_update_head_refs_insertion_at_ref_does_not_shift():
+    """Insertion AT base index 6 is inserted AFTER 6 → produces new layer 7.
+    A ref to base 6 still points at base 6 (unchanged), so no shift."""
+    lines = [[6, 1, "Conv", [64]]]
+    out = wt.update_head_refs(lines, [6])
+    assert out == [[6, 1, "Conv", [64]]]
+    print("✓ test_update_head_refs_insertion_at_ref_does_not_shift")
+
+
+def test_update_head_refs_mixed_before_and_after():
+    """Insertions [3, 6, 8] applied to ref 6: only 3 < 6 shifts → 6 + 1 = 7."""
+    lines = [[6, 1, "Conv", [64]]]
+    out = wt.update_head_refs(lines, [3, 6, 8])
+    assert out == [[7, 1, "Conv", [64]]]
+    print("✓ test_update_head_refs_mixed_before_and_after")
+
+
+def test_update_head_refs_concat_three_way_mixed():
+    """Concat with multiple absolute refs all shift independently."""
+    lines = [[[4, 6, 9], 1, "Concat", [1]]]
+    out = wt.update_head_refs(lines, [5])
+    # ref 4: 5 not < 4, no shift → 4
+    # ref 6: 5 < 6, +1 → 7
+    # ref 9: 5 < 9, +1 → 10
+    assert out == [[[4, 7, 10], 1, "Concat", [1]]]
+    print("✓ test_update_head_refs_concat_three_way_mixed")
+
+
+def test_update_head_refs_does_not_mutate_input():
+    """Caller's list should remain unchanged (defensive copy)."""
+    lines = [[6, 1, "Conv", [64]]]
+    original = [list(line) for line in lines]
+    _ = wt.update_head_refs(lines, [3])
+    assert lines == original
+    print("✓ test_update_head_refs_does_not_mutate_input")
+
+
+def test_update_head_refs_passthrough_malformed_lines():
+    """Lines that don't look like [from, ...] are passed through."""
+    lines = [None, [], "not a list", [6, 1, "Conv", [64]]]
+    out = wt.update_head_refs(lines, [3])
+    assert out[0] is None
+    assert out[1] == []
+    assert out[2] == "not a list"
+    assert out[3] == [7, 1, "Conv", [64]]
+    print("✓ test_update_head_refs_passthrough_malformed_lines")
+
+
+def test_generate_custom_yaml_shifts_head_concat():
+    """Integration: insertion in backbone shifts head's Concat refs.
+    This is the v1.7 → v1.7.6 silent failure case (#13 from review)."""
+    # Minimal base: 4 backbone layers (Conv x2, C2f x1, SPPF x1), 2 head layers
+    # head Concat[-1, 1] should still reference the original base layer 1
+    # after we insert a CBAM after backbone layer 1.
+    base = {
+        "nc": 80,
+        "backbone": [
+            [-1, 1, "Conv",     [64, 3, 2]],   # base idx 0
+            [-1, 1, "Conv",     [128, 3, 2]],  # base idx 1
+            [-1, 1, "C2f",      [128, True]],  # base idx 2
+            [-1, 1, "SPPF",     [256, 5]],     # base idx 3
+        ],
+        "head": [
+            [[-1, 1], 1, "Concat", [1]],       # base idx 4 — refs backbone Conv at 1
+            [-1, 1, "Detect",  [80]],          # base idx 5
+        ],
+    }
+    insertion = wt.Insertion(
+        module_class="LazyCBAM",
+        position_kind="at_index",
+        position_value=2,             # insert AFTER base idx 2 (C2f)
+        scope="backbone",
+        yaml_args=[128],
+        module_kwargs={},
+    )
+    custom, record = wt.generate_custom_yaml(base, [insertion])
+
+    # Backbone now has 5 entries (4 originals + 1 CBAM)
+    assert len(custom["backbone"]) == 5
+    # CBAM is at new index 3 (one past the C2f at original idx 2)
+    assert custom["backbone"][3][2] == "LazyCBAM"
+
+    # Head Concat ref to base idx 1 stays as 1 (insertion at 2 doesn't shift base 1)
+    head_concat = custom["head"][0]
+    assert head_concat[0] == [-1, 1], (
+        f"Concat refs should remain [-1, 1] because insertion at base idx 2 "
+        f"does not shift refs <= 2; got {head_concat[0]}"
+    )
+    print("✓ test_generate_custom_yaml_shifts_head_concat")
+
+
+def test_generate_custom_yaml_shifts_head_concat_when_ref_after_insertion():
+    """Same but insertion BEFORE the head ref — head ref must shift."""
+    base = {
+        "nc": 80,
+        "backbone": [
+            [-1, 1, "Conv",     [64, 3, 2]],   # base idx 0
+            [-1, 1, "Conv",     [128, 3, 2]],  # base idx 1
+            [-1, 1, "C2f",      [128, True]],  # base idx 2
+            [-1, 1, "SPPF",     [256, 5]],     # base idx 3
+        ],
+        "head": [
+            [[-1, 3], 1, "Concat", [1]],       # refs SPPF at base idx 3
+            [-1, 1, "Detect",  [80]],
+        ],
+    }
+    # Insert AFTER base idx 1 (between Conv and C2f) — ref to base 3 must
+    # become ref to new index 4
+    insertion = wt.Insertion(
+        module_class="LazyCBAM",
+        position_kind="at_index",
+        position_value=1,
+        scope="backbone",
+        yaml_args=[128],
+        module_kwargs={},
+    )
+    custom, _ = wt.generate_custom_yaml(base, [insertion])
+    head_concat = custom["head"][0]
+    assert head_concat[0] == [-1, 4], (
+        f"Concat ref to base 3 should shift to 4 because insertion at base 1 "
+        f"is < 3; got {head_concat[0]}"
+    )
+    print("✓ test_generate_custom_yaml_shifts_head_concat_when_ref_after_insertion")
+
+
+
 TESTS = [
     test_split_sections_basic,
     test_split_sections_no_detect,
@@ -711,6 +879,19 @@ TESTS = [
     test_extend_spec_with_adapters_pre_target_post_ordering,
     test_extend_spec_noop_when_plan_empty,
     test_shapeinfo_rejects_non_4d,
+    # v1.7.7 — update_head_refs (Fix #13)
+    test_update_head_refs_no_insertions_passthrough,
+    test_update_head_refs_empty_section,
+    test_update_head_refs_negative_refs_untouched,
+    test_update_head_refs_single_absolute_shifts,
+    test_update_head_refs_multiple_insertions_compound,
+    test_update_head_refs_insertion_at_ref_does_not_shift,
+    test_update_head_refs_mixed_before_and_after,
+    test_update_head_refs_concat_three_way_mixed,
+    test_update_head_refs_does_not_mutate_input,
+    test_update_head_refs_passthrough_malformed_lines,
+    test_generate_custom_yaml_shifts_head_concat,
+    test_generate_custom_yaml_shifts_head_concat_when_ref_after_insertion,
 ]
 
 if __name__ == "__main__":

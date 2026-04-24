@@ -28,6 +28,20 @@ try:
 except ImportError:
     pass
 
+# ── v1.7.5 Environment shielding ───────────────────────────────────────────────
+# See train.py.detection for full rationale. Reset ULTRALYTICS_RUNS_DIR, default
+# WANDB_MODE=offline, update SETTINGS.runs_dir. track.py reads the detector
+# checkpoint written by train.py — both must resolve runs/ to the same place.
+import os as _os
+_os.environ.pop("ULTRALYTICS_RUNS_DIR", None)
+_os.environ.setdefault("WANDB_MODE", "offline")
+try:
+    from ultralytics.utils import SETTINGS as _SETTINGS
+    _SETTINGS.update({"runs_dir": str(Path("runs").resolve())})
+except Exception:
+    pass
+# ───────────────────────────────────────────────────────────────────────────────
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Section ② — Tunables (the contract surface)
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -932,11 +932,15 @@ pathlib.Path('train.py').write_text(src)
 "
 $RUNNER train.py > run.log 2>&1
 
-# Restore TIME_BUDGET — orchestrator's value comes from research_config.yaml
+# Restore TIME_BUDGET — orchestrator's value lives in state["loop_time_budget"]
+# (v1.7.6 fix: previous version read state["time_budget_sec"] which never
+# existed; KeyError on every successful short-test that progressed to
+# full-budget rerun. Latent since v1.7.1 because no real Step 5.5 short-test
+# completed end-to-end before now.)
 python3 -c "
 import pathlib, re, json
 state = json.load(open('pipeline_state.json'))
-tb = state['time_budget_sec']
+tb = state['loop_time_budget']
 src = pathlib.Path('train.py').read_text()
 src = re.sub(r'(?m)^TIME_BUDGET\s*=.*', f'TIME_BUDGET = {tb}', src, count=1)
 pathlib.Path('train.py').write_text(src)
@@ -1110,28 +1114,79 @@ else:
     state["consecutive_crashes"] = 0
 
 if state["consecutive_crashes"] >= crash_pause_after:
-    # Policy: halve BATCH_SIZE in train.py (and track.py if present),
-    # revert the last broken commit, reset counter, log, continue.
+    # v1.7.6 — fixed crash-pause sequencing.
+    #
+    # Previous order: halve BATCH_SIZE in working tree → git reset --hard HEAD~1
+    # Bug: `git reset --hard` reverts both the broken commit AND the halve in
+    #      the working tree. Next loop reads the unchanged BATCH_SIZE from
+    #      train.py, crashes again the same way, counter resets to 0 after 3,
+    #      halve runs but is reset again — infinite loop with no observable
+    #      forward progress.
+    # Fix order: revert first → halve in clean working tree → commit halve so
+    #            the smaller BATCH_SIZE survives any later reset.
+    #
+    # Also: v1.7.6 detects BATCH_SIZE=1 and stops further halving with a
+    # discoveries log (Bug 5 from review). Previous behaviour halved 1 → 1
+    # forever and did the revert dance every 3 crashes with no real change.
+
+    # Step 1 — revert the broken commit FIRST (clean working tree)
+    subprocess.run(["git", "reset", "--hard", "HEAD~1"], check=False)
+
+    # Step 2 — read current BATCH_SIZE (after revert) and decide what to do
+    halved_any = False
+    floored_any = False
     for script in ("train.py", "track.py"):
         p = pathlib.Path(script)
         if not p.exists():
             continue
         src = p.read_text()
         m = re.search(r"(?m)^BATCH_SIZE\s*=\s*(\d+)", src)
-        if m:
-            new_bs = max(1, int(m.group(1)) // 2)
-            p.write_text(re.sub(
-                r"(?m)^BATCH_SIZE\s*=.*$",
-                f"BATCH_SIZE     = {new_bs}",
-                src, count=1))
-    log_discovery(
-        f"{crash_pause_after} consecutive crashes. Halved BATCH_SIZE and "
-        f"reset counter. Continuing loop.",
-        loop=state.get("loop_count", 0),
-        category="bug_workaround",
-    )
+        if not m:
+            continue
+        current = int(m.group(1))
+        if current <= 1:
+            # Already at floor — halving would do nothing (1//2 = 0, max=1).
+            # Don't write the file, don't commit a no-op. Log and let
+            # autoresearch keep retrying — but the next 3 crashes won't
+            # trigger another silent halve; they'll trigger another log.
+            floored_any = True
+            continue
+        new_bs = max(1, current // 2)
+        p.write_text(re.sub(
+            r"(?m)^BATCH_SIZE\s*=.*$",
+            f"BATCH_SIZE     = {new_bs}",
+            src, count=1))
+        halved_any = True
+
+    # Step 3 — commit the halve so it survives future resets
+    if halved_any:
+        subprocess.run(["git", "add", "train.py"], check=False)
+        subprocess.run(["git", "add", "track.py"], check=False)   # no-op if absent
+        subprocess.run(
+            ["git", "commit", "-m",
+             f"crash-pause: halve BATCH_SIZE after {crash_pause_after} crashes"],
+            check=False,
+        )
+        log_discovery(
+            f"{crash_pause_after} consecutive crashes. Reverted last "
+            f"experiment, halved BATCH_SIZE, committed. Continuing loop.",
+            loop=state.get("loop_count", 0),
+            category="bug_workaround",
+        )
+    elif floored_any:
+        # Already at floor. Don't pretend to fix anything — flag clearly
+        # so the user can intervene (smaller image size, fewer epochs,
+        # different model). Counter still resets to avoid loop spam.
+        log_discovery(
+            f"{crash_pause_after} consecutive crashes but BATCH_SIZE "
+            f"already at 1. Cannot reduce further. Possible causes: model "
+            f"too large, IMGSZ too high, NaN gradients, broken module. "
+            f"Manual intervention recommended; loop continues anyway.",
+            loop=state.get("loop_count", 0),
+            category="limitation",
+        )
+
     state["consecutive_crashes"] = 0
-    subprocess.run(["git", "reset", "--hard", "HEAD~1"], check=False)
 
 pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
 ```
@@ -1172,26 +1227,77 @@ def guard_violated(new, baseline):
     return None
 ```
 
-**Decision rule (C7 — crash is checked FIRST):**
+**Decision rule (v1.7.7 explicit pseudo-code; C7 — crash is checked FIRST):**
 
-0. **Crash check (must run first).** If `status == "crash"` or
-   `results[PRIMARY] is None` → **discard** (revert via git reset). A crash
-   iteration never becomes the baseline, even when it is the first iteration.
+The decision is a strict ladder: each rule fires in order, the first one
+that matches wins. Earlier vague wording let agents reach different
+keep/discard verdicts on identical results. v1.7.7 fixes the formula.
 
-1. Else if first iteration (`best_PRIMARY is None` AND not crashed)
-   → **keep** unconditionally. This run establishes the baseline.
+```
+Inputs (per iteration):
+  primary_delta  = signed_improvement(results[PRIMARY], best_PRIMARY, PRIMARY)
+                   # positive = better; negative = worse
+                   # for a MAXIMIZE metric: results - best
+                   # for a MINIMIZE metric: best - results
+  tiebreak_delta = signed_improvement(results[TIEBREAK], best_TIEBREAK, TIEBREAK)
+                   # None when TIEBREAK undefined or best_TIEBREAK None
+  guard_failed   = guard_violated(results, baseline_row)  # metric name or None
+  EPSILON        = ev["metrics"].get("regression_epsilon", MIN_IMPROVE / 2)
+                   # default = half of MIN_IMPROVE
 
-2. Else if `guard_violated(results, baseline_row)` returns a metric name
-   → **discard** (log the violating metric name as the reason).
+Decision (first matching rule wins):
 
-3. Else if `is_better(results[PRIMARY], best_PRIMARY, PRIMARY)` AND
-   improvement magnitude `>= MIN_IMPROVE` → **keep**.
+  0. crash:                         status == "crash" OR results[PRIMARY] is None
+                                    → DISCARD (revert)
+  1. first iteration:               best_PRIMARY is None
+                                    → KEEP (establishes baseline)
+  2. guard violation:               guard_failed is not None
+                                    → DISCARD (reason = guard_failed)
+  3. clear primary improvement:     primary_delta >= MIN_IMPROVE
+                                    → KEEP
+  4. tiebreak rescue:               primary_delta >= -EPSILON
+                                    AND tiebreak_delta is not None
+                                    AND tiebreak_delta >= MIN_IMPROVE
+                                    → KEEP (description gets " [tiebreak]" suffix)
+  5. otherwise:                     → DISCARD
+```
 
-4. Else if PRIMARY tied (within `MIN_IMPROVE`) AND `TIEBREAK` is not None
-   AND `best_TIEBREAK` is not None AND
-   `is_better(results[TIEBREAK], best_TIEBREAK, TIEBREAK)` → **keep**.
+The key clarification (rule 4): a tiebreak rescue is allowed when the
+primary did **not regress significantly** (delta within `-EPSILON`) and
+the tiebreak metric did **clearly improve** (delta beyond `MIN_IMPROVE`).
+The two thresholds use different scales because a primary slightly
+worse + tiebreak clearly better is the "evidence is mixed but leans
+slightly positive" case — typical of a borderline architecture change
+that improved fine-grained quality without hurting coarse quality much.
 
-5. Otherwise → **discard**.
+```python
+def signed_improvement(new, old, name):
+    """Positive = better in the direction this metric prefers."""
+    if old is None or new is None:
+        return None
+    return (old - new) if name in MINIMIZE else (new - old)
+```
+
+Use this helper in Step 7's evaluation. Returning `None` means
+"undefined" (e.g. TIEBREAK metric not declared in yaml) — rule 4 then
+cannot fire and we fall through to rule 5.
+
+**EPSILON yaml field (v1.7.7 new, optional)**:
+
+```yaml
+evaluation:
+  metrics:
+    primary: val_mAP50_95
+    tiebreak: val_mAP50
+    min_improvement: 0.001
+    regression_epsilon: 0.0005   # [v1.7.7 optional] default = min_improvement / 2
+                                 # primary may regress by up to this and still
+                                 # be eligible for tiebreak rescue (rule 4).
+```
+
+Older yamls without this field fall through to the default
+(`MIN_IMPROVE / 2`), so existing pipelines retain the same behaviour as
+the previous looser rule.
 
 Discard = revert:
 ```bash
@@ -1374,6 +1480,20 @@ mechanism is needed from autoresearch's side.
     `discoveries.md` instead. Then start the next iteration. The user reads `discoveries.md`
     after the pipeline stops. Your only chat output during the loop is one-line status per
     iteration: `"Loop N: keep/discard — <description>"`.
+14. **Never directly assign `layer.forward = wrapper`** — always use
+    `layer.register_forward_hook(...)`. Direct `.forward` assignment bypasses
+    PyTorch's `_call_impl` machinery (global hooks, `__call__` dispatch,
+    fused/eval phase variations) and breaks during val phase under AMP.
+    See `train-script-spec.md § Lazy-wrapper contract` and v1.7.7 #18.
+15. **Never set `OPTIMIZER = "auto"`** (v1.7.7). ultralytics' 'auto' silently
+    overrides any user-supplied `LR0` and `MOMENTUM`, only printing one log
+    line. Any LR-tuning experiment under 'auto' silently no-ops and looks
+    identical to baseline. The template's `train()` function raises
+    `ValueError` if it detects 'auto' at runtime, but autoresearch must not
+    even try to set it. Permitted values: `SGD`, `AdamW`, `Adam`, `RMSProp`,
+    `NAdam`, `RAdam`. Switching between concrete optimizers is fine and is a
+    legitimate experiment (e.g. SGD → AdamW for a momentum-vs-adaptive
+    comparison) — just never `'auto'`.
 
 ---
 
@@ -1384,12 +1504,17 @@ mechanism is needed from autoresearch's side.
 Every crash increments `pipeline_state.consecutive_crashes`. Every
 non-crash outcome resets it to 0. When the counter reaches
 `crash_pause_after` (default 3, from `research_config.yaml →
-orchestrator.error_policy.autoresearch_crash_pause_after`), the loop:
+orchestrator.error_policy.autoresearch_crash_pause_after`), the loop
+(v1.7.6 sequence — order matters):
 
-1. Halves `BATCH_SIZE` in `train.py` (and `track.py` if present)
-2. Reverts the last broken commit (`git reset --hard HEAD~1`)
-3. Logs the event to `discoveries.md`
-4. Resets the counter to 0
+1. **Reverts the last broken commit FIRST** (`git reset --hard HEAD~1`),
+   so the working tree starts clean
+2. Reads post-revert `BATCH_SIZE`. If already at 1, logs a `limitation`
+   discovery and skips the halve (Bug 2 fix); otherwise halves and writes
+   back to `train.py` (and `track.py` if present)
+3. **Commits the halve** with message `"crash-pause: halve BATCH_SIZE..."`
+   so the new value survives any future reset (Bug 1 fix)
+4. Resets `consecutive_crashes` to 0
 5. Continues looping — never pauses for user input
 
 This is the sole implementation of `autoresearch_crash_pause_after`. Step 6

@@ -26,7 +26,7 @@ CURRENT_DEFAULTS: dict[str, Any] = {
     "stall_force_test_reset":      5,
     "stop_requested":              False,
     "stop_reason":                 None,
-    "python_runner":               "uv run",
+    "python_runner":               "python3",
     "stop_flag_file":              "stop_pipeline.flag",
     "max_paper_finder_expansions": 3,
     "baseline_snapshot":           None,

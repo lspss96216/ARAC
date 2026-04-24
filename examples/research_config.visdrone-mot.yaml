@@ -20,6 +20,10 @@ task:
     small object scale, camera motion, and dense crowded scenes.
   task_type: object_tracking       # [required] [tracking-only] Triggers scaffolding of train.py + track.py (vs detection: train.py only).
   framework: ultralytics-yolo      # [required] Currently only ultralytics-yolo supported.
+  # --- v1.7.5: user-specified base model (optional, skips paper-finder Phase 2-4) ---
+  # preferred_base_model: YOLO26X              # [optional] If set with preferred_base_weights_url, paper finder writes base_model.md directly and skips scoring.
+  # preferred_base_weights_url: https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26x.pt
+  # preferred_base_arxiv_id: 2305.09972        # [optional, optional] arXiv ID if known; omit otherwise
   domain: aerial_drone             # [optional] Hint for paper finder query generation.
   detection_targets:               # [optional] Class names. Used in paper finder query generation.
     - pedestrian
@@ -41,7 +45,7 @@ task:
 # -----------------------------------------------------------------------------
 paths:
   project_root: "."                # [required] Project working directory.
-  skills_dir: "~/.claude/skills"   # [required] Where the skills + shared/ live.
+  skills_dir: "./skills"           # [required] Where the skills + shared/ live. Relative to this yaml. Absolute paths also accepted.
   pipeline_state: "pipeline_state.json"  # [optional] Default ok.
   train_script: "train.py"         # [optional] [tracking-only] Note: also creates track.py automatically. Default ok.
   custom_modules_file: "custom_modules.py"
@@ -152,7 +156,7 @@ dataset_hunter:
   openimages_max_samples: 50000
   val_split_ratio: 0.1
   pretrain:
-    time_budget_sec: 21600         # 6 hours pretrain.
+    time_budget_sec: 21600         # 6 hours pretrain. v1.7.5: set to 0 to skip pretrain entirely (dataset search still runs).
     eval_time_budget_sec: 1800     # 30 min × 2 finetune jobs for self-eval.
     improvement_threshold: 0.002   # Pretrained must beat baseline by this absolute margin.
     skip_if_corpus_empty: true
@@ -168,6 +172,7 @@ autoresearch:
     max_runtime_multiplier: 2      # Kill as crashed if exceeds budget × this.
     iterations: null               # null = run forever until interrupted (see orchestrator.stopping).
     seed: 42                       # Locked across runs.
+  optimizer: SGD                   # [v1.7.7] Initial optimizer for train.py. Permitted: SGD/AdamW/Adam/RMSProp/NAdam/RAdam. Cannot be 'auto' (silently overrides LR0/MOMENTUM). autoresearch may swap during experiments but never to 'auto'.
   stall:
     threshold: 10                  # Consecutive no-improvement rounds before triggering paper finder expand.
     force_test_reset: 5            # When stalled with pending modules, reset stall to this and force-test next pending.

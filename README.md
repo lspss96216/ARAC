@@ -9,6 +9,48 @@ keeping what improves the primary metric.
 Supports `task_type: object_detection` and `object_tracking`, driven entirely
 by `research_config.yaml`. No skill hardcodes a specific metric.
 
+**This is v1.7.7** — production-readiness for hook + yaml_inject.
+Six fixes that make architectural injection actually work end-to-end:
+yaml_inject's silent forward-pass crash from unshifted head Concat
+references (#13); hook-mode's silent failure where ultralytics' Trainer
+rebuilds the model and loses all hooks (#14); checkpoint pickle failure
+from closure-based hooks (#15); val-phase dtype mismatch under AMP (#17);
+unpredictable breakage from `layer.forward = wrapper` bypassing
+`_call_impl` (#18); silent LR override under `optimizer='auto'` (#16);
+ambiguous tiebreak rule causing inconsistent keep/discard verdicts
+(#19). New `shared/hook_utils.py` (`PicklableHook` base class,
+`reapply_on_rebuild` helper) + 13 tests. New `update_head_refs` in
+`weight_transfer.py` + 12 tests. Total python tests **57 → 82**.
+Drop-in. v1.7.x line ends here. See `CHANGELOG_v1.7.7.md`.
+
+**This is v1.7.6** — bug fix release. Four real bugs found during code
+review of v1.7.5: crash-pause sequence reverted its own halve
+(deadlock-prone under sustained crashes); BATCH_SIZE halving stayed
+silently at 1 forever; Step 5.5 short-test restore read a state key
+that didn't exist (`time_budget_sec` instead of `loop_time_budget`);
+state_migrate's stale `python_runner` default could lock the pipeline
+into a broken runner across upgrade. Plus removal of v1.7.5's
+auto-write `pyproject.toml` feature, which had three independent
+implementation problems and the wrong scope (env management is the
+user's job; runner choice is the pipeline's). Step 6.5 now does
+verify-only, with a clear two-option remediation message on failure.
+All 57 tests + 88 SKILL snippets still green. Drop-in. See
+`CHANGELOG_v1.7.6.md`.
+
+The v1.7.x line ends here. v1.8 work (full_yaml mode + apply_yaml_spec)
+begins immediately.
+
+**This is v1.7.5** — onboarding hardening. 11 fixes addressing friction
+points observed when a real user ran v1.7.4 end-to-end on a fresh
+machine: local skill precedence over cloud-hosted similarly-named skills,
+relative `skills_dir` default, git identity auto-config, smarter
+python_runner detection (system python3 first), optional pyproject.toml
+generation, user-specified base model short-circuit, weights/ directory
+safety, `pretrain.time_budget_sec: 0` skip path, environment shield for
+ULTRALYTICS_RUNS_DIR and WANDB, Section marker regex tolerance. No
+schema changes, no new features, no behavioural changes to any
+algorithm. Drop-in on top of v1.7.4. See `CHANGELOG_v1.7.5.md`.
+
 **This is v1.7.4** — documentation bug fix. Adds a Tie-breaking rule
 to `autoresearch/SKILL.md` Step 2 so the loop always has a
 deterministic fallback when multiple pending modules look equally
@@ -113,6 +155,9 @@ CHANGELOG_v1.7.1.md                         · Step 5.5 repair loop + Q2/Q3 patc
 CHANGELOG_v1.7.2.md                         · IMGSZ state-handoff fix
 CHANGELOG_v1.7.3.md                         · preferred_locations secondary sort
 CHANGELOG_v1.7.4.md                         · tie-breaking rule (don't ask, pick one)
+CHANGELOG_v1.7.5.md                         · onboarding hardening (11 fixes)
+CHANGELOG_v1.7.6.md                         · 4 latent bugs + pyproject.toml retreat
+CHANGELOG_v1.7.7.md                         · hook + yaml_inject production-readiness
 ```
 
 ---
@@ -285,11 +330,32 @@ SDK (`pip install firecrawl-py`) per the caveat in paper-finder Phase 2.
 
 ## Versions
 
-See `CHANGELOG_v1.7.4.md`, `CHANGELOG_v1.7.3.md`, `CHANGELOG_v1.7.2.md`,
-`CHANGELOG_v1.7.1.md`, `CHANGELOG_v1.7.md`, and `CHANGELOG_v1.6.md`
-for recent release notes.
+See `CHANGELOG_v1.7.7.md`, `CHANGELOG_v1.7.6.md`, `CHANGELOG_v1.7.5.md`,
+`CHANGELOG_v1.7.4.md`, `CHANGELOG_v1.7.3.md`, `CHANGELOG_v1.7.2.md`,
+`CHANGELOG_v1.7.1.md`, `CHANGELOG_v1.7.md`, and `CHANGELOG_v1.6.md` for
+recent release notes.
 
-- **v1.7.4** (current): autoresearch tie-breaking rule added to Step 2.
+- **v1.7.7** (current): production-readiness for hook + yaml_inject. Six
+  fixes — head ref shifting in `update_head_refs` (yaml_inject was
+  silently broken from v1.7 to v1.7.6); `PicklableHook` + `reapply_on_rebuild`
+  in new `shared/hook_utils.py` (hook mode was silently broken from
+  v1.6 to v1.7.6); explicit OPTIMIZER never 'auto' (LR experiments
+  silently no-op'd); pseudo-code tiebreak rule (ambiguous decisions
+  resolved). 25 new python tests, total 82. Drop-in. v1.7.x line ends.
+- **v1.7.6**: 4 latent crash-handling bugs fixed (crash-pause
+  sequence, BATCH_SIZE=1 floor, Step 5.5 short-test state key,
+  python_runner stale default). v1.7.5's auto-write `pyproject.toml`
+  feature removed — replaced with verify-only check that fails fast
+  with a clear remediation message. Final patch in v1.7.x line; v1.8
+  starts next.
+- **v1.7.5**: onboarding hardening. 11 fixes covering local
+  skill precedence, `skills_dir` relative path resolution, git identity
+  auto-config, smarter python_runner detection, optional pyproject.toml
+  generation, user-specified base model, weights/ directory safety,
+  `pretrain.time_budget_sec: 0` skip path, environment shield for
+  ULTRALYTICS_RUNS_DIR and WANDB, Section marker regex tolerance.
+  All 57 tests + 88 SKILL snippets still green.
+- **v1.7.4**: autoresearch tie-breaking rule added to Step 2.
   When Priority A–E leaves multiple candidates at the same sort rank,
   apply write order → lower complexity → preferred_locations →
   alphabetical, and NEVER stop to ask the user. Pure SKILL.md prose,

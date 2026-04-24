@@ -438,6 +438,141 @@ Register in `custom_modules.py` the same way as hook-mode modules (see
 YAML insertion (`LazyCBAM` above) must match the registered class name
 exactly.
 
+### Hook-mode contract (v1.7.7)
+
+When you write a hook-mode module (the `inject_modules()` branch), the
+hook callable that you pass to `register_forward_hook` must obey three
+hard rules. Violating any of them produces a silent or delayed failure
+that wastes a full TIME_BUDGET and is hard to attribute back to the hook.
+
+**Rule 1 — hooks must be picklable.** ultralytics calls `torch.save(model)`
+every epoch end to write `last.pt` and `best.pt`. This pickles the entire
+nn.Module including all forward hooks. Any closure-based hook fails:
+
+```python
+# ✗ BAD — closure captures `cbam` from enclosing scope; not picklable
+def make_hook(cbam):
+    def hook(module, inputs, output):
+        return cbam(output)
+    return hook
+
+# ✓ GOOD — top-level class; pickle-safe
+class CBAMHook(PicklableHook):
+    def __init__(self, channels):
+        super().__init__()
+        self.cbam = CBAM(channels)
+    def __call__(self, module, inputs, output):
+        return self.cbam(output)
+```
+
+Symptom of violation: `Can't pickle local object` at epoch 1 ckpt write.
+Train + val of epoch 1 both succeed; the pickle error appears only when
+ultralytics tries to write the checkpoint file.
+
+**Rule 2 — hooks must be dtype-aware.** Training uses AMP autocast (FP16);
+val phase doesn't (FP32). A hook that owns its own nn.Module gets FP32
+input during val, FP16 input during train, and crashes:
+
+```python
+# ✓ GOOD — _dtype_cast handles AMP/val mismatch
+class CBAMHook(PicklableHook):
+    def __init__(self, channels):
+        super().__init__()
+        self.cbam = CBAM(channels)
+    def __call__(self, module, inputs, output):
+        target = self._param_dtype(self.cbam)
+        x = self._dtype_cast(output, target)
+        y = self.cbam(x)
+        return y.to(output.dtype)
+```
+
+Symptom: `RuntimeError: Input type (HalfTensor) and weight type
+(FloatTensor) should be the same`. Train all batches succeed, val batch 0
+crashes.
+
+**Rule 3 — never assign `layer.forward = wrapper`.** Always use
+`layer.register_forward_hook(callable)`. Direct method assignment bypasses
+PyTorch's `_call_impl` machinery (global hooks, fused-conv eval paths,
+ultralytics' `Detect` postprocessing) and breaks unpredictably:
+
+```python
+# ✗ BAD — bypasses _call_impl
+layer.forward = my_wrapper
+
+# ✓ GOOD — uses the official hook system
+PicklableHook.attach(layer, MyHook, *args)
+```
+
+`PicklableHook.attach()` is a classmethod that instantiates the hook and
+calls `register_forward_hook`. Use it as the only way to attach a hook in
+this pipeline.
+
+### Trainer rebuild — reapply_on_rebuild contract (v1.7.7)
+
+ultralytics' `Trainer.setup_model()` runs `self.model = self.get_model(...)`,
+which **constructs a fresh DetectionModel and loads weights into it**.
+Any hooks you registered on the model *before* `model.train()` are bound
+to the OLD object. The fresh object has no hooks. `inject_modules()`'s
+work is silently lost.
+
+Symptom of violation: training completes, mAP equals baseline within
+floating-point noise, model summary line printed by ultralytics shows the
+**baseline parameter count** (e.g. 55.6M) rather than the augmented count
+(e.g. 60.4M including CBAM blocks).
+
+**Required fix**: every `inject_modules()` branch that attaches a hook
+MUST also register `reapply_on_rebuild` so the hook gets re-attached on
+the rebuilt model:
+
+```python
+from hook_utils import PicklableHook, reapply_on_rebuild
+
+def inject_modules(model):
+    if USE_CBAM:
+        from custom_modules import CBAMHook
+        # Initial attach to the model that exists right now
+        for idx in (4, 6, 8):
+            CBAMHook.attach(model.model.model[idx], channels=256)
+        # Re-attach after trainer rebuilds the model in setup_model
+        def _reapply(rebuilt):
+            for idx in (4, 6, 8):
+                CBAMHook.attach(rebuilt.model[idx], channels=256)
+        reapply_on_rebuild(model, _reapply)
+    return model
+```
+
+The reapply function takes the **rebuilt nn.Module** (not the YOLO wrapper)
+as its argument. Index into it the same way you'd index `model.model`,
+omitting the outer `.model` wrapper level.
+
+If `reapply` raises an exception, training proceeds anyway — the hooks
+are simply missing on the rebuilt model. This is intentional: a crash
+inside reapply would mask the underlying problem (the agent should see
+the symptom mAP-equals-baseline and inspect, rather than have the entire
+training fail with a confusing traceback from inside an ultralytics
+callback).
+
+### Tunable contract — OPTIMIZER must never be 'auto' (v1.7.7)
+
+The Section ② variable `OPTIMIZER` is a tunable that autoresearch may
+change between experiments (e.g. SGD → AdamW for an adaptive-LR test).
+It must NEVER be set to the literal string `'auto'`. ultralytics' 'auto'
+mode silently overrides any user-supplied `LR0` and `MOMENTUM`, only
+printing one log line:
+
+```
+'optimizer=auto' found, ignoring 'lr0=0.005' and 'momentum=0.937' and ...
+```
+
+Any LR-tuning experiment under 'auto' would silently run with ultralytics'
+internally-chosen LR instead of the LR being tested. Whole iterations of
+TIME_BUDGET wasted producing data that doesn't answer the experimental
+question.
+
+Permitted values: `SGD`, `AdamW`, `Adam`, `RMSProp`, `NAdam`, `RAdam`.
+The `train()` function in the template raises `ValueError` if it detects
+`'auto'` at runtime, but autoresearch must not even try.
+
 ### Coexistence with `inject_modules()`
 
 `yaml_inject` runs first, producing a structurally modified `model`. Then
@@ -539,7 +674,15 @@ Quick checklist a skill can run before modifying:
 import pathlib, re
 src = pathlib.Path("train.py").read_text()
 
-required_sections  = ["Section ①", "Section ②", "Section ③", "Section ④"]
+# v1.7.5 — Section markers matched with regex tolerating both ASCII digits
+# (Section 2) and circled digits (Section ②). Editors or IDEs that rewrite
+# Unicode don't break the spec check.
+required_section_pats = [
+    ("Section 1", re.compile(r"(?mi)^#?\s*Section\s*[①1]\b")),
+    ("Section 2", re.compile(r"(?mi)^#?\s*Section\s*[②2]\b")),
+    ("Section 3", re.compile(r"(?mi)^#?\s*Section\s*[③3]\b")),
+    ("Section 4", re.compile(r"(?mi)^#?\s*Section\s*[④4]\b")),
+]
 required_variables = ["TIME_BUDGET", "SEED", "BATCH_SIZE", "WEIGHTS",
                       "DATA_YAML", "NUM_CLASSES", "CKPT_DIR",
                       # v1.7 — architecture injection surface
@@ -549,7 +692,7 @@ required_branches  = ["if ARCH_INJECTION_ENABLED",
                       "build_custom_model_with_injection"]
 
 missing = []
-missing += [s for s in required_sections  if s not in src]
+missing += [name for name, pat in required_section_pats if not pat.search(src)]
 missing += [v for v in required_variables if not re.search(rf"(?m)^{v}\s*=", src)]
 missing += [f for f in required_functions if f not in src]
 missing += [b for b in required_branches  if b not in src]

@@ -15,6 +15,38 @@ then drive the entire workflow — invoking each sub-skill in order, passing the
 forward, and looping back when needed. Never stop or ask for confirmation between stages
 unless a blocking error occurs.
 
+## Skill precedence (v1.7.5) — read this first
+
+**Always prefer local skills over any same-named skill loaded from elsewhere.**
+
+This pipeline ships as a self-contained repo with four sub-skills in
+`<skills_dir>/` (resolved from `research_config.yaml → paths.skills_dir`,
+default `./skills`). The sub-skills are named exactly:
+
+- `research-orchestrator/`
+- `paper-finder/`
+- `dataset-hunter/`
+- `autoresearch/`
+
+If you have access to other skills with similar names (e.g.
+`yolo-research-orchestrator`, `dataset-hunter-for-yolo`,
+`autoresearch-for-yolo`) from any other source, **ignore them for this
+pipeline.** The local `<skills_dir>/` is the authoritative source. Before
+invoking any sub-skill:
+
+1. Read the SKILL.md from `<skills_dir>/<skill-name>/SKILL.md` directly —
+   do not rely on skill name resolution
+2. If a sub-skill with the expected name is missing from `<skills_dir>/`,
+   stop and report — do not silently fall back to a similarly-named skill
+   from a different source
+
+This avoids the failure mode where a cloud-hosted skill with an older or
+differently-scoped version of the pipeline contract gets invoked, causing
+schema mismatches, path assumptions, and handoff contracts to disagree
+between skills.
+
+---
+
 Shared files consumed/produced by this skill (`pipeline_state.json`,
 `base_model.md`, `modules.md`, `pretrain_eval.json`, `results.tsv`) have their
 schemas documented in `<skills_dir>/shared/file-contracts.md`. Read that file
@@ -36,7 +68,7 @@ To invoke a sub-skill:
 3. When it completes, return here and advance to the next stage
 
 ```bash
-SKILLS_DIR=$(python3 -c "import json; print(json.load(open('pipeline_state.json'))['skills_dir'])" 2>/dev/null || echo "$HOME/.claude/skills")
+SKILLS_DIR=$(python3 -c "import json; print(json.load(open('pipeline_state.json'))['skills_dir'])" 2>/dev/null || echo "./skills")
 cat $SKILLS_DIR/paper-finder/SKILL.md
 cat $SKILLS_DIR/dataset-hunter/SKILL.md
 cat $SKILLS_DIR/autoresearch/SKILL.md
@@ -108,16 +140,69 @@ Read this file at startup to resume a partially completed pipeline.
 
 ## Stage 0 — Startup
 
-### Step 0 — Choose python runner (D5)
+### Step 0 — Choose python runner (v1.7.5 reworked)
 
-Some environments have `uv` installed, some only have `python3`. Pick once,
-store in state, and have every sub-skill read from there rather than
-hardcoding `uv run`:
+Some environments have `uv` installed, some only have `python3`. Prefer
+the **local system python** unless the project already has a
+`pyproject.toml` (which strongly implies the user wants uv-managed deps).
+This avoids the failure mode where `uv run python3 train.py` launches in
+a fresh empty venv and immediately crashes on `import numpy` because the
+project never configured uv properly.
+
+**Default preference**: system `python3` (most research machines already
+have ultralytics / torch / etc. installed globally).
+
+**Use `uv run` only when**:
+1. `shutil.which("uv")` returns a path, AND
+2. `pyproject.toml` exists in cwd, AND
+3. `uv run python3 -c "import ultralytics"` actually succeeds (the uv env
+   has the deps the pipeline needs)
+
+Otherwise fall back to `python3` and either install missing packages
+system-wide, or if the user explicitly wants uv and a `pyproject.toml`
+is absent, generate a minimal one (see Step 6.5 below).
 
 ```python
-import shutil, json, pathlib
-python_runner = "uv run" if shutil.which("uv") else "python3"
+import shutil, subprocess, pathlib, json
+
+def choose_python_runner() -> tuple[str, str]:
+    """Return (runner, reason) tuple.
+    runner is 'python3' or 'uv run'. reason explains the choice for logging.
+    """
+    # Fast path 1: system python already has ultralytics → prefer it
+    rc_sys = subprocess.run(
+        ["python3", "-c", "import ultralytics"],
+        capture_output=True,
+    ).returncode
+    if rc_sys == 0:
+        return "python3", "system python3 has ultralytics installed"
+
+    # Fast path 2: uv + pyproject.toml + uv env has ultralytics
+    if shutil.which("uv") and pathlib.Path("pyproject.toml").exists():
+        rc_uv = subprocess.run(
+            ["uv", "run", "python3", "-c", "import ultralytics"],
+            capture_output=True,
+        ).returncode
+        if rc_uv == 0:
+            return "uv run", "uv-managed env has ultralytics installed"
+
+    # Neither works out of the box — default to python3 and let Step 6.5
+    # either install globally or scaffold a uv project (user's choice via
+    # yaml flag `orchestrator.use_uv_project: true`).
+    return "python3", (
+        "neither system python3 nor uv env has ultralytics; "
+        "defaulting to python3 — see Step 6.5 for remediation"
+    )
+
+python_runner, reason = choose_python_runner()
+print(f"[orchestrator] python_runner = {python_runner!r} ({reason})")
 # Written to state in Step 2. Autoresearch Step 5 reads state["python_runner"].
+#
+# v1.7.6 — On resume, this overwrites whatever value state had previously.
+# Rationale: machine state may have changed between runs (uv installed,
+# ultralytics installed in system python, venv broken, etc.). Re-detection
+# every Stage 0 means stale `python_runner` in state files (e.g. pre-v1.7.5
+# defaults of "uv run") cannot lock the pipeline into a broken runner.
 ```
 
 ### Step 1 — Check for `research_config.yaml`
@@ -187,15 +272,70 @@ state files that might be shared or accidentally committed.
 
 Check if `pipeline_state.json` exists:
 
+#### `skills_dir` resolution helper (v1.7.5)
+
+Before either branch below, resolve `skills_dir` once. The yaml default is
+`./skills` (relative to `research_config.yaml`) but users may pass `~/...`
+or absolute paths. Do **not** assume the caller has already
+`expanduser`'d the value.
+
+```python
+def resolve_skills_dir(raw: str, yaml_path: str = "research_config.yaml") -> str:
+    """Resolve skills_dir from research_config.yaml into an absolute path.
+
+    Handles:
+      - absolute paths (returned as-is after normalisation)
+      - ~ / $HOME expansion
+      - relative paths (resolved against the yaml's directory, NOT cwd)
+
+    Fails loudly if the resolved path does not exist OR does not contain
+    a `shared/` subdirectory — a silent misconfiguration here causes every
+    subsequent skill to fail with confusing ImportErrors.
+    """
+    import os, pathlib
+    expanded = os.path.expanduser(os.path.expandvars(raw))
+    p = pathlib.Path(expanded)
+    if not p.is_absolute():
+        # Resolve relative to the yaml's directory, not cwd — user may run
+        # the pipeline from anywhere
+        yaml_dir = pathlib.Path(yaml_path).resolve().parent
+        p = (yaml_dir / p).resolve()
+    if not p.exists():
+        raise RuntimeError(
+            f"skills_dir does not exist: {p}\n"
+            f"(from research_config.yaml → paths.skills_dir = {raw!r})\n"
+            f"Fix: set it to an absolute path or a path relative to the yaml."
+        )
+    if not (p / "shared").is_dir():
+        raise RuntimeError(
+            f"skills_dir resolved to {p}, but no `shared/` subdirectory found.\n"
+            f"Expected layout: {p}/shared/ , {p}/research-orchestrator/ , etc."
+        )
+    return str(p)
+```
+
+Apply it in both branches:
+
 - **Exists** → run migration (C3 rename + backfill missing keys) and resume:
   ```python
   import sys, pathlib, json
-  SKILLS_DIR = os.path.expanduser(cfg["paths"].get("skills_dir", "~/.claude/skills"))
+  SKILLS_DIR = resolve_skills_dir(
+      cfg["paths"].get("skills_dir", "./skills"),
+      yaml_path="research_config.yaml",
+  )
   sys.path.insert(0, str(pathlib.Path(SKILLS_DIR) / "shared"))
   import state_migrate
   state = state_migrate.migrate("pipeline_state.json")
   # state now has dataset_root (not dataset), all v1.6 keys present, no float('inf')
-  print(f"Resuming from stage: {state.get('stage')}")
+
+  # v1.7.6 — overwrite python_runner with this Stage 0's detection.
+  # Stale state from earlier versions (pre-v1.7.5 default "uv run") would
+  # otherwise lock the loop into a broken runner even after the user set up
+  # ultralytics in system python.
+  state["python_runner"] = python_runner
+  pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+
+  print(f"Resuming from stage: {state.get('stage')} (runner: {python_runner})")
   ```
 
 - **Does not exist** → create from yaml values:
@@ -257,7 +397,10 @@ Check if `pipeline_state.json` exists:
       # paths
       "local_papers_dir":      cfg["paths"].get("local_papers_dir"),
       "local_datasets_dir":    cfg["paths"].get("local_datasets_dir"),
-      "skills_dir":            os.path.expanduser(cfg["paths"].get("skills_dir", "~/.claude/skills")),
+      "skills_dir":            resolve_skills_dir(
+          cfg["paths"].get("skills_dir", "./skills"),
+          yaml_path="research_config.yaml",
+      ),
       "train_script":          cfg["paths"].get("train_script", "train.py"),
       "custom_modules_file":   cfg["paths"].get("custom_modules_file", "custom_modules.py"),
       "weights_dir":           cfg["paths"].get("weights_dir", "weights"),
@@ -305,7 +448,7 @@ Check if `pipeline_state.json` exists:
 
 ### Step 3 — Verify skill files exist
 
-(using `skills_dir` from pipeline state, default: `~/.claude/skills`):
+(using `skills_dir` from pipeline state, default: `./skills` (resolved relative to the yaml)):
 ```bash
 SKILLS_DIR=$(python3 -c "import json; print(json.load(open('pipeline_state.json'))['skills_dir'])")
 for s in paper-finder dataset-hunter autoresearch; do
@@ -336,7 +479,24 @@ Install if desired: `npx skills add PrathamLearnsToCode/paper2code/skills/paper2
 ### Step 5 — Initialise git if needed
 
 ```bash
-git rev-parse --git-dir 2>/dev/null || (git init && git add -A && git commit -m "init")
+# Initialise repo if not already one
+git rev-parse --git-dir 2>/dev/null || git init
+
+# v1.7.5 — ensure git identity exists BEFORE any commit. Default git config
+# in fresh installs has no user.email, and the first `git commit` fails with
+#   fatal: unable to auto-detect email address (got '<user>@<host>.(none)')
+# We set a --local (per-repo) identity derived from the project name so the
+# global git config is not touched. User can override at any time with
+# `git config --local user.email / user.name` of their own.
+if [ -z "$(git config --local --get user.email 2>/dev/null)" ]; then
+    PROJECT=$(python3 -c "import json; print(json.load(open('pipeline_state.json')).get('project_name', 'autoresearch'))" 2>/dev/null || echo "autoresearch")
+    git config --local user.email "pipeline@${PROJECT}.local"
+    git config --local user.name  "autoresearch pipeline"
+    echo "[orchestrator] Set git identity (--local): pipeline@${PROJECT}.local"
+fi
+
+# First commit (if repo is brand new with no commits yet)
+git rev-parse --verify HEAD 2>/dev/null || (git add -A && git commit -m "init")
 ```
 
 ### Step 6 — Check for `train.py` and friends
@@ -348,6 +508,24 @@ later stages can rely on its guarantees.
 ```bash
 cat "$SKILLS_DIR/shared/train-script-spec.md"
 ```
+
+#### (v1.7.5) Ensure `weights/` exists before any model probing
+
+Any test call like `YOLO("yolo26x.pt")` that an agent makes *outside*
+train.py will download the file to **cwd** — which may be project root,
+not `weights/`. Create the directory early so at least the structure is
+in place, and always use an explicit path in any diagnostic probe:
+
+```python
+import pathlib, json
+state = json.loads(pathlib.Path("pipeline_state.json").read_text())
+pathlib.Path(state.get("weights_dir", "weights")).mkdir(exist_ok=True)
+```
+
+**Rule**: if at any point a diagnostic call needs to load a model file
+(to confirm ultralytics recognises it, to read its layer layout, etc.),
+always prefix the path: `YOLO("weights/yolo26x.pt")`, never
+`YOLO("yolo26x.pt")`. The latter writes to cwd if the file is missing.
 
 Then verify and scaffold:
 
@@ -378,12 +556,21 @@ for dst_name, src in needed.items():
         print(f"scaffolded {dst} from {src.name}")
 
 # Spec compliance check — run before any patch
+# v1.7.5 — Use regex for Section markers so the check tolerates ASCII
+# digits (Section 1), circled digits (Section ①), and mixed styles.
+SECTION_RE = [
+    (1, re.compile(r"(?m)^#\s*(?:═+\s*\n#\s*)?Section\s*[①1]\b", re.IGNORECASE)),
+    (2, re.compile(r"(?m)^#\s*(?:═+\s*\n#\s*)?Section\s*[②2]\b", re.IGNORECASE)),
+    (3, re.compile(r"(?m)^#\s*(?:═+\s*\n#\s*)?Section\s*[③3]\b", re.IGNORECASE)),
+    (4, re.compile(r"(?m)^#\s*(?:═+\s*\n#\s*)?Section\s*[④4]\b", re.IGNORECASE)),
+]
+
 def check_spec_compliance(path):
     src = pathlib.Path(path).read_text()
     missing = []
-    for section in ["Section ①", "Section ②", "Section ③", "Section ④"]:
-        if section not in src:
-            missing.append(section)
+    for n, pat in SECTION_RE:
+        if not pat.search(src):
+            missing.append(f"Section {n}")
     if path.name == "train.py":
         for var in ["TIME_BUDGET", "SEED", "BATCH_SIZE", "WEIGHTS",
                     "DATA_YAML", "NUM_CLASSES", "CKPT_DIR"]:
@@ -413,6 +600,64 @@ After this step, `git add` the new/existing script(s) and commit:
 git add train.py
 [ -f track.py ] && git add track.py
 git diff --cached --quiet || git commit -m "scaffold: train.py per spec"
+```
+
+### Step 6.5 — (v1.7.6) Verify the chosen runner can import ultralytics
+
+v1.7.5 attempted to auto-write a `pyproject.toml` for users who wanted
+uv-managed environments. This was removed in v1.7.6 because:
+
+1. The hardcoded `requires-python = ">=3.10"` excluded Python 3.9 systems
+2. `[tool.uv] override-dependencies = []` did not actually prevent uv
+   from re-downloading torch over the user's CUDA-specific install
+3. `name = "<project_name>"` failed PEP 503 validation when project
+   names contained spaces, uppercase, or non-ASCII characters
+
+The right separation of concerns: **the pipeline picks the runner; the
+user manages the environment.** Step 0's `choose_python_runner()`
+defaults to system `python3` and only falls through to `uv run` when
+both `pyproject.toml` exists AND uv's env can already `import
+ultralytics`. If neither path works, the pipeline now fails loudly at
+startup with a clear remediation message rather than scaffolding a
+partially-working project.
+
+```python
+import shutil, subprocess, json, pathlib
+
+state = json.loads(pathlib.Path("pipeline_state.json").read_text())
+runner = state["python_runner"]
+
+# Re-verify import works under the chosen runner. This guards against
+# rare cases where Step 0's detection succeeded but the env then changed
+# (e.g. apt/uv tampered with the env between Step 0 and now).
+if runner == "uv run":
+    rc = subprocess.run(
+        ["uv", "run", "python3", "-c", "import ultralytics"],
+        capture_output=True,
+    ).returncode
+else:
+    rc = subprocess.run(
+        ["python3", "-c", "import ultralytics"],
+        capture_output=True,
+    ).returncode
+
+if rc != 0:
+    raise RuntimeError(
+        f"ultralytics import failed under python_runner={runner!r}.\n"
+        f"\n"
+        f"Remediation options:\n"
+        f"  (a) System install: pip install ultralytics\n"
+        f"  (b) uv-managed: write your own pyproject.toml with the deps\n"
+        f"      your CUDA setup needs, then run `uv sync` before retrying.\n"
+        f"      The pipeline will pick up uv automatically once `uv run\n"
+        f"      python3 -c 'import ultralytics'` succeeds.\n"
+        f"\n"
+        f"Why no auto-scaffold: torch / CUDA / cuDNN / Python version\n"
+        f"combinations vary too much across research machines for a\n"
+        f"generic pyproject.toml to be safe. v1.7.5's auto-write was\n"
+        f"removed because it routinely re-downloaded a CPU-only torch\n"
+        f"over a working CUDA install."
+    )
 ```
 
 Update `pipeline_state.json` → `stage: "paper_finder"` and proceed immediately.
@@ -446,7 +691,7 @@ Proceed immediately to Stage 2.
 
 ## Stage 2 — Dataset Hunter (pretrain optional)
 
-**Entry condition:** `dataset_hunter_enabled == true` AND `pretrain_done == false` AND `pretrain_skipped == false`
+**Entry condition:** `dataset_hunter_enabled == true` AND `pretrain_done == false` AND `pretrain_skipped == false` AND `pretrain_time_budget > 0`
 
 ### C10 fast-path — dataset_hunter_enabled: false
 
@@ -466,13 +711,39 @@ if not state["dataset_hunter_enabled"]:
     # Fall through directly to Stage 3.
 ```
 
+### v1.7.5 fast-path — pretrain.time_budget_sec: 0
+
+If the user set `dataset_hunter.pretrain.time_budget_sec: 0` in the yaml,
+dataset search **may still run** (so you get modules.md coverage and
+downloaded datasets for later re-pretrain), but **pretrain is skipped**.
+This is the "I want to start experimenting fast, pretrain can wait"
+workflow — common when a user wants Loop 1 baseline within the hour,
+not tomorrow.
+
+```python
+if state.get("pretrain_time_budget", 21600) == 0:
+    print("pretrain_time_budget=0 — skipping pretrain, dataset search still runs.")
+    state["pretrain_skipped"] = True
+    state["pretrain_offer_declined"] = True   # prevent auto-trigger later
+    # Don't set stage=autoresearch yet — Phase 1-4 of dataset-hunter still run
+    # if dataset_hunter_enabled. Only pretrain (Phase 5-6) is skipped.
+    pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+    # After dataset-hunter Phase 1-4 finishes, fall through to Stage 3.
+```
+
+To skip **both** dataset search AND pretrain, use the stronger form
+`dataset_hunter.enabled: false` above.
+
 **Patience:** Stage 2 is the longest stage. Dataset downloads alone may take 1–3
 hours depending on how many sources are available. Pretrain adds another
 `pretrain_time_budget` seconds (default 6 hours). Self-eval adds
 `self_eval_time_budget` × 2 (two finetune jobs). **Do not skip, shortcut,
 or abort Stage 2 because it is taking a long time.** The only valid reasons
-to skip pretrain are: (a) corpus is empty after all downloads, or (b) the
-user set `dataset_hunter.enabled: false` in the yaml.
+to skip are:
+(a) corpus is empty after all downloads, or
+(b) the user set `dataset_hunter.enabled: false` in the yaml, or
+(c) the user set `dataset_hunter.pretrain.time_budget_sec: 0` in the yaml
+    (pretrain skipped but dataset search still runs).
 
 1. Read `$SKILLS_DIR/dataset-hunter/SKILL.md`
 2. Pass from pipeline state: disk budget, Roboflow API key, pretrain TIME_BUDGET, `local_datasets_dir`
@@ -714,6 +985,26 @@ for script in scripts_to_lock:
     lock_variable(script, "SEED",        state.get("seed", 42))
     lock_variable(script, "IMGSZ",       imgsz)
 
+# v1.7.7 — OPTIMIZER initial set. Not locked — autoresearch may swap it
+# (e.g. SGD → AdamW for an LR schedule experiment). But the value 'auto'
+# is forbidden because ultralytics silently overrides LR0 and MOMENTUM under
+# 'auto', so any LR experiment under 'auto' would silently no-op.
+#
+# Read the user's preference from yaml (default SGD); reject 'auto' here.
+# autoresearch's contract (Critical Rule #15) also forbids setting it back.
+init_optimizer = ar.get("optimizer", "SGD")
+if str(init_optimizer).lower() == "auto":
+    raise RuntimeError(
+        "research_config.yaml → autoresearch.optimizer cannot be 'auto'. "
+        "ultralytics 'auto' silently overrides LR0/MOMENTUM. "
+        "Use a concrete optimizer: SGD / AdamW / Adam / RMSProp / NAdam / RAdam."
+    )
+for script in scripts_to_lock:
+    # Initial set only — not locked. Written once via the same helper for
+    # consistency, but autoresearch may overwrite later (without using 'auto').
+    lock_variable(script, "OPTIMIZER", repr(init_optimizer))
+state["optimizer"] = init_optimizer
+
 # v1.7.2 — persist the resolved IMGSZ in pipeline_state so downstream skills
 # (dataset-hunter's pretrain.py scaffold, autoresearch's Step 5.5 repair
 # probes) don't each have to re-read research_config.yaml and re-implement
@@ -724,7 +1015,10 @@ pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
 
 These three values (TIME_BUDGET, SEED, IMGSZ) are fixed for the entire pipeline
 run — identical across every experiment so that keep/discard decisions reflect
-the change being tested, not randomness or resolution differences.
+the change being tested, not randomness or resolution differences. OPTIMIZER is
+**initialised** to the user's yaml choice (default `SGD`) but not locked —
+autoresearch may swap it to test other optimizers (e.g. AdamW) but **must
+never** set it to `'auto'` (see Critical Rule #15 in autoresearch SKILL).
 
 ### Step 4 — Mark autoresearch running
 
