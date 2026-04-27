@@ -42,7 +42,10 @@ task:
 # paths — where files live
 # -----------------------------------------------------------------------------
 paths:
-  project_root: "."                # [required] Project working directory. Almost always "." (current dir).
+  project_root: "."                # [required] Project working directory. v1.9.2+ uses this as absolute path
+                                   # (resolved at Stage 0) for ALL file operations, defeating cross-project run.log
+                                   # pollution when multiple ARAC projects coexist on the same machine. "." resolves
+                                   # to wherever this yaml is read from. Use absolute path if you launch from elsewhere.
   skills_dir: "./skills"           # [required] Where the four skills + shared/ live. Relative to this yaml. Absolute paths also accepted.
   pipeline_state: "pipeline_state.json"  # [optional] Where orchestrator stores cross-stage state. Default ok.
   train_script: "train.py"         # [optional] The script autoresearch iterates on. Default ok.
@@ -168,13 +171,28 @@ autoresearch:
     max_runtime_multiplier: 2      # If a run exceeds time_budget_sec * this, kill it as crashed. Default 2.
     iterations: null               # null = loop forever until interrupted. Set integer for bounded run.
     seed: 42                       # Random seed. Locked across runs for reproducibility.
+    initial_batch_size: 16         # [optional, v1.9.3+] Starting BATCH_SIZE for train.py. Stage 0 patches the
+                                   # template's default into the actual value. Unlike IMGSZ/SEED/TIME_BUDGET this
+                                   # is NOT locked — autoresearch may halve it dynamically (resource_impact
+                                   # auto-halve, crash-pause, OOM). yaml only sets the starting point.
+                                   # If unset, falls back to template default (16). H100 80GB users typically
+                                   # set 64; smaller GPUs may need 8. Run the first iteration and adjust based
+                                   # on memory_gb in results.tsv.
   optimizer: SGD                   # [v1.7.7] Initial optimizer for train.py. Permitted: SGD/AdamW/Adam/RMSProp/NAdam/RAdam. Cannot be 'auto' (silently overrides LR0/MOMENTUM). autoresearch may swap during experiments but never to 'auto'.
   stall:                           # [optional] When to escalate after no-improvement streaks.
     threshold: 10                  # Consecutive non-improving rounds before triggering paper_finder expand.
     force_test_reset: 5            # When stall hits threshold AND modules.md has pending entries,
                                    # reset stall_count to this so the pipeline force-tests a pending
                                    # module next iteration. Set equal to threshold to disable force-test.
-  module_priority:                 # [optional] Order autoresearch picks experiment types. Lower index = tried first.
+  module_priority:                 # [optional, v1.9.1+] Order autoresearch picks experiment types. Lower index = tried first.
+                                   # Tokens omitted from this list are SKIPPED ENTIRELY (not just deprioritized).
+                                   # Default order if unset: A → B → C → D → E (the order shown below).
+                                   # Common configurations:
+                                   #   [modules_md_pending]                               — architecture-only run
+                                   #   [zero_param_changes]                               — hyperparameter-sweep-only run
+                                   #   [modules_md_pending, combinations]                 — paper-backed + combine wins, no manual tuning
+                                   #   [zero_param_changes, modules_md_pending]           — try hyperparams first, fall back to modules
+                                   # Invalid tokens / non-list values fall back to default with a discoveries.md warning.
     - modules_md_pending           # A: paper-backed modules from modules.md
     - zero_param_changes           # B: hyperparameters, LR, augmentation (no param count change)
     - replacement_changes          # C: swap one block for another of similar size
@@ -205,6 +223,14 @@ orchestrator:
                                            # schedulers (cron, systemd timer) request a clean shutdown.
     max_paper_finder_expansions: 3 # After this many expansions with no new pending modules, stop —
                                    # further expansion is not finding new ideas.
+    # v1.8 — autonomous convergence triggers (all optional; commented = no limit).
+    # max_no_improvement_loops: 10  # Stop if N consecutive iterations all discard. Detects convergence
+    #                                # for unattended runs. Counter resets on every keep.
+    # max_total_loops: 100           # Hard ceiling on total iterations regardless of convergence state.
+    #                                # Distinct from autoresearch.loop.iterations (which is the user's
+    #                                # bounded-run intent); this is the safety brake for `iterations: null`.
+    # max_wallclock_hours: 72        # Stop after N hours of wallclock since pipeline start. Useful for
+    #                                # batch jobs with hard deadlines.
     # Also honours autoresearch.loop.iterations if set (bounded run terminates naturally).
   git:                             # [optional] Git automation.
     auto_init: true                # Run `git init` if project isn't a repo. Required for autoresearch's commit/revert flow.

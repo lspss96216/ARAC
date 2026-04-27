@@ -11,7 +11,7 @@
     "mode": {
       "type": "string",
       "enum": ["insertions", "full_yaml"],
-      "description": "Strategy selector. 'insertions' is the v1.7 supported mode (weight_transfer programmatically generates a new YAML from a list of insertions). 'full_yaml' is reserved for v1.8+ (agent writes a complete YAML; helper only computes layer_map and transfers). Using 'full_yaml' in v1.7 raises NotImplementedError."
+      "description": "Strategy selector. 'insertions' (v1.7+) — weight_transfer programmatically generates a custom YAML from a list of insertion specs; best for adding modules to an otherwise-unchanged base. 'full_yaml' (v1.9+) — agent writes a complete custom YAML; helper handles weight transfer via auto-computed or user-overridden layer_map. Use full_yaml for structural rewrites (BiFPN replacing PAFPN, DETR-style decoder, new backbone family)."
     }
   },
 
@@ -37,10 +37,38 @@
     {
       "properties": {
         "mode":             { "const": "full_yaml" },
-        "custom_yaml_path": { "type": "string" },
+        "custom_yaml_path": {
+          "type": "string",
+          "description": "Path (relative to project root) to the agent-written complete custom YAML file. Must follow ultralytics' parse_model conventions: backbone + head sections, [from, repeats, module, args] per layer."
+        },
+        "layer_map_strategy": {
+          "type": "string",
+          "enum": ["auto", "override"],
+          "default": "auto",
+          "description": "v1.9 — How to map base.layer[i] → custom.layer[j] for weight transfer. 'auto' uses class-name + structural-position heuristic (good for backbone-preserving rewrites like neck-only changes). 'override' requires layer_map_override to be specified (use when auto would mis-pair, e.g. ConvNeXt backbone substitution where Conv classes still exist but at different roles)."
+        },
         "layer_map_override": {
-          "type": ["object", "null"],
-          "description": "Reserved for v1.8. When null, helper auto-computes via class-name pairing. When dict, keys/values are stringified integers."
+          "type": ["array", "null"],
+          "description": "v1.9 — When layer_map_strategy='override', a list of {base_idx, custom_idx} pairs. Either base_idx or custom_idx may be omitted to skip that layer entirely (e.g. {base_idx: 5} = 'don't transfer base layer 5'). When layer_map_strategy='auto', this field is ignored.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "base_idx":   { "type": "integer", "minimum": 0 },
+              "custom_idx": { "type": "integer", "minimum": 0 }
+            },
+            "additionalProperties": false
+          }
+        },
+        "transfer_scope": {
+          "type": "string",
+          "enum": ["backbone", "backbone+neck", "full"],
+          "default": "backbone",
+          "description": "v1.9 — Which sections of the base model to transfer weights FROM. 'backbone' is the safest default (head class counts may differ; neck topology may differ). 'backbone+neck' when only the head is replaced. 'full' only when the custom YAML is structurally a near-superset of the base (e.g. inserted attention modules in an otherwise-identical YAML — but at that point you should be using mode='insertions' instead)."
+        },
+        "strict": {
+          "type": "boolean",
+          "default": true,
+          "description": "v1.9 — Per-entry strict mode (same semantics as insertions mode). When true, every paired (base_idx → custom_idx) in the resolved layer_map must transfer at least one tensor, else raise. Disable only when you know some layers genuinely have no compatible counterpart (e.g. a SPD-Conv replacement of a Conv where channel counts differ)."
         }
       },
       "required": ["mode", "custom_yaml_path"],

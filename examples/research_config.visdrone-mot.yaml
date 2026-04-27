@@ -44,7 +44,8 @@ task:
 # paths
 # -----------------------------------------------------------------------------
 paths:
-  project_root: "."                # [required] Project working directory.
+  project_root: "."                # [required] Project working directory. v1.9.2+ uses absolute resolution to
+                                   # prevent cross-project run.log pollution. See visdrone-detection.yaml for details.
   skills_dir: "./skills"           # [required] Where the skills + shared/ live. Relative to this yaml. Absolute paths also accepted.
   pipeline_state: "pipeline_state.json"  # [optional] Default ok.
   train_script: "train.py"         # [optional] [tracking-only] Note: also creates track.py automatically. Default ok.
@@ -172,12 +173,17 @@ autoresearch:
     max_runtime_multiplier: 2      # Kill as crashed if exceeds budget × this.
     iterations: null               # null = run forever until interrupted (see orchestrator.stopping).
     seed: 42                       # Locked across runs.
+    initial_batch_size: 16         # [optional, v1.9.3+] Starting BATCH_SIZE. Stage 0 patches train.py.
+                                   # NOT locked — autoresearch may halve dynamically (resource_impact, crash-pause).
+                                   # See visdrone-detection.yaml for sizing guidance.
   optimizer: SGD                   # [v1.7.7] Initial optimizer for train.py. Permitted: SGD/AdamW/Adam/RMSProp/NAdam/RAdam. Cannot be 'auto' (silently overrides LR0/MOMENTUM). autoresearch may swap during experiments but never to 'auto'.
   stall:
     threshold: 10                  # Consecutive no-improvement rounds before triggering paper finder expand.
     force_test_reset: 5            # When stalled with pending modules, reset stall to this and force-test next pending.
                                    # Actually read from yaml now (C1 — was hardcoded in v1.5).
-  module_priority:                 # Order autoresearch picks experiment types.
+  module_priority:                 # [optional, v1.9.1+] Order autoresearch picks experiment types.
+                                   # Tokens omitted are SKIPPED ENTIRELY. Default order if unset: A → B → C → D → E.
+                                   # See visdrone-detection.yaml for common configurations.
     - modules_md_pending
     - zero_param_changes
     - replacement_changes
@@ -200,6 +206,10 @@ orchestrator:
   stopping:                        # [optional] Autonomous Stage 4 triggers. Unattended runs need at least one (C9).
     stop_flag_file: "stop_pipeline.flag"   # External scheduler drops this file to request clean shutdown.
     max_paper_finder_expansions: 3 # After this many expansions with no new modules, stop.
+    # v1.8 — autonomous convergence triggers (all optional; commented = no limit).
+    # max_no_improvement_loops: 10  # Stop if N consecutive iterations all discard.
+    # max_total_loops: 100           # Hard ceiling regardless of convergence.
+    # max_wallclock_hours: 72        # Stop after N hours since pipeline start.
   git:
     auto_init: true
     branch_prefix: "autoresearch/"

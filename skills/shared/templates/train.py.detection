@@ -171,7 +171,7 @@ def train(model) -> None:
         time=TIME_BUDGET / 3600,             # ultralytics accepts time in hours
         imgsz=IMGSZ,
         freeze=FREEZE_LAYERS,
-        project=str(CKPT_DIR.parent),
+        project=str(CKPT_DIR.parent.resolve()),  # v1.8 — abs path defeats ULTRALYTICS_RUNS_DIR / SETTINGS races
         name=CKPT_DIR.name,
         seed=SEED,
         optimizer=OPTIMIZER,                 # v1.7.7 — explicit; never 'auto'
@@ -218,7 +218,37 @@ def print_metrics(metrics, model) -> None:
     print(f"peak_vram_mb:     {peak_vram_mb:.0f}")
 
 
+def _write_run_start_sentinel():
+    """v1.9.2 — write `__RUN_START__: <iso> <commit> <pid>` as the first
+    line of stdout. Step 6's freshness check verifies this token's
+    timestamp is fresher than state['step5_started_at']; if Step 6 ever
+    reads a stale run.log (e.g. from a neighbour project on the same
+    machine), the freshness check raises and prevents corrupting the
+    experimental record. See file-contracts.md § run.log v1.9.2 sentinel.
+    """
+    import os, subprocess
+    from datetime import datetime
+    iso = datetime.now().isoformat(timespec="seconds")
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except Exception:
+        commit = "no-git"
+    print(f"__RUN_START__: {iso} {commit} {os.getpid()}", flush=True)
+
+
+def _write_run_end_sentinel(exit_code: int):
+    """v1.9.2 — write `__RUN_END__: <iso> <exit>` as the last line of
+    stdout. Absence of this sentinel in run.log signals to Step 6 that
+    the run was killed mid-execution (vs cleanly crashed-and-returned)."""
+    from datetime import datetime
+    iso = datetime.now().isoformat(timespec="seconds")
+    print(f"__RUN_END__: {iso} {exit_code}", flush=True)
+
+
 def main() -> int:
+    _write_run_start_sentinel()
     set_seed(SEED)
 
     try:
@@ -270,4 +300,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = 99
+    try:
+        rc = main()
+    finally:
+        _write_run_end_sentinel(rc)
+    sys.exit(rc)

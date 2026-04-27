@@ -399,8 +399,14 @@ def compute_layer_map(
     positions = sorted(record.inserted_base_positions)
 
     def offset(orig_idx: int) -> int:
-        # number of insertions with position ≤ orig_idx
-        return sum(1 for p in positions if p <= orig_idx)
+        # v1.8 — was `p <= orig_idx` which incorrectly shifted layer p itself.
+        # When insertion goes at base position p, the new layer ends up at
+        # custom index p+1, leaving original layer p still at custom index p.
+        # So orig_idx p should NOT include p in the count — only p' < p shifts.
+        # Symptom of the old bug: pretrained weights routed into the inserted
+        # Lazy* wrapper instead of the preserved original at base index p.
+        # number of insertions with position STRICTLY LESS THAN orig_idx
+        return sum(1 for p in positions if p < orig_idx)
 
     return {
         orig_idx: orig_idx + offset(orig_idx)
@@ -566,8 +572,18 @@ def build_custom_model_with_injection(
     # the dependency can still test error paths.
     mode = spec.get("mode")
     if mode == "full_yaml":
-        raise NotImplementedError(
-            "mode='full_yaml' is reserved for v1.8+. Use mode='insertions' in v1.7."
+        # v1.9 — dispatch to apply_yaml_spec rather than raise. Kept this
+        # function as a single entry point so train.py templates only need to
+        # import build_custom_model_with_injection regardless of which mode
+        # the agent chose.
+        return apply_yaml_spec(
+            base_weights=base_weights,
+            custom_yaml_path=spec["custom_yaml_path"],
+            layer_map_override=spec.get("layer_map_override"),
+            layer_map_strategy=spec.get("layer_map_strategy", "auto"),
+            transfer_scope=spec.get("transfer_scope", "backbone"),
+            imgsz=imgsz,
+            strict=spec.get("strict", True),
         )
     if mode != "insertions":
         raise ValueError(f"Unknown spec.mode: {mode!r}")
@@ -586,8 +602,18 @@ def build_custom_model_with_injection(
     custom_yaml_dict, record = generate_custom_yaml(base_yaml, insertions)
 
     # Write custom yaml to disk so YOLO(...) can read it and the file is
-    # part of the git commit for reproducibility
-    yaml_out = pathlib.Path("exp_arch.yaml")
+    # part of the git commit for reproducibility.
+    #
+    # v1.8 — Filename MUST encode the model scale so ultralytics'
+    # guess_model_scale (called inside YOLO(yaml_path)) infers the right
+    # variant. It reads scale from filename via regex, ignoring the
+    # weights's actual scale. Bare `exp_arch.yaml` defaulted to scale='n',
+    # which silently built a YOLO_N variant and broke weight transfer
+    # because YOLO_X (the actual base) and YOLO_N have different layer counts.
+    #
+    # Derive name from base weights stem: weights/yolo26x.pt → yolo26x_arch.yaml
+    base_stem = pathlib.Path(base_weights).stem   # e.g. "yolo26x"
+    yaml_out = pathlib.Path(f"{base_stem}_arch.yaml")
     import yaml as _yaml
     yaml_out.write_text(_yaml.safe_dump(custom_yaml_dict, sort_keys=False))
     print(f"[weight_transfer] Generated custom YAML: {yaml_out} "
@@ -633,15 +659,241 @@ def build_custom_model_with_injection(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# High level — v1.8+ placeholder
+# High level — full_yaml mode (v1.9)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def apply_yaml_spec(*args, **kwargs):
-    """Reserved for v1.8. Will handle mode='full_yaml' specs."""
-    raise NotImplementedError(
-        "apply_yaml_spec is reserved for v1.8. v1.7 supports "
-        "build_custom_model_with_injection with mode='insertions' only."
+def _yaml_layer_class(line: list) -> str:
+    """Given a YAML layer line [from, repeats, class_name, args], return class_name."""
+    return line[2] if len(line) >= 3 else ""
+
+
+def _flatten_yaml_layers(yaml_dict: dict) -> list:
+    """backbone + head sections concatenated in order. Note ultralytics YAML
+    has no separate 'neck' section — neck layers live at the top of 'head'.
+    The split between neck and head proper is conventional (head = layers
+    feeding into Detect)."""
+    return list(yaml_dict.get("backbone", [])) + list(yaml_dict.get("head", []))
+
+
+def auto_compute_full_yaml_layer_map(
+    base_yaml: dict,
+    custom_yaml: dict,
+    transfer_scope: str = "backbone",
+) -> dict[int, int]:
+    """Compute base.layer[i] → custom.layer[j] via class-name + structural-position
+    heuristic. Used by apply_yaml_spec when layer_map_strategy='auto'.
+
+    Algorithm:
+      1. Determine which base indices are in `transfer_scope`:
+         - 'backbone'      → backbone indices only
+         - 'backbone+neck' → backbone + first half of head section (heuristic:
+                             everything before the first Detect-family class)
+         - 'full'          → all layers including head
+      2. For each base[i] in scope (ascending), find the first custom[j]
+         where j > last-paired-j AND class_name matches.
+      3. Skip on no match — caller decides whether to raise (strict) or accept.
+
+    Limitations:
+      - Identical-class chains in custom YAML may pair the wrong copy. Example:
+        custom has 4× Conv where base has 3× Conv. Auto will pair base[0,1,2]
+        with custom[0,1,2] and ignore custom[3]; if the intended pairing was
+        custom[0,1,3], use layer_map_strategy='override'.
+      - Class-name renames (Conv → SPDConv) leave the renamed layers unpaired.
+        These show up as unmatched indices; strict mode raises if any base
+        index in scope is unpaired.
+    """
+    base_layers = _flatten_yaml_layers(base_yaml)
+    custom_layers = _flatten_yaml_layers(custom_yaml)
+
+    n_base_backbone = len(base_yaml.get("backbone", []))
+    n_custom_backbone = len(custom_yaml.get("backbone", []))
+
+    def in_scope(base_idx: int) -> bool:
+        if transfer_scope == "backbone":
+            return base_idx < n_base_backbone
+        if transfer_scope == "full":
+            return True
+        if transfer_scope == "backbone+neck":
+            # Heuristic: include indices up to (but not including) the first
+            # Detect-family layer in the base
+            for k, line in enumerate(base_layers):
+                cls = _yaml_layer_class(line)
+                if "Detect" in cls or "RTDETRDecoder" in cls:
+                    return base_idx < k
+            return True   # no Detect found → treat all as in scope
+        raise ValueError(f"Unknown transfer_scope: {transfer_scope!r}")
+
+    layer_map: dict[int, int] = {}
+    j_cursor = 0
+    for i, base_line in enumerate(base_layers):
+        if not in_scope(i):
+            continue
+        base_class = _yaml_layer_class(base_line)
+        if not base_class:
+            continue
+        # Search custom from j_cursor onward for first matching class
+        for j in range(j_cursor, len(custom_layers)):
+            if _yaml_layer_class(custom_layers[j]) == base_class:
+                layer_map[i] = j
+                j_cursor = j + 1
+                break
+        # No match → leave i unpaired (caller decides on strict/non-strict)
+    return layer_map
+
+
+def _resolve_layer_map_override(
+    override: list[dict],
+) -> dict[int, int]:
+    """Convert schema's [{base_idx, custom_idx}, ...] list into dict.
+    Entries missing one of the two keys are dropped (schema allows partial
+    entries to mean 'skip this layer entirely')."""
+    out: dict[int, int] = {}
+    for entry in (override or []):
+        if "base_idx" in entry and "custom_idx" in entry:
+            out[int(entry["base_idx"])] = int(entry["custom_idx"])
+    return out
+
+
+def apply_yaml_spec(
+    base_weights: str,
+    custom_yaml_path: str,
+    layer_map_override: list[dict] | None = None,
+    layer_map_strategy: str = "auto",
+    transfer_scope: str = "backbone",
+    imgsz: int = 640,
+    strict: bool = True,
+) -> "YOLO":
+    """v1.9 — full_yaml mode. Build a model from agent-written complete custom
+    YAML, transferring what weights we can from base_weights.
+
+    Workflow:
+      1. Parse base YAML (from .pt) + custom YAML (from disk)
+      2. Compute layer_map: auto (class+position heuristic) or use override
+      3. Build custom YOLO from custom_yaml_path
+      4. transfer_weights with computed layer_map (per-entry strict)
+      5. force_lazy_build (one dummy forward so any Lazy* wrappers materialise)
+      6. register_stage2_callback for trainer-rebuild reapply (v1.7.7 #14 path)
+      7. Return ready-to-train YOLO
+
+    Args:
+      base_weights:      path to pretrained .pt to transfer FROM
+      custom_yaml_path:  path to agent-written complete custom YAML
+      layer_map_override: when layer_map_strategy='override', list of
+                         {base_idx, custom_idx} pairs (per arch_spec schema)
+      layer_map_strategy: 'auto' or 'override'
+      transfer_scope:    'backbone' (default), 'backbone+neck', or 'full'
+      imgsz:             image size for force_lazy_build's dummy forward
+      strict:            per-entry strict transfer (default True)
+
+    Raises:
+      ValueError: layer_map_strategy='override' but override is None or empty
+      ValueError: unknown layer_map_strategy or transfer_scope
+      RuntimeError: strict mode and a paired layer transferred zero tensors
+      RuntimeError: strict mode and any base index in scope is unpaired
+                    (not in layer_map)
+
+    Returns:
+      ultralytics YOLO instance, ready for .train(...).
+    """
+    if layer_map_strategy not in ("auto", "override"):
+        raise ValueError(
+            f"layer_map_strategy={layer_map_strategy!r} — must be 'auto' or 'override'"
+        )
+
+    # v1.9 — validate override input before importing ultralytics so
+    # environments without the dep can still test error paths.
+    if layer_map_strategy == "override" and not layer_map_override:
+        raise ValueError(
+            "layer_map_strategy='override' but layer_map_override is None or empty. "
+            "Provide a list of {base_idx, custom_idx} pairs in arch_spec.json."
+        )
+
+    if transfer_scope not in ("backbone", "backbone+neck", "full"):
+        raise ValueError(
+            f"transfer_scope={transfer_scope!r} — must be 'backbone', "
+            f"'backbone+neck', or 'full'"
+        )
+
+    from ultralytics import YOLO
+
+    # 1. Parse base + custom YAMLs
+    print(f"[weight_transfer] full_yaml: loading base weights {base_weights}")
+    orig = YOLO(base_weights)
+    base_yaml = parse_base_yaml(base_weights)
+
+    import yaml as _yaml
+    custom_yaml = _yaml.safe_load(pathlib.Path(custom_yaml_path).read_text())
+    if not isinstance(custom_yaml, dict):
+        raise ValueError(f"{custom_yaml_path} did not parse as a dict")
+    if "backbone" not in custom_yaml or "head" not in custom_yaml:
+        raise ValueError(
+            f"{custom_yaml_path} must have both 'backbone' and 'head' top-level "
+            f"sections (ultralytics convention)"
+        )
+
+    # 2. Compute layer_map
+    if layer_map_strategy == "auto":
+        layer_map = auto_compute_full_yaml_layer_map(
+            base_yaml, custom_yaml, transfer_scope=transfer_scope
+        )
+        print(f"[weight_transfer] auto layer_map computed: "
+              f"{len(layer_map)} pairs from {len(_flatten_yaml_layers(base_yaml))} "
+              f"base layers")
+    else:
+        layer_map = _resolve_layer_map_override(layer_map_override)
+        print(f"[weight_transfer] override layer_map: {len(layer_map)} pairs")
+
+    # 3. In strict mode, verify every in-scope base layer with parameters got
+    # paired (skip param-less layers like Concat / Upsample)
+    if strict and layer_map_strategy == "auto":
+        paramless = discover_paramless_layers(orig.model)
+        unpaired = []
+        base_layers = _flatten_yaml_layers(base_yaml)
+        n_base_backbone = len(base_yaml.get("backbone", []))
+        for i in range(len(base_layers)):
+            if i in paramless:
+                continue
+            # Same scope filter as auto_compute (in-scope but not paired)
+            in_scope = (
+                (transfer_scope == "backbone" and i < n_base_backbone) or
+                (transfer_scope == "full") or
+                (transfer_scope == "backbone+neck" and i in layer_map)
+                # backbone+neck heuristic is content-dependent; trust layer_map
+            )
+            if in_scope and i not in layer_map:
+                unpaired.append((i, _yaml_layer_class(base_layers[i])))
+        if unpaired:
+            raise RuntimeError(
+                f"strict mode: {len(unpaired)} base layer(s) in transfer_scope="
+                f"{transfer_scope!r} could not be paired by auto layer_map: "
+                f"{unpaired[:5]}{'...' if len(unpaired) > 5 else ''}. "
+                f"Either revise custom YAML to preserve these classes, set "
+                f"layer_map_strategy='override' with explicit pairs, or set "
+                f"strict=false (loses correctness guarantees)."
+            )
+
+    # 4. Build custom model from agent's YAML
+    # IMPORTANT: ultralytics' guess_model_scale reads filename. If custom_yaml_path
+    # already encodes the scale (e.g. "yolo26x_bifpn.yaml") this works; otherwise
+    # ultralytics defaults to scale 'n'. We do NOT rename the agent's file (would
+    # confuse the agent's own bookkeeping); instead we trust the agent named it
+    # appropriately. Document this in train-script-spec.md § full_yaml.
+    custom = YOLO(str(custom_yaml_path))
+
+    # 5. Transfer weights using computed layer_map
+    transfer_weights(
+        orig.model.state_dict(), custom.model, layer_map, strict=strict,
     )
+
+    # 6. force_lazy_build — same as insertions mode, in case custom YAML uses
+    # Lazy* wrappers
+    force_lazy_build(custom.model, imgsz=imgsz)
+
+    # 7. Stage 2 callback so weight transfer survives trainer rebuild
+    register_stage2_callback(custom, base_weights, layer_map, strict=strict)
+    print(f"[weight_transfer] full_yaml: Stage 2 callback registered")
+
+    return custom
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -60,6 +60,16 @@ _COMPLEXITY_ORDER = {"low": 0, "medium": 1, "high": 2}
 KNOWN_INTEGRATION_MODES = {"hook", "yaml_inject", "full_yaml"}
 DEFAULT_INTEGRATION_MODE = "hook"
 
+# v1.9 — resource_impact tags. autoresearch Step 3 Modify uses these to
+# preemptively halve BATCH_SIZE for memory-heavy experiments (avoiding the
+# silent CPU TaskAlignedAssigner fallback that under-trains the run).
+KNOWN_RESOURCE_IMPACTS = {
+    "vram_4x",            # ~4× baseline VRAM (P2 head, dense attention)
+    "vram_2x",            # ~2× baseline VRAM (single attention layer added)
+    "cpu_fallback_risk",  # known to trigger CPU assigner fallback at default batch
+    "none",               # explicit "no extra cost" — for parser sanity, optional
+}
+
 
 @dataclass
 class Module:
@@ -96,6 +106,16 @@ class Module:
         raw = self.fields.get("Integration mode") or ""
         stripped = raw.strip()
         return stripped if stripped else DEFAULT_INTEGRATION_MODE
+
+    @property
+    def resource_impact(self) -> Optional[str]:
+        """v1.9 — autoresearch reads this to decide whether to halve BATCH_SIZE
+        before running. Returns None when the field is absent or blank (treated
+        as 'unknown', no auto-halve). Returns the raw value otherwise; callers
+        check membership in KNOWN_RESOURCE_IMPACTS and fall back gracefully."""
+        raw = self.fields.get("resource_impact") or ""
+        stripped = raw.strip()
+        return stripped if stripped else None
 
 
 # ---------------------------------------------------------------------------

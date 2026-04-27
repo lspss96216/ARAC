@@ -256,6 +256,63 @@ def test_integration_mode_blank_is_default():
 
 
 # ---------------------------------------------------------------------------
+# v1.9 — resource_impact field
+# ---------------------------------------------------------------------------
+
+def test_resource_impact_absent_returns_none():
+    """No resource_impact field → property returns None (treated as 'unknown')."""
+    m = mm.Module(name="x", fields={})
+    assert m.resource_impact is None
+    print("✓ test_resource_impact_absent_returns_none")
+
+
+def test_resource_impact_blank_returns_none():
+    """Blank or whitespace-only → None."""
+    m1 = mm.Module(name="x", fields={"resource_impact": ""})
+    m2 = mm.Module(name="y", fields={"resource_impact": "   "})
+    assert m1.resource_impact is None
+    assert m2.resource_impact is None
+    print("✓ test_resource_impact_blank_returns_none")
+
+
+def test_resource_impact_known_values():
+    """Each KNOWN_RESOURCE_IMPACTS value parses cleanly."""
+    for tag in mm.KNOWN_RESOURCE_IMPACTS:
+        m = mm.Module(name="x", fields={"resource_impact": tag})
+        assert m.resource_impact == tag, f"{tag} → {m.resource_impact}"
+    print("✓ test_resource_impact_known_values")
+
+
+def test_resource_impact_unknown_returned_as_is():
+    """Unknown values returned as-is (warn-not-reject policy parallel to
+    integration_mode). autoresearch decides what to do with them."""
+    m = mm.Module(name="x", fields={"resource_impact": "vram_8x_unknown"})
+    assert m.resource_impact == "vram_8x_unknown"
+    assert m.resource_impact not in mm.KNOWN_RESOURCE_IMPACTS
+    print("✓ test_resource_impact_unknown_returned_as_is")
+
+
+def test_resource_impact_round_trip_through_append():
+    """Field survives append + parse round-trip."""
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+        path = f.name
+    pathlib.Path(path).write_text("")
+    mm.append_module(path, {
+        "name": "P2 Head",
+        "fields": {
+            "Location": "head",
+            "Complexity": "high",
+            "paper2code": "no",
+            "Integration mode": "full_yaml",
+            "resource_impact": "vram_4x",
+        },
+    })
+    mods = mm.parse(path)
+    assert mods[0].resource_impact == "vram_4x"
+    print("✓ test_resource_impact_round_trip_through_append")
+
+
+# ---------------------------------------------------------------------------
 # v1.7.3 — preferred_locations secondary sort
 # ---------------------------------------------------------------------------
 
@@ -402,6 +459,12 @@ if __name__ == "__main__":
     test_integration_mode_yaml_inject()
     test_integration_mode_unknown_warns_but_accepts()
     test_integration_mode_blank_is_default()
+    # v1.9 — resource_impact
+    test_resource_impact_absent_returns_none()
+    test_resource_impact_blank_returns_none()
+    test_resource_impact_known_values()
+    test_resource_impact_unknown_returned_as_is()
+    test_resource_impact_round_trip_through_append()
     # v1.7.3
     test_preferred_locations_orders_within_complexity()
     test_preferred_locations_reversed()

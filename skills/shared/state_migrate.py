@@ -36,6 +36,28 @@ CURRENT_DEFAULTS: dict[str, Any] = {
     "architecture_keeps":          0,
     "request_repretrain":          False,
     "repretrain_reason":           None,
+
+    # --- v1.8 additions ---
+    "vanilla_baseline_done":       False,
+    "no_improvement_loops":        0,
+    "pretrain_dead_config_warned": False,
+
+    # --- v1.9 additions ---
+    "batch_size_pre_autohalve":    None,
+
+    # --- v1.9.2 additions ---
+    # project_root: absolute path of project root. Migration falls back to
+    # cwd; if that's wrong the next Step 5 cwd-lock check will catch it.
+    # Best practice is to re-run orchestrator Stage 0 to pick up the
+    # canonical absolute path from research_config.yaml.
+    "project_root":                None,    # filled in by Stage 0 init or migration_post_hook below
+    "step5_started_at":            None,    # ISO timestamp Step 5 sets before launching train.py
+    "step5_started_at_unix":       None,    # same, unix epoch (for mtime comparisons)
+
+    # --- v1.9.3 additions ---
+    # initial_batch_size: starting BATCH_SIZE from yaml. None = use template
+    # default (16). Stage 0 patches train.py once at scaffold time.
+    "initial_batch_size":          None,
 }
 
 # Legacy -> current key renames. Applied once; after migration the old key
@@ -70,6 +92,14 @@ def migrate(path: str | pathlib.Path = "pipeline_state.json") -> dict:
         if key not in state:
             state[key] = default
             changed = True
+
+    # v1.9.2 — post-default hook: if project_root is still None after
+    # migration (resume from pre-v1.9.2), fall back to cwd resolved.
+    # This is best-effort; Step 5's cwd-lock will catch the case where
+    # cwd is genuinely wrong.
+    if state.get("project_root") is None:
+        state["project_root"] = str(pathlib.Path(".").resolve())
+        changed = True
 
     # 3. Sanitize non-JSON-spec sentinels (e.g. a buggy older version wrote
     #    float('inf')). Recursively walk the structure.

@@ -238,25 +238,64 @@ def test_layer_map_no_insertions():
 
 
 def test_layer_map_with_insertions():
-    """3 insertions at base positions [0,1,3] — offset per orig_idx."""
+    """3 insertions at base positions [0,1,3] — offset per orig_idx.
+
+    v1.8 — corrected formula. An insertion at base position p produces a new
+    layer at custom index p+1; the original layer p stays at custom index p.
+    So the orig_idx → custom_idx offset = count of insertions STRICTLY LESS
+    than orig_idx (NOT ≤).
+
+    Concrete walk-through with insertions at [0, 1, 3]:
+      orig=[A, B, C, D, E, F, G, _, _]   (indices 0..8; 5,6 paramless; 8 Detect)
+      Insert X@0 → A becomes preceded by something? No — "after p=0" means
+        X is inserted AS layer 1, original B (orig_idx=1) shifts to custom 2.
+      Insert Y@1 → original B at orig_idx 1 stays at the post-prev-shift
+        position custom_idx 2; Y becomes layer 3, original C (orig_idx=2)
+        was at custom 3, shifts to custom 4.
+      Insert Z@3 → original D at orig_idx 3 was at custom 5 (after shifts
+        from X@0 and Y@1); stays at custom 5; Z becomes layer 6; original E
+        at orig_idx 4 was at custom 6, shifts to custom 7.
+
+    So:
+      orig 0 → count(p < 0) = 0 → custom 0
+      orig 1 → count(p < 1) = 1 (just X@0) → custom 2
+      orig 2 → count(p < 2) = 2 (X@0, Y@1) → custom 4
+      orig 3 → count(p < 3) = 2 → custom 5
+      orig 4 → count(p < 4) = 3 (all three) → custom 7
+      orig 7 → count(p < 7) = 3 → custom 10
+    """
     record = wt.InsertionRecord(inserted_base_positions=[0, 1, 3])
-    # orig_total: 9 layers (backbone 5 + neck 3 + detect 1)
     paramless = {5, 6}
     lm = wt.compute_layer_map(
         record, orig_total_layers=9,
         skip_head=True, detect_orig_idx=8,
         paramless_orig_indices=paramless,
     )
-    # Offset formula: custom_idx = orig_idx + count(p ≤ orig_idx)
-    # orig 0 → count(≤0) = 1 → 1
-    # orig 1 → count(≤1) = 2 → 3
-    # orig 2 → count(≤2) = 2 → 4
-    # orig 3 → count(≤3) = 3 → 6
-    # orig 4 → count(≤4) = 3 → 7
-    # orig 7 → count(≤7) = 3 → 10
-    expected = {0: 1, 1: 3, 2: 4, 3: 6, 4: 7, 7: 10}
+    expected = {0: 0, 1: 2, 2: 4, 3: 5, 4: 7, 7: 10}
     assert lm == expected, f"got {lm}, want {expected}"
     print("✓ test_layer_map_with_insertions")
+
+
+def test_layer_map_insertion_at_p_does_not_shift_orig_p():
+    """v1.8 — direct test for the off-by-one fix. Insertion at base position
+    p must shift orig_idx > p, but NOT orig_idx == p (since the original
+    layer at p stays at custom index p; the inserted layer is at p+1).
+
+    Concrete case: 4 base layers [A, B, C, D], insert X@1 → custom layout
+    becomes [A, B, X, C, D]:
+      orig 0 (A) → custom 0
+      orig 1 (B) → custom 1   (B stays at index 1, X is at 2)
+      orig 2 (C) → custom 3
+      orig 3 (D) → custom 4
+    """
+    record = wt.InsertionRecord(inserted_base_positions=[1])
+    lm = wt.compute_layer_map(
+        record, orig_total_layers=4, skip_head=False,
+        paramless_orig_indices=set(),
+    )
+    expected = {0: 0, 1: 1, 2: 3, 3: 4}
+    assert lm == expected, f"got {lm}, want {expected}"
+    print("✓ test_layer_map_insertion_at_p_does_not_shift_orig_p")
 
 
 def test_layer_map_skip_head_default():
@@ -401,18 +440,294 @@ def test_insertion_from_dict_unknown_kind():
 # Main entry (mid-level) — smoke test via mock
 # ──────────────────────────────────────────────────────────────────────────────
 
-def test_build_rejects_full_yaml_mode():
-    """v1.7 must refuse mode='full_yaml'."""
+def test_build_dispatches_full_yaml_mode():
+    """v1.9 — full_yaml mode must dispatch to apply_yaml_spec, not raise.
+
+    Monkey-patches apply_yaml_spec to a sentinel so we can verify the call
+    arrives with the right kwargs without needing ultralytics + a real .pt.
+    """
+    captured = {}
+    original = wt.apply_yaml_spec
+    def fake_apply(**kwargs):
+        captured.update(kwargs)
+        return "<fake YOLO instance>"
+    wt.apply_yaml_spec = fake_apply
+    try:
+        result = wt.build_custom_model_with_injection(
+            "fake.pt",
+            {
+                "mode": "full_yaml",
+                "custom_yaml_path": "custom.yaml",
+                "layer_map_strategy": "auto",
+                "transfer_scope": "backbone+neck",
+                "strict": False,
+            },
+            imgsz=1280,
+        )
+    finally:
+        wt.apply_yaml_spec = original
+
+    assert result == "<fake YOLO instance>"
+    assert captured["base_weights"] == "fake.pt"
+    assert captured["custom_yaml_path"] == "custom.yaml"
+    assert captured["layer_map_strategy"] == "auto"
+    assert captured["transfer_scope"] == "backbone+neck"
+    assert captured["strict"] is False
+    assert captured["imgsz"] == 1280
+    assert captured["layer_map_override"] is None  # not provided in spec
+    print("✓ test_build_dispatches_full_yaml_mode")
+
+
+def test_build_dispatches_full_yaml_with_override():
+    """Same dispatch but with an override list — must arrive intact."""
+    captured = {}
+    original = wt.apply_yaml_spec
+    def fake_apply(**kwargs):
+        captured.update(kwargs)
+    wt.apply_yaml_spec = fake_apply
     try:
         wt.build_custom_model_with_injection(
-            "fake.pt", {"mode": "full_yaml", "custom_yaml_path": "x.yaml"},
+            "fake.pt",
+            {
+                "mode": "full_yaml",
+                "custom_yaml_path": "custom.yaml",
+                "layer_map_strategy": "override",
+                "layer_map_override": [
+                    {"base_idx": 0, "custom_idx": 0},
+                    {"base_idx": 1, "custom_idx": 2},
+                ],
+            },
             imgsz=640,
         )
-    except NotImplementedError as e:
-        assert "full_yaml" in str(e)
-        print("✓ test_build_rejects_full_yaml_mode")
+    finally:
+        wt.apply_yaml_spec = original
+
+    assert captured["layer_map_strategy"] == "override"
+    assert captured["layer_map_override"] == [
+        {"base_idx": 0, "custom_idx": 0},
+        {"base_idx": 1, "custom_idx": 2},
+    ]
+    print("✓ test_build_dispatches_full_yaml_with_override")
+
+
+def test_apply_yaml_spec_rejects_unknown_strategy():
+    """layer_map_strategy must be 'auto' or 'override'."""
+    try:
+        wt.apply_yaml_spec(
+            base_weights="fake.pt",
+            custom_yaml_path="x.yaml",
+            layer_map_strategy="random",
+        )
+    except ValueError as e:
+        assert "layer_map_strategy" in str(e)
+        print("✓ test_apply_yaml_spec_rejects_unknown_strategy")
         return
-    raise AssertionError("expected NotImplementedError for full_yaml")
+    raise AssertionError("expected ValueError")
+
+
+def test_apply_yaml_spec_rejects_override_without_pairs():
+    """layer_map_strategy='override' requires non-empty layer_map_override."""
+    for empty in (None, []):
+        try:
+            wt.apply_yaml_spec(
+                base_weights="fake.pt",
+                custom_yaml_path="x.yaml",
+                layer_map_strategy="override",
+                layer_map_override=empty,
+            )
+        except ValueError as e:
+            assert "override" in str(e).lower()
+            continue
+        raise AssertionError(f"expected ValueError for empty={empty}")
+    print("✓ test_apply_yaml_spec_rejects_override_without_pairs")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v1.9 — auto_compute_full_yaml_layer_map (Fix A1)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_auto_layer_map_identical_yamls():
+    """When custom == base, every layer pairs to itself."""
+    base = {
+        "backbone": [
+            [-1, 1, "Conv", [64, 3, 2]],
+            [-1, 1, "Conv", [128, 3, 2]],
+            [-1, 1, "C2f", [128, True]],
+            [-1, 1, "SPPF", [256, 5]],
+        ],
+        "head": [
+            [-1, 1, "Detect", [80]],
+        ],
+    }
+    custom = base   # same dict
+    lm = wt.auto_compute_full_yaml_layer_map(base, custom, transfer_scope="full")
+    assert lm == {0: 0, 1: 1, 2: 2, 3: 3, 4: 4}
+    print("✓ test_auto_layer_map_identical_yamls")
+
+
+def test_auto_layer_map_backbone_only_scope():
+    """transfer_scope='backbone' skips head pairing."""
+    base = {
+        "backbone": [
+            [-1, 1, "Conv", [64, 3, 2]],
+            [-1, 1, "Conv", [128, 3, 2]],
+        ],
+        "head": [
+            [-1, 1, "Detect", [80]],
+        ],
+    }
+    # custom has same backbone, different Detect (e.g. different class count)
+    custom = {
+        "backbone": [
+            [-1, 1, "Conv", [64, 3, 2]],
+            [-1, 1, "Conv", [128, 3, 2]],
+        ],
+        "head": [
+            [-1, 1, "Detect", [10]],   # different nc
+        ],
+    }
+    lm = wt.auto_compute_full_yaml_layer_map(base, custom, transfer_scope="backbone")
+    # Only backbone indices (0, 1) — head (idx 2) excluded
+    assert lm == {0: 0, 1: 1}
+    print("✓ test_auto_layer_map_backbone_only_scope")
+
+
+def test_auto_layer_map_neck_replaced():
+    """Realistic case: backbone preserved, neck (PAFPN) replaced with BiFPN."""
+    base = {
+        "backbone": [
+            [-1, 1, "Conv", [64, 3, 2]],
+            [-1, 1, "C2f", [128, True]],
+        ],
+        "head": [
+            [-1, 1, "Conv", [256, 1, 1]],     # neck Conv
+            [[-1, 1], 1, "Concat", [1]],      # neck Concat
+            [-1, 1, "Detect", [80]],          # actual head
+        ],
+    }
+    custom = {
+        "backbone": [
+            [-1, 1, "Conv", [64, 3, 2]],     # paired
+            [-1, 1, "C2f", [128, True]],     # paired
+        ],
+        "head": [
+            [-1, 1, "BiFPN", [256, 3]],      # custom neck — no Conv to pair
+            [[-1, 1], 1, "BiFPN", [256, 1]],
+            [-1, 1, "Detect", [80]],          # still pairable
+        ],
+    }
+    lm = wt.auto_compute_full_yaml_layer_map(base, custom, transfer_scope="full")
+    # backbone Conv → custom Conv at 0
+    # backbone C2f → custom C2f at 1
+    # base Conv at 2 (neck) → custom has no Conv; unpaired
+    # base Concat at 3 (neck) → custom has no Concat; unpaired
+    # base Detect at 4 → custom Detect at 4
+    assert lm == {0: 0, 1: 1, 4: 4}
+    print("✓ test_auto_layer_map_neck_replaced")
+
+
+def test_auto_layer_map_class_rename_unpairs():
+    """If custom renames Conv → SPDConv, those layers don't pair."""
+    base = {
+        "backbone": [
+            [-1, 1, "Conv", [64, 3, 2]],
+            [-1, 1, "Conv", [128, 3, 2]],
+            [-1, 1, "C2f", [128, True]],
+        ],
+        "head": [[-1, 1, "Detect", [80]]],
+    }
+    custom = {
+        "backbone": [
+            [-1, 1, "SPDConv", [64]],          # renamed
+            [-1, 1, "SPDConv", [128]],         # renamed
+            [-1, 1, "C2f", [128, True]],       # preserved
+        ],
+        "head": [[-1, 1, "Detect", [80]]],
+    }
+    lm = wt.auto_compute_full_yaml_layer_map(base, custom, transfer_scope="full")
+    # base Conv (0,1) — no SPDConv → no pair
+    # base C2f (2) → custom C2f (2)
+    # base Detect (3) → custom Detect (3)
+    assert lm == {2: 2, 3: 3}
+    print("✓ test_auto_layer_map_class_rename_unpairs")
+
+
+def test_auto_layer_map_cursor_advances():
+    """Cursor is monotonic — each match advances past the matched custom index.
+    Multiple Conv in base pair to consecutive Conv in custom, not the same one."""
+    base = {
+        "backbone": [
+            [-1, 1, "Conv", [64, 3, 2]],
+            [-1, 1, "Conv", [128, 3, 2]],
+            [-1, 1, "Conv", [256, 3, 2]],
+        ],
+        "head": [[-1, 1, "Detect", [80]]],
+    }
+    custom = {
+        "backbone": [
+            [-1, 1, "Conv", [64, 3, 2]],
+            [-1, 1, "Conv", [128, 3, 2]],
+            [-1, 1, "Conv", [256, 3, 2]],
+        ],
+        "head": [[-1, 1, "Detect", [80]]],
+    }
+    lm = wt.auto_compute_full_yaml_layer_map(base, custom, transfer_scope="full")
+    assert lm == {0: 0, 1: 1, 2: 2, 3: 3}
+    print("✓ test_auto_layer_map_cursor_advances")
+
+
+def test_auto_layer_map_extra_custom_layers_skipped():
+    """If custom has more of class X than base, the extras stay unpaired (only
+    base→custom direction; nothing claims the extras)."""
+    base = {
+        "backbone": [
+            [-1, 1, "Conv", [64, 3, 2]],
+            [-1, 1, "C2f", [128, True]],
+        ],
+        "head": [[-1, 1, "Detect", [80]]],
+    }
+    custom = {
+        "backbone": [
+            [-1, 1, "Conv", [64, 3, 2]],
+            [-1, 1, "Conv", [128, 3, 2]],   # extra Conv inserted
+            [-1, 1, "C2f", [128, True]],
+        ],
+        "head": [[-1, 1, "Detect", [80]]],
+    }
+    lm = wt.auto_compute_full_yaml_layer_map(base, custom, transfer_scope="full")
+    # base Conv (0) → custom Conv (0)
+    # base C2f (1) → custom C2f (2)
+    # base Detect (2) → custom Detect (3)
+    assert lm == {0: 0, 1: 2, 2: 3}
+    print("✓ test_auto_layer_map_extra_custom_layers_skipped")
+
+
+def test_resolve_layer_map_override_basic():
+    out = wt._resolve_layer_map_override([
+        {"base_idx": 0, "custom_idx": 0},
+        {"base_idx": 1, "custom_idx": 2},
+    ])
+    assert out == {0: 0, 1: 2}
+    print("✓ test_resolve_layer_map_override_basic")
+
+
+def test_resolve_layer_map_override_skips_partial_entries():
+    """Schema allows {base_idx} or {custom_idx} alone meaning 'skip this layer';
+    those translate to no entry in the dict."""
+    out = wt._resolve_layer_map_override([
+        {"base_idx": 0, "custom_idx": 0},
+        {"base_idx": 1},                   # skip — no custom_idx
+        {"custom_idx": 5},                 # skip — no base_idx
+        {"base_idx": 2, "custom_idx": 3},
+    ])
+    assert out == {0: 0, 2: 3}
+    print("✓ test_resolve_layer_map_override_skips_partial_entries")
+
+
+def test_resolve_layer_map_override_empty_or_none():
+    assert wt._resolve_layer_map_override([]) == {}
+    assert wt._resolve_layer_map_override(None) == {}
+    print("✓ test_resolve_layer_map_override_empty_or_none")
 
 
 def test_build_rejects_unknown_mode():
@@ -852,6 +1167,7 @@ TESTS = [
     test_generate_insertion_in_neck,
     test_layer_map_no_insertions,
     test_layer_map_with_insertions,
+    test_layer_map_insertion_at_p_does_not_shift_orig_p,
     test_layer_map_skip_head_default,
     test_transfer_weights_all_match,
     test_transfer_weights_strict_raises_on_zero,
@@ -859,7 +1175,19 @@ TESTS = [
     test_insertion_from_dict_after_class,
     test_insertion_from_dict_at_index,
     test_insertion_from_dict_unknown_kind,
-    test_build_rejects_full_yaml_mode,
+    test_build_dispatches_full_yaml_mode,
+    test_build_dispatches_full_yaml_with_override,
+    test_apply_yaml_spec_rejects_unknown_strategy,
+    test_apply_yaml_spec_rejects_override_without_pairs,
+    test_auto_layer_map_identical_yamls,
+    test_auto_layer_map_backbone_only_scope,
+    test_auto_layer_map_neck_replaced,
+    test_auto_layer_map_class_rename_unpairs,
+    test_auto_layer_map_cursor_advances,
+    test_auto_layer_map_extra_custom_layers_skipped,
+    test_resolve_layer_map_override_basic,
+    test_resolve_layer_map_override_skips_partial_entries,
+    test_resolve_layer_map_override_empty_or_none,
     test_build_rejects_unknown_mode,
     # v1.7.1 — repair primitives
     test_classify_crash_tier1,

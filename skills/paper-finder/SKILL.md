@@ -109,6 +109,22 @@ else:
 Search the following sources in parallel. For each source, collect paper titles, arxiv IDs,
 and abstract snippets. Do not download full PDFs yet — that happens in Phase 3.
 
+**v1.10 — `_source` tag required.** Every candidate added to the
+collection MUST carry a `_source` field identifying which source it
+came from. This drives Phase 2.5's cross-source dedup. Six valid values:
+
+| `_source` value | Meaning |
+|---|---|
+| `arxiv` | arXiv API (this section) |
+| `pwc` | Papers with Code |
+| `s2` | Semantic Scholar primary search |
+| `local` | Local PDF folder (user-provided) |
+| `hf` | HuggingFace Papers (Source 6, v1.10+) |
+| `s2_expansion` | Semantic Scholar citation expansion fallback |
+
+Skipping `_source` makes the candidate invisible to dedup. Phase 2.5
+will warn but cannot recover.
+
 ### arXiv
 
 ```bash
@@ -263,6 +279,53 @@ If install fails (network restricted), fall back to `pdftotext` CLI:
 pdftotext -l 12 "<pdf_path>" -
 ```
 
+### HuggingFace Papers (v1.10)
+
+ML-specialised paper aggregator with daily-curated rankings. Useful when
+PwC has coverage gaps for HF-ecosystem models or recent transformer
+work that hasn't been benchmarked yet. Each paper carries `ai_summary`,
+`ai_keywords`, and `githubRepo` fields, often saving Phase 3 scoring
+work.
+
+**Search by query** (1-3 task-relevant queries):
+```bash
+curl "https://huggingface.co/api/papers/search?q=<query>&limit=20"
+```
+
+Returns JSON list with shape (relevant fields only):
+```json
+[
+  {
+    "id": "2403.12345",
+    "title": "...",
+    "summary": "abstract text",
+    "ai_summary": "auto-generated 1-line summary",
+    "ai_keywords": ["object detection", "small objects", ...],
+    "githubRepo": "username/repo-name",
+    "publishedAt": "2024-03-15T..."
+  }
+]
+```
+
+**Trending fallback** if search comes back thin:
+```bash
+curl "https://huggingface.co/api/daily_papers?limit=30"
+```
+
+`daily_papers` is HF's manually-curated daily ML paper list — lower
+recall but very high precision. Use when Source 1-5 are returning
+mostly off-target.
+
+**Integration with Phase 3 scoring**: HF Papers' `ai_keywords` field
+can contribute to "Task relevance" scoring directly (keyword overlap
+with task description). Don't treat `ai_summary` as authoritative — it
+can be wrong about specific numbers — but as a triage signal it saves
+LLM calls.
+
+**Rate limit**: HF API doesn't enforce hard limits but be polite —
+batch all queries in a single subagent invocation, don't spawn parallel
+hammers.
+
 ### Semantic Scholar citation expansion (fallback)
 
 If the above sources return < 10 relevant results, expand via citation graph:
@@ -273,6 +336,145 @@ curl "https://api.semanticscholar.org/graph/v1/paper/<s2_paper_id>/citations?fie
 curl "https://api.semanticscholar.org/graph/v1/paper/search?query=survey+<domain>+object+detection&fields=title,abstract,year,citationCount,externalIds&limit=20"
 ```
 Mine related-work sections of survey papers for additional technique references.
+
+---
+
+## Phase 2.5 — Cross-source dedup (v1.10)
+
+Source 1-6 + S2 citation expansion can return the same paper multiple
+times. BiFPN paper appears in arXiv search, Papers with Code,
+Semantic Scholar AND HF Papers — without dedup, Phase 3's "top 20"
+ends up being 12 unique papers padded with 8 duplicate variants of 4
+papers, weakening the candidate pool.
+
+Run dedup BEFORE Phase 3 scoring.
+
+### Dedup key
+
+Primary key: `arxiv_id` (normalised — strip `arXiv:` prefix, strip
+version suffix `v1`/`v2`/etc.). Each source provides this in a
+slightly different field:
+
+| Source | Field for arxiv_id |
+|---|---|
+| arXiv API | `id` (e.g., `http://arxiv.org/abs/2305.18290v1`) |
+| Papers with Code | `arxiv_id` (when present; sometimes null) |
+| Semantic Scholar | `externalIds.ArXiv` |
+| HF Papers | `id` (already in `2305.18290` form) |
+| Local PDF | derived from filename if pattern matches; else None |
+| S2 citation expansion | `externalIds.ArXiv` |
+
+Fallback key for arxiv_id-less candidates: lowercased title with
+whitespace collapsed. Less reliable (typos, subtitle differences) but
+catches the common cases.
+
+### Dedup logic
+
+```python
+import re
+
+def normalize_arxiv_id(raw):
+    """Extract canonical arxiv_id from any of the source-specific shapes.
+    Returns None if this paper doesn't have one (rare but possible — e.g.
+    NeurIPS-only papers, local PDFs of preprints)."""
+    if not raw:
+        return None
+    s = str(raw)
+    # Strip URL prefixes
+    s = re.sub(r'^https?://arxiv\.org/abs/', '', s)
+    s = re.sub(r'^arXiv:', '', s, flags=re.I)
+    # Strip version suffix v1, v2, etc.
+    s = re.sub(r'v\d+$', '', s)
+    # Verify shape — should be NNNN.NNNNN or older format
+    if re.match(r'^(\d{4}\.\d{4,5}|[a-z\-]+/\d{7})$', s):
+        return s
+    return None
+
+
+def normalize_title(t):
+    if not t:
+        return None
+    return re.sub(r'\s+', ' ', t.lower().strip())
+
+
+def dedup_candidates(all_candidates):
+    """all_candidates: list of dicts from various sources, each with at minimum
+       title and source-specific id fields. Returns deduped list, preserving
+       the highest-quality occurrence (preferred order: arXiv > S2 > PwC > HF
+       Papers > local PDF) when same paper appears multiple times."""
+    SOURCE_PRIORITY = {
+        "arxiv": 5, "s2": 4, "pwc": 3, "hf": 2, "local": 1,
+        "s2_expansion": 4,  # same as s2
+    }
+    by_arxiv_id = {}
+    by_title = {}
+    for cand in all_candidates:
+        # Try arxiv_id first
+        aid = normalize_arxiv_id(
+            cand.get("arxiv_id") or cand.get("id") or
+            (cand.get("externalIds") or {}).get("ArXiv")
+        )
+        title_key = normalize_title(cand.get("title"))
+        cand_priority = SOURCE_PRIORITY.get(cand.get("_source"), 0)
+        if aid:
+            existing = by_arxiv_id.get(aid)
+            if not existing or cand_priority > SOURCE_PRIORITY.get(existing.get("_source"), 0):
+                # Merge fields from lower-priority duplicate (e.g. keep PwC's
+                # github URL even when arXiv version wins as the "primary")
+                if existing:
+                    for k, v in existing.items():
+                        if k not in cand or not cand[k]:
+                            cand[k] = v
+                by_arxiv_id[aid] = cand
+            elif existing:
+                # Lower priority version — merge our fields up
+                for k, v in cand.items():
+                    if k not in existing or not existing[k]:
+                        existing[k] = v
+        elif title_key:
+            existing = by_title.get(title_key)
+            if not existing or cand_priority > SOURCE_PRIORITY.get(existing.get("_source"), 0):
+                by_title[title_key] = cand
+    return list(by_arxiv_id.values()) + list(by_title.values())
+```
+
+Each source's collection step must tag entries with `_source`:
+
+```python
+# Example — when collecting from HF Papers Source 6
+for p in hf_papers_response:
+    p["_source"] = "hf"
+    candidates.append(p)
+```
+
+### Field merging across duplicates
+
+When the same paper appears in 3 sources, dedup keeps the highest-priority
+version but **merges fields** from lower-priority versions. This is
+important because each source carries different metadata:
+
+- arXiv: clean abstract, structured authors, ID
+- PwC: GitHub URL, benchmark results table
+- S2: citation count, isInfluential flag
+- HF Papers: ai_keywords, ai_summary, githubRepo (sometimes different from PwC's)
+
+After dedup, each surviving candidate has the **union** of metadata
+across its source occurrences. Phase 3 scoring then has fuller signal
+than any single source provided.
+
+### Sanity checks
+
+After dedup, verify:
+- Total candidate count went DOWN (else dedup didn't fire — likely a
+  bug in `_source` tagging)
+- arXiv-keyed dedup count > title-keyed dedup count (most papers should
+  resolve via arxiv_id)
+- No survivor has `_source: None` (unmissed-tag bug)
+
+If any check fails, log the imbalance to discoveries.md (subagent
+context) but proceed — false-positive dedup is much worse than
+false-negative dedup, so when in doubt, **keep both copies** and let
+Phase 3 scoring sort it.
 
 ---
 
@@ -429,7 +631,7 @@ unknown Location rather than guess a default):
 Use the exact lower-case spelling above. If uncertain, pick the closest match
 and note the ambiguity in `Integration notes`.
 
-### Integration mode (v1.7)
+### Integration mode (v1.7, full_yaml available v1.9)
 
 A per-module field telling autoresearch **how** to apply the module. The
 three legal values:
@@ -444,9 +646,14 @@ three legal values:
   generates a new YAML with inserted layers and transfers pretrained
   weights per-entry strict. Good for inserting attention blocks, SE
   modules, extra heads — anything that shifts downstream indices.
-- `full_yaml` — reserved for v1.8. Emit this only if you need an
-  architectural change `weight_transfer` can't do (e.g. BiFPN replacing
-  PAFPN). Autoresearch will discard such modules in v1.7.
+- `full_yaml` (v1.9) — autoresearch writes a complete custom YAML to disk
+  (provided by paper-finder in `Integration notes` → `custom_yaml_template`)
+  and `arch_spec.json` points at it. At train time,
+  `weight_transfer.apply_yaml_spec` builds the model from the custom YAML
+  and transfers weights via either an auto class+position heuristic or an
+  explicit layer_map_override. Good for **structural rewrites** the
+  insertion-based path can't express: BiFPN replacing PAFPN, DETR-style
+  decoder replacing the YOLO Detect head, ConvNeXt backbone substitution.
 
 Heuristic for picking the mode from paper text:
 
@@ -458,11 +665,23 @@ Heuristic for picking the mode from paper text:
 | "we insert <module> after every <class>" / "add <module> at stage N" | `yaml_inject` |
 | "we add a new detection head at P2" | `yaml_inject` |
 | "we add an auxiliary branch from <layer>" | `yaml_inject` (if the branch is a new layer) |
-| "we replace the entire neck with BiFPN" / major structural redesign | `full_yaml` (not yet supported) |
+| "we replace the entire neck with BiFPN" / "we redesign the FPN" | `full_yaml` |
+| "our backbone uses ConvNeXt blocks instead of CSP-Darknet" | `full_yaml` |
+| "we propose a new decoder with cross-attention on top of the CNN backbone" | `full_yaml` |
+| "the head outputs N×M predictions instead of 4-bbox + class" | `full_yaml` |
 
-When both modes could apply, prefer `hook` — it's simpler and cheaper.
-Reserve `yaml_inject` for cases where the paper's method genuinely requires
-a new layer in the graph with shifted indices.
+The mode-selection ladder, in order of preference (each rule fires the first
+time it matches):
+
+1. Loss / regularizer / scheduler change → `hook`
+2. Same layer count, only forward behaviour differs → `hook`
+3. New layers inserted but base structure preserved → `yaml_inject`
+4. Backbone, neck, OR head substantively replaced → `full_yaml`
+
+When both modes could apply, prefer `hook` over `yaml_inject` over
+`full_yaml` — simpler is cheaper to debug. Reserve `full_yaml` for cases
+where the paper's structural change cannot be expressed as a list of
+insertions (i.e. the change deletes or restructures, not just adds).
 
 **Asymmetric cost of misclassification (v1.7.1, refined v1.7.7).** If you
 can't decide, **prefer `yaml_inject`**. The failure modes are not
@@ -524,9 +743,202 @@ module_kwargs: {<optional_kwargs_dict>}
 - `scope` — enforces where in the model the module can go. For `at_index`,
   scope is an assertion (out-of-scope raises).
 
+#### v1.8 — base-aware `after_class` selection
+
+The class name in `after_class:` MUST match a real class in the actual
+base model's YAML. Different YOLO families use different block class
+names; using a YOLOv8-era default (`C2f`) when the base is YOLO11 / YOLO26
+(which use `C3k2`) silently produces "no matches" failures or wrong
+insertion positions.
+
+**Before writing any insertion**, read `base_model.md` and check which
+backbone family is in use. The mapping:
+
+| Base model family | Backbone block class | Notes |
+|---|---|---|
+| YOLOv5 (v5/v5n/v5s/v5m/v5l/v5x) | `C3` | older, used residual connection inside |
+| YOLOv8 (v8/v8n/v8s/v8m/v8l/v8x) | `C2f` | added second branch fusion |
+| YOLOv9 (v9, v9c, etc.) | `RepNCSPELAN4` | ELAN-derived block |
+| YOLOv10 (v10, v10n, v10s, etc.) | `C2f` | inherited from v8 |
+| YOLO11 (yolo11, yolo11n, etc.) | `C3k2` | C3-derived with k2 kernel |
+| YOLO26 (yolo26, yolo26x, etc.) | `C3k2` | inherited from YOLO11 |
+
+For non-listed families (RT-DETR, YOLOv6, etc.), open the actual base
+YAML and look at the backbone block class names directly. If unsure,
+prefer `at_index` over `after_class` — `at_index` is unambiguous.
+
+The `Conv` class is stable across all YOLO families and safe to use
+without family-aware checks.
+
+```python
+# Helper to check the base model's backbone block class before writing
+# insertions. Defensively reads base_model.md for the model name.
+import re, pathlib
+base_md = pathlib.Path("base_model.md").read_text()
+# Extract model name from a line like "**Selected**: YOLO26X (user-specified)"
+m = re.search(r"\*\*?Selected\*\*?:\s*([A-Za-z0-9_.-]+)", base_md)
+base_name = m.group(1).lower() if m else ""
+
+if "yolo26" in base_name or "yolo11" in base_name:
+    backbone_block = "C3k2"
+elif "yolov9" in base_name:
+    backbone_block = "RepNCSPELAN4"
+elif "yolov5" in base_name:
+    backbone_block = "C3"
+else:
+    backbone_block = "C2f"   # YOLOv8 / v10 / fallback
+```
+
 Without these fields, paper-finder should leave `Integration mode` as `hook`
 or mark the module `paper2code: no (incomplete)` so the user knows to fill
 in the details manually before autoresearch picks it up.
+
+### v1.9 — full_yaml modules need a custom YAML template
+
+When you pick `full_yaml`, the module's `Integration notes` must include a
+**complete YAML template** that the agent will write to disk during apply.
+Required fields:
+
+```
+### Integration notes
+custom_yaml_template: |
+  nc: <num_classes — autoresearch will overwrite from train.py's NUM_CLASSES>
+  scales:
+    n: [...]    # paper's depth/width multipliers per scale
+  backbone:
+    - [-1, 1, Conv, [64, 3, 2]]
+    - ...
+  head:
+    - [-1, 1, BiFPN, [256, 3]]
+    - ...
+layer_map_strategy: <auto | override>
+layer_map_override: <only when strategy=override; list of {base_idx, custom_idx}>
+transfer_scope:    <backbone | backbone+neck | full>
+```
+
+#### Choosing `layer_map_strategy`
+
+| Use `auto` when | Use `override` when |
+|---|---|
+| Backbone preserved exactly; only neck or head replaced | Custom YAML renames classes (Conv → SPDConv) |
+| Class names unchanged for the layers you want transferred | Custom YAML reorders or duplicates layer types |
+| Number of each preserved class matches between base and custom | You want to skip specific base layers from transfer |
+
+Default to `auto`. The auto heuristic is class-name + structural-position
+matching with a monotonic cursor — it works for the common case of
+"replace neck, keep backbone". Use `override` when you can predict auto
+will mis-pair (e.g. base has 6 Conv but custom has 8 Conv at different
+roles).
+
+#### Choosing `transfer_scope`
+
+| Scope | Transfer FROM these base layers | When to use |
+|---|---|---|
+| `backbone` | backbone only | Default. Head class counts may differ; neck topology may differ; safest. |
+| `backbone+neck` | backbone + everything before first Detect | When ONLY the head is replaced (e.g. DETR decoder). |
+| `full` | all layers | Rarely correct — equivalent to insertions mode minus head ref shifting. Almost always wrong for full_yaml; use insertions mode instead. |
+
+#### When NOT to use full_yaml
+
+Even when paper text suggests structural change, prefer `yaml_inject` if:
+
+- The change is "insert N modules in the existing structure" (use yaml_inject
+  with a list of insertions; v1.7.7's `update_head_refs` handles index
+  shifting correctly)
+- The change is "swap module class X for module class Y at the same
+  position" (use yaml_inject with explicit `at_index` insertion of the
+  new class — but accept that v1.9 doesn't yet support REPLACE semantics
+  for yaml_inject, only INSERT; the workaround is full_yaml or a hook
+  that wraps the existing layer)
+
+Reserve `full_yaml` for cases where the structure substantively changes:
+neck topology, head architecture, or backbone family.
+
+#### Example full_yaml Integration notes (BiFPN replacing PAFPN)
+
+```
+### Integration notes
+custom_yaml_template: |
+  nc: 80
+  scales:
+    n: [0.50, 0.25, 1024]
+    s: [0.50, 0.50, 1024]
+    m: [0.67, 0.75, 768]
+    l: [1.00, 1.00, 512]
+    x: [1.00, 1.25, 512]
+  backbone:
+    - [-1, 1, Conv, [64, 3, 2]]
+    - [-1, 1, Conv, [128, 3, 2]]
+    - [-1, 3, C3k2, [128, True]]
+    - [-1, 1, Conv, [256, 3, 2]]
+    - [-1, 6, C3k2, [256, True]]
+    - [-1, 1, Conv, [512, 3, 2]]
+    - [-1, 6, C3k2, [512, True]]
+    - [-1, 1, Conv, [1024, 3, 2]]
+    - [-1, 3, C3k2, [1024, True]]
+    - [-1, 1, SPPF, [1024, 5]]
+  head:
+    - [[4, 6, 9], 1, BiFPN, [256, 3]]      # paper's weighted bidirectional fusion
+    - [[-1], 1, BiFPN, [256, 3]]
+    - [[-1], 1, BiFPN, [256, 3]]
+    - [[-3, -2, -1], 1, Detect, [nc]]
+layer_map_strategy: auto
+transfer_scope: backbone
+```
+
+The `auto` strategy will pair the 10 backbone Conv/C3k2/SPPF layers
+between base and custom (identical class sequence). The 4 head layers
+(BiFPN × 3 + Detect) won't be paired since base has Conv/Concat/Detect
+and custom has BiFPN/Detect — that's expected: with `transfer_scope=backbone`,
+head is intentionally excluded.
+
+If the user is pinning a non-standard base (`preferred_base_model: YOLO26X`),
+copy the base's actual backbone YAML verbatim into `custom_yaml_template`'s
+backbone section. The auto strategy needs class names to match the base.
+
+### v1.9 — Resource impact tagging
+
+When a module is likely to push GPU memory beyond the default `BATCH_SIZE`'s
+budget, set `resource_impact` so autoresearch can preemptively halve
+BATCH_SIZE. This avoids the silent CPU `TaskAlignedAssigner` fallback (real
+run's Loop 7: EMA at batch=64 silently moved to CPU, training 3-7× slower,
+"untrainable in equal-budget regime" — discoveries.md `resource_constraint`
+category).
+
+The 3 known tags:
+
+| Tag | Meaning | Auto-action |
+|---|---|---|
+| `vram_4x` | ~4× baseline VRAM (P2 head, dense full-image attention, large transformer head) | autoresearch halves BATCH_SIZE twice (×0.25) |
+| `vram_2x` | ~2× baseline VRAM (single attention layer added; small structural change) | autoresearch halves BATCH_SIZE once (×0.5) |
+| `cpu_fallback_risk` | Known to trigger CPU assigner fallback at default batch even without big VRAM signature (e.g. matmul-heavy modules at high IMGSZ) | autoresearch halves BATCH_SIZE once (×0.5) and logs |
+
+Set the field by inspecting the paper's design choices:
+
+| Module description signal | Suggested `resource_impact` |
+|---|---|
+| "we add a P2 detection branch" / extra detection scale | `vram_4x` |
+| "global self-attention over feature map" / dense attention | `vram_4x` |
+| "transformer block on Pk feature" (k ≤ 4) | `vram_4x` (P2/P3 features are large) |
+| "transformer block on Pk feature" (k ≥ 5) | `vram_2x` (smaller features) |
+| Single SE/CBAM attention block per stage | `vram_2x` |
+| "we wrap one Conv with attention" / single-layer change | (omit field — no auto-halve) |
+| Loss-only changes (WIoU, Slide Loss, focal variants) | (omit field) |
+| Hyperparameter changes (mixup, copy-paste, lr) | (omit field) |
+
+When in doubt, **prefer to omit** the field — under-tagging means the
+experiment runs at full batch and may CPU-fallback (loud signal: low it/s
+in `logs/loop_<N>.log`); over-tagging unnecessarily halves batch and slows
+the experiment without need. Loud failure beats silent over-correction.
+
+Format in modules.md:
+
+```
+- **resource_impact**: vram_4x
+```
+
+Field is optional — modules without `resource_impact` get the default
+behaviour (no auto-halve).
 
 
 ---

@@ -320,7 +320,7 @@ neck, wrap a forward pass. It cannot do **structural** changes — inserting a
 new layer mid-backbone shifts every downstream layer index, and pretrained
 weights stop aligning. That's what `weight_transfer.py` handles.
 
-### Two injection modes
+### Two injection modes (three from v1.9)
 
 Autoresearch picks one per iteration based on the module's `Integration mode`
 field in `modules.md`:
@@ -329,7 +329,7 @@ field in `modules.md`:
 |---|---|---|
 | `hook` (default, v1.6) | `inject_modules(model)` branch | Layer swap, forward wrap, block replacement (same index layout) |
 | `yaml_inject` (v1.7) | `weight_transfer.build_custom_model_with_injection` | Insert new layer(s) into YAML, rebuild model, transfer pretrained weights according to computed layer_map |
-| `full_yaml` (reserved v1.8+) | Agent writes full custom YAML | Arbitrary structural changes — NotImplementedError in v1.7 |
+| `full_yaml` (v1.9) | `weight_transfer.apply_yaml_spec` | Agent writes complete custom YAML; helper computes layer_map (auto class+position OR explicit override) and transfers per scope (backbone / backbone+neck / full) |
 
 Unknown `Integration mode` values fall back to `hook` with a stderr warning
 (warn-not-reject policy in `modules_md.py`).
@@ -362,6 +362,85 @@ When autoresearch picks a pending module with `Integration mode: yaml_inject`:
 5. The returned `YOLO` instance is then passed through `inject_modules(model)`
    for any hook-mode modules that coexist in the same run.
 
+### How `full_yaml` works (v1.9)
+
+When autoresearch picks a pending module with `Integration mode: full_yaml`:
+
+1. autoresearch reads the module's `Integration notes`, which (per
+   `paper-finder/SKILL.md § Phase 5 full_yaml Integration notes`) contains a
+   complete YAML template.
+2. autoresearch writes that YAML to disk as `<base_stem>_<module>.yaml`
+   (filename matters — ultralytics' `guess_model_scale` reads it via regex).
+3. autoresearch writes `arch_spec.json` with `mode: full_yaml`,
+   `custom_yaml_path`, `layer_map_strategy`, `transfer_scope`, optionally
+   `layer_map_override`.
+4. autoresearch flips `ARCH_INJECTION_ENABLED = True` in Section ②.
+5. autoresearch runs `train.py`. Section ④ branches on
+   `ARCH_INJECTION_ENABLED` → `build_custom_model_with_injection(...)` →
+   dispatches on `spec["mode"]` → `apply_yaml_spec(...)`.
+6. `apply_yaml_spec` does:
+   - Validate args (layer_map_strategy ∈ {auto, override}, transfer_scope ∈
+     {backbone, backbone+neck, full}, override list non-empty if strategy=
+     override) — these checks run before importing ultralytics so unit tests
+     can exercise error paths.
+   - Load base `.pt` and parse its embedded YAML.
+   - Load the agent's custom YAML from disk; verify it has top-level
+     `backbone` and `head` sections.
+   - Compute layer_map: `auto` → class+position heuristic with monotonic
+     cursor across layers in `transfer_scope`; `override` → resolve the
+     `[{base_idx, custom_idx}]` list to a dict.
+   - In strict mode + auto strategy, verify every parameter-bearing base
+     layer in transfer_scope was paired. Raise with unpaired class list if
+     not — this catches "agent renamed Conv → SPDConv" cases that would
+     otherwise silently leave layers at random init.
+   - Build the custom model via `YOLO(custom_yaml_path)`.
+   - `transfer_weights(...)` with computed layer_map.
+   - `force_lazy_build(...)` — same as yaml_inject path; in case the custom
+     YAML uses `Lazy*` wrappers.
+   - `register_stage2_callback(...)` — same hook-survival mechanism as
+     yaml_inject.
+   - Return the YOLO instance.
+7. Same as yaml_inject, the result is passed through `inject_modules(model)`
+   for any coexisting hook-mode modules.
+
+#### Choosing `transfer_scope`
+
+| Scope | Transfers FROM | Use when |
+|---|---|---|
+| `backbone` (default) | base backbone only | The default. Head class counts often differ; neck topology often differs in full_yaml; backbone is usually the most robust transfer target. |
+| `backbone+neck` | base backbone + everything before first Detect-family layer | When ONLY the head is being replaced (e.g. DETR decoder atop preserved CSP-Darknet + PAFPN). |
+| `full` | all base layers | Almost always wrong for full_yaml — equivalent to insertions mode minus head ref shifting. Use insertions mode instead. |
+
+#### Choosing `layer_map_strategy`
+
+`auto` works when:
+- Base and custom share class names for the layers you want transferred
+- The order of those classes is the same in both
+- Counts match (or custom has more — the auto cursor stops once base is
+  exhausted)
+
+`override` is required when:
+- Custom renames classes (Conv → SPDConv) — otherwise auto leaves the
+  renamed layers unpaired
+- Custom reorders or duplicates classes in ways auto's monotonic cursor
+  can't infer
+- You want to skip specific base layers from transfer (provide
+  `{base_idx: N}` without `custom_idx` — interpreted as "skip layer N")
+
+#### full_yaml-specific failure modes
+
+- **Missing `backbone` or `head` section in custom YAML** → `ValueError`.
+  The agent's YAML is malformed.
+- **Strict + auto + unpaired layers** → `RuntimeError` with unpaired indices
+  listed. Either revise custom YAML to preserve those classes, switch to
+  `override`, or set `strict=False` (loses correctness guarantees).
+- **Filename scale mismatch** → ultralytics builds wrong scale silently.
+  Mitigated by autoresearch's `<base_stem>_<module>.yaml` naming pattern;
+  still possible if `WEIGHTS` itself doesn't encode scale.
+- **per-entry strict transfer fails** → same as yaml_inject path. Class
+  pairing is correct but parameter shapes don't match (e.g. base Conv has
+  64 channels but custom Conv at the paired index has 128). Crash, discard.
+
 ### `ARCH_INJECTION_SPEC_FILE` format
 
 Pointed to by Section ② `ARCH_INJECTION_SPEC_FILE`. JSON, validated by
@@ -392,6 +471,41 @@ Positions:
 
 Scopes: `backbone`, `neck`, `head`, `all`. For `at_index` mode, `scope` is
 enforced as an assertion (out-of-scope index raises).
+
+#### v1.9 — full_yaml example
+
+```json
+{
+  "mode": "full_yaml",
+  "custom_yaml_path": "yolo26x_bifpn.yaml",
+  "layer_map_strategy": "auto",
+  "transfer_scope": "backbone",
+  "strict": true
+}
+```
+
+With explicit override (when `auto` would mis-pair):
+
+```json
+{
+  "mode": "full_yaml",
+  "custom_yaml_path": "yolo26x_convnext.yaml",
+  "layer_map_strategy": "override",
+  "layer_map_override": [
+    {"base_idx": 0,  "custom_idx": 0},
+    {"base_idx": 1,  "custom_idx": 1},
+    {"base_idx": 5,  "custom_idx": 8},
+    {"base_idx": 9,  "custom_idx": 13}
+  ],
+  "transfer_scope": "backbone",
+  "strict": true
+}
+```
+
+The override list may include partial entries — `{"base_idx": 5}` (no
+`custom_idx`) means "skip transferring base layer 5 entirely". This is the
+correct way to handle base layers with no compatible counterpart in the
+custom YAML.
 
 ### Lazy-wrapper contract
 

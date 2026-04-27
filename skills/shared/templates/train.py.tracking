@@ -129,7 +129,7 @@ def train(model) -> str:
         time=TIME_BUDGET / 3600,
         imgsz=IMGSZ,
         freeze=FREEZE_LAYERS,
-        project=str(CKPT_DIR.parent),
+        project=str(CKPT_DIR.parent.resolve()),  # v1.8 — abs path defeats ULTRALYTICS_RUNS_DIR / SETTINGS races
         name=CKPT_DIR.name,
         seed=SEED,
         optimizer=OPTIMIZER,
@@ -170,7 +170,29 @@ def print_metrics(metrics, model, best_ckpt: str) -> None:
     print(f"trained_weights:  {best_ckpt}")
 
 
+def _write_run_start_sentinel():
+    """v1.9.2 — see train.py.detection for rationale."""
+    import os, subprocess
+    from datetime import datetime
+    iso = datetime.now().isoformat(timespec="seconds")
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except Exception:
+        commit = "no-git"
+    print(f"__RUN_START__: {iso} {commit} {os.getpid()}", flush=True)
+
+
+def _write_run_end_sentinel(exit_code: int):
+    """v1.9.2 — see train.py.detection for rationale."""
+    from datetime import datetime
+    iso = datetime.now().isoformat(timespec="seconds")
+    print(f"__RUN_END__: {iso} {exit_code}", flush=True)
+
+
 def main() -> int:
+    _write_run_start_sentinel()
     set_seed(SEED)
 
     try:
@@ -211,4 +233,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = 99
+    try:
+        rc = main()
+    finally:
+        _write_run_end_sentinel(rc)
+    sys.exit(rc)

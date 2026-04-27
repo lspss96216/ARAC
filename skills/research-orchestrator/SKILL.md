@@ -367,6 +367,14 @@ Apply it in both branches:
       "task":                  cfg["task"]["description"],
       "task_type":             cfg["task"].get("task_type", "object_detection"),
       "dataset_root":          cfg["paths"]["dataset_root"],   # C3 — renamed
+      # v1.9.2 — absolute project root, so file ops never depend on cwd.
+      # Bug this fixes: agent in multi-project working dir reads neighbour's
+      # run.log and parses metrics from the wrong experiment. cwd cannot be
+      # trusted; this canonical absolute path is the SOURCE OF TRUTH for
+      # every file operation in the pipeline.
+      "project_root":          str(pathlib.Path(
+                                   cfg.get("paths", {}).get("project_root", ".")
+                               ).resolve()),
       "stage":                 "init",
       # skill outputs
       "paper_finder_done":     False,
@@ -385,7 +393,16 @@ Apply it in both branches:
       "best_tiebreak_value":   None,        # A2
       "stall_count":           0,
       "loop_count":            0,
+      "vanilla_baseline_done": False,           # v1.8 — Loop 0 vanilla baseline
+      "no_improvement_loops":  0,               # v1.8 — for autonomous stop trigger
+      "pretrain_dead_config_warned": False,     # v1.8 — one-time warning latch
+      "batch_size_pre_autohalve": None,         # v1.9 — restore BATCH_SIZE after resource_impact halve
       "seed":                  ar.get("loop", {}).get("seed", 42),
+      # v1.9.3 — initial BATCH_SIZE for train.py. None signals "use template default"
+      # (currently 16). Stage 0 Step 3 patches train.py with this if not None.
+      # Unlike IMGSZ/SEED/TIME_BUDGET, this is NOT locked — autoresearch may
+      # halve dynamically (resource_impact auto-halve, crash-pause halve, OOM).
+      "initial_batch_size":    ar.get("loop", {}).get("initial_batch_size"),
       "paper_finder_expansions": 0,
       "consecutive_crashes":   0,           # A3/C8
       "param_only_streak":     0,
@@ -427,6 +444,11 @@ Apply it in both branches:
       "max_paper_finder_expansions": stopping.get("max_paper_finder_expansions", 3), # C9
       "stop_requested":        False,                                                # C9
       "stop_reason":           None,                                                 # C9
+      # v1.8 — autonomous stop triggers (all optional; null = no limit)
+      # Loaded from research_config.yaml → orchestrator.stopping
+      "max_no_improvement_loops":  stopping.get("max_no_improvement_loops"),
+      "max_total_loops":           stopping.get("max_total_loops"),
+      "max_wallclock_hours":       stopping.get("max_wallclock_hours"),
       "baseline_snapshot":     None,                                                 # reserved for future B2
       # advanced
       "results_tsv":           adv.get("results_tsv", "results.tsv"),
@@ -1005,6 +1027,29 @@ for script in scripts_to_lock:
     lock_variable(script, "OPTIMIZER", repr(init_optimizer))
 state["optimizer"] = init_optimizer
 
+# v1.9.3 — BATCH_SIZE initial set. Same pattern as OPTIMIZER: initialised
+# from yaml but NOT locked, so autoresearch can halve dynamically:
+#   - resource_impact auto-halve (v1.9, modules tagged vram_4x/2x)
+#   - crash-pause halve (v1.7.6, after 3 consecutive crashes)
+#   - OOM detected by agent
+# yaml field: autoresearch.loop.initial_batch_size. If unset (None), the
+# template's default (16) stays in place — preserves v1.9.2 behaviour for
+# users who haven't migrated their yaml.
+init_batch = state.get("initial_batch_size")
+if init_batch is not None:
+    if not isinstance(init_batch, int) or init_batch < 1:
+        raise RuntimeError(
+            f"research_config.yaml → autoresearch.loop.initial_batch_size "
+            f"must be a positive integer, got {init_batch!r}. Set to a "
+            f"concrete batch size (e.g. 64 for H100 80GB, 8 for smaller GPUs) "
+            f"or remove the field to use the template default of 16."
+        )
+    for script in scripts_to_lock:
+        lock_variable(script, "BATCH_SIZE", init_batch)
+    print(f"[orchestrator] BATCH_SIZE initialised to {init_batch} from yaml")
+else:
+    print(f"[orchestrator] BATCH_SIZE: yaml unset, using template default (16)")
+
 # v1.7.2 — persist the resolved IMGSZ in pipeline_state so downstream skills
 # (dataset-hunter's pretrain.py scaffold, autoresearch's Step 5.5 repair
 # probes) don't each have to re-read research_config.yaml and re-implement
@@ -1015,10 +1060,16 @@ pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
 
 These three values (TIME_BUDGET, SEED, IMGSZ) are fixed for the entire pipeline
 run — identical across every experiment so that keep/discard decisions reflect
-the change being tested, not randomness or resolution differences. OPTIMIZER is
-**initialised** to the user's yaml choice (default `SGD`) but not locked —
-autoresearch may swap it to test other optimizers (e.g. AdamW) but **must
-never** set it to `'auto'` (see Critical Rule #15 in autoresearch SKILL).
+the change being tested, not randomness or resolution differences.
+
+OPTIMIZER and BATCH_SIZE are **initialised** from yaml but NOT locked.
+- OPTIMIZER: default `SGD` from `autoresearch.optimizer`. autoresearch may
+  swap it to test other optimizers (e.g. AdamW) but **must never** set it
+  to `'auto'` (see Critical Rule #15 in autoresearch SKILL).
+- BATCH_SIZE: from `autoresearch.loop.initial_batch_size` (v1.9.3+).
+  autoresearch may halve it dynamically (resource_impact auto-halve,
+  crash-pause halve, OOM). yaml only sets the starting point. If yaml
+  doesn't set it, the template default (16) is used.
 
 ### Step 4 — Mark autoresearch running
 
@@ -1158,6 +1209,46 @@ if state.get("paper_finder_expansions", 0) >= max_exp:
         state["stop_reason"] = (f"{max_exp} paper-finder expansions produced "
                                 f"no new pending modules")
 
+# v1.8 — Trigger 4: no improvement for N consecutive loops
+#
+# Tracks when autoresearch has been generating only discards. Useful for
+# unattended runs where the user wants to stop once the loop has clearly
+# converged. Counter is incremented in autoresearch Step 9 on every
+# discard and reset to 0 on every keep.
+max_no_imp = state.get("max_no_improvement_loops")
+if max_no_imp is not None and state.get("no_improvement_loops", 0) >= max_no_imp:
+    state["stop_requested"] = True
+    state["stop_reason"] = (
+        f"{max_no_imp} consecutive iterations without a keep — convergence"
+    )
+
+# v1.8 — Trigger 5: hard cap on total iterations
+#
+# Distinct from `loop_iterations` (Trigger 2): loop_iterations is the
+# user's "I want exactly N iterations and then summary" intent. This is
+# the safety brake: "regardless of intent, never go above this". Useful
+# when iterations: null is set but you still want a sanity ceiling.
+max_total = state.get("max_total_loops")
+if max_total is not None and state.get("loop_count", 0) >= max_total:
+    state["stop_requested"] = True
+    state["stop_reason"] = f"hit max_total_loops cap ({max_total})"
+
+# v1.8 — Trigger 6: wallclock cap
+#
+# For long-running unattended jobs. started_at lives in state as ISO8601;
+# compute elapsed hours. Imprecise to ~ minutes (only checked once per
+# loop after a TIME_BUDGET-long run).
+max_hours = state.get("max_wallclock_hours")
+if max_hours is not None and state.get("started_at"):
+    from datetime import datetime
+    started = datetime.fromisoformat(state["started_at"])
+    elapsed_hours = (datetime.now() - started).total_seconds() / 3600
+    if elapsed_hours >= max_hours:
+        state["stop_requested"] = True
+        state["stop_reason"] = (
+            f"wallclock {elapsed_hours:.1f}h >= {max_hours}h cap"
+        )
+
 pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
 
 if state["stop_requested"]:
@@ -1169,6 +1260,69 @@ Users can also stop with Ctrl+C or a "stop" command; those paths remain
 unchanged. Stage 4 reads `stop_reason` for the summary.
 
 ### Step 7 — Automatic pretrain trigger (no user interaction)
+
+#### v1.8 — Semantic clarification of the two pretrain control fields
+
+Two fields in pipeline_state interact here, and v1.7.x docs left their
+relationship implicit. From `thinking_log.md` of a real run, an agent
+interpreted `pretrain_offer_declined: true` as "permanently disable the
+auto-trigger" while the user's yaml had `optional_pretrain_trigger.enabled:
+true`, expecting the trigger to fire after stalls. The trigger never
+fired. v1.8 makes the contract explicit:
+
+| Field | Type | Set by | Meaning |
+|---|---|---|---|
+| `pretrain_offer_declined` | runtime state (boolean, mutable) | Stage 2 path or this Step 7 | "Skip the auto-trigger NEXT time it would fire". Reset to `false` after a successful pretrain or by user-edit; otherwise stays sticky. |
+| `optional_pretrain_trigger.enabled` | yaml config (boolean, immutable in run) | User in research_config.yaml | "If `enabled: true`, the auto-trigger MAY fire. If `enabled: false`, this whole Step 7 is dead code — pretrain only runs at Stage 2." |
+| `optional_pretrain_trigger.stalled_loops_required` | yaml config (int) | User | How many consecutive no-improvement loops before the trigger considers firing. Only meaningful when `enabled: true`. |
+
+The trigger fires iff **all three** hold:
+1. `optional_pretrain_trigger.enabled == true` (yaml says trigger is allowed)
+2. `pretrain_offer_declined == false` (no recent decline)
+3. Stall counter `>= stalled_loops_required`
+
+A common user mistake (also documented in real runs):
+
+```yaml
+# Ambiguous configuration the agent will interpret defensively:
+optional_pretrain_trigger:
+  enabled: true
+  stalled_loops_required: 5
+# But Stage 2 sets pretrain_offer_declined = true, making the trigger
+# permanently dormant.
+```
+
+If the user wants the trigger to genuinely fire on stall, Stage 2 must
+NOT set `pretrain_offer_declined: true`. v1.8 Stage 2's "skip pretrain"
+path now distinguishes:
+
+- `dataset_hunter.enabled: false` → never pretrain → `pretrain_offer_declined: true`
+  (correct: agent declined; auto-trigger should not override)
+- `dataset_hunter.pretrain.time_budget_sec: 0` → skip but allow auto-trigger →
+  `pretrain_offer_declined: false`
+  (the v1.7.5 fast-path already does this; documenting the rationale)
+
+If `optional_pretrain_trigger.enabled` is true AND
+`pretrain_offer_declined` is true, orchestrator logs a one-time warning at
+loop start so the user notices the dead config:
+
+```python
+if (cfg.get("orchestrator", {})
+       .get("optional_pretrain_trigger", {})
+       .get("enabled") is True
+    and state.get("pretrain_offer_declined") is True
+    and not state.get("pretrain_dead_config_warned")):
+    print(
+        "[orchestrator] WARNING: optional_pretrain_trigger.enabled=true "
+        "but pretrain_offer_declined=true — auto-trigger will never fire. "
+        "Set dataset_hunter.pretrain.time_budget_sec: 0 (instead of "
+        "dataset_hunter.enabled: false) if you want the trigger to fire on stall."
+    )
+    state["pretrain_dead_config_warned"] = True
+    pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+```
+
+#### Trigger conditions
 
 If `pretrain_skipped == true` AND `pretrain_offer_declined == false`
 AND `pretrain_attempt_failed == false` (B3)

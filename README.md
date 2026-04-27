@@ -9,6 +9,65 @@ keeping what improves the primary metric.
 Supports `task_type: object_detection` and `object_tracking`, driven entirely
 by `research_config.yaml`. No skill hardcodes a specific metric.
 
+**This is v1.10** — paper-finder source diversification + dedup. Adds
+HuggingFace Papers as Source 6 (ML-specialised ranking, fixes PwC
+coverage gaps) and a new Phase 2.5 cross-source dedup step (collapses
+the same paper appearing across arXiv / PwC / S2 / HF). SKILL-only
+changes — no new Python modules, no new dependencies, no new tests.
+Drop-in. See `CHANGELOG_v1.10.md` for what was deferred (Phase 3.5
+read methodology, Phase 5 citation graph) pending v1.9.3 real-run
+feedback.
+
+**This is v1.9.3** — patch release. Adds
+`autoresearch.loop.initial_batch_size` yaml field. v1.6 → v1.9.2
+hardcoded train.py's initial BATCH_SIZE to template default (16) with
+no yaml knob; users on H100 80GB ran experiments at batch=16 with no
+obvious way to change it. v1.9.3 makes the starting value
+yaml-configurable while preserving autoresearch's runtime halve
+authority (resource_impact, crash-pause, OOM). Drop-in. See
+`CHANGELOG_v1.9.3.md`.
+
+**This is v1.9.2** — patch release. Fixes cross-project run.log
+pollution: an agent in the wrong cwd was reading a neighbour project's
+run.log and parsing metrics from a different experiment, silently
+corrupting results.tsv. 4 layers of defence: (1) `state["project_root"]`
+absolute path canonicalised at Stage 0, (2) `__RUN_START__` /
+`__RUN_END__` sentinels in run.log, (3) Step 5 prelude with cwd-lock +
+stale-file cleanup + start-time recording, (4) Step 6 pre-parse
+freshness check via new `check_run_log_fresh` invariant. Total tests
+123 → 129. Drop-in. See `CHANGELOG_v1.9.2.md`.
+
+**This is v1.9.1** — patch release. Wires up
+`autoresearch.module_priority` yaml field which had been dead config
+since v1.6 (yaml example listed it; no skill ever read it). Same
+class as v1.7.3's `preferred_locations` fix. Tokens omitted from the
+list are now SKIPPED ENTIRELY, enabling architecture-only or
+hyperparameter-only runs via yaml. Drop-in. See
+`CHANGELOG_v1.9.1.md`.
+
+**This is v1.9** — `full_yaml` mode + resource-impact auto-halve.
+Implements `weight_transfer.apply_yaml_spec` end-to-end (the v1.7-v1.8
+placeholder that raised `NotImplementedError`), unblocking the structural-
+rewrite class of experiments (BiFPN replacing PAFPN, DETR-style decoders,
+ConvNeXt backbones, P2 head architectures). Adds autoresearch dispatch
+branch + paper-finder Phase 5 heuristic + modules.md schema +
+train-script-spec.md chapter for full_yaml mode. Separately adds
+`resource_impact` field on modules.md (vram_4x / vram_2x /
+cpu_fallback_risk) and autoresearch Step 3 auto-halve to prevent the
+silent CPU-fallback class of failures observed in real runs. Total
+python tests **106 → 123**. Drop-in. See `CHANGELOG_v1.9.md`.
+
+**This is v1.8** — production-usability + agent contract enforcement.
+Combines real-world fixes from a 31-loop production run (3 weight_transfer
+bugs, base-aware after_class, project= absolute path, mandatory Loop 0
+vanilla baseline) with autonomous stop triggers (no_improvement_loops,
+max_total_loops, max_wallclock_hours), pretrain-trigger semantic clarification,
+description format contract, per-loop log archive, expanded discoveries.md
+categories, and a new **`shared/invariants.py`** module (23 tests) that
+catches agent contract violations at runtime. Total python tests **82 → 106**.
+**No new architectural capability** — full_yaml mode reserved for v1.9.
+Drop-in. See `CHANGELOG_v1.8.md`.
+
 **This is v1.7.7** — production-readiness for hook + yaml_inject.
 Six fixes that make architectural injection actually work end-to-end:
 yaml_inject's silent forward-pass crash from unshifted head Concat
@@ -124,21 +183,29 @@ transparently via `shared/state_migrate.py`.
 ```
 skills/                                     → copy to ~/.claude/skills/
 ├── shared/
-│   ├── modules_md.py                       · modules.md parser (12 unit tests) [v1.7]
+│   ├── modules_md.py                       · modules.md parser (23 unit tests) [v1.7+v1.9]
 │   ├── state_migrate.py                    · pipeline_state.json schema migration [v1.6]
 │   ├── parse_metrics.py                    · shared stdout/json/csv metric extractor [v1.6]
 │   ├── weight_transfer.py                  · yaml_inject + pretrained transfer [v1.7]
 │   │                                         + Step 5.5 repair primitives  [v1.7.1]
+│   │                                         + update_head_refs (head ref shifting) [v1.7.7]
+│   │                                         + compute_layer_map fix + filename scale suffix [v1.8]
+│   │                                         + apply_yaml_spec full_yaml mode [v1.9]
+│   ├── hook_utils.py                       · PicklableHook + reapply_on_rebuild (13 tests) [v1.7.7]
+│   ├── invariants.py                       · runtime contract checks (23 tests) [v1.8]
 │   ├── train-script-spec.md                · train.py / track.py contract
 │   ├── file-contracts.md                   · schemas for all cross-skill files
-│   ├── test_modules_md.py                  · parser unit tests (12)
+│   ├── results-tsv-guide.md                · user-facing TSV reading guide [v1.8]
+│   ├── test_modules_md.py                  · parser unit tests (23) [v1.7+v1.9]
 │   ├── test_templates.py                   · template compliance checker
-│   ├── test_weight_transfer.py             · weight_transfer unit tests (36) [v1.7.1]
+│   ├── test_weight_transfer.py             · weight_transfer tests (61) [v1.7.1+v1.7.7+v1.8+v1.9]
+│   ├── test_hook_utils.py                  · hook_utils tests (13) [v1.7.7]
+│   ├── test_invariants.py                  · invariants tests (23) [v1.8]
 │   └── templates/
 │       ├── train.py.detection              · scaffold for object_detection
 │       ├── train.py.tracking               · detector-training half of tracking
 │       ├── track.py.tracking               · tracker + TrackEval half
-│       └── arch_spec.schema.json           · JSON schema for ARCH_INJECTION_SPEC [v1.7]
+│       └── arch_spec.schema.json           · JSON schema for ARCH_INJECTION_SPEC [v1.7+v1.9]
 ├── research-orchestrator/SKILL.md          ← Stage 0–4 master controller
 ├── paper-finder/SKILL.md                   ← Stage 1: base_model.md + modules.md
 ├── dataset-hunter/SKILL.md                 ← Stage 2: pretrain corpus + self-eval
@@ -158,6 +225,12 @@ CHANGELOG_v1.7.4.md                         · tie-breaking rule (don't ask, pic
 CHANGELOG_v1.7.5.md                         · onboarding hardening (11 fixes)
 CHANGELOG_v1.7.6.md                         · 4 latent bugs + pyproject.toml retreat
 CHANGELOG_v1.7.7.md                         · hook + yaml_inject production-readiness
+CHANGELOG_v1.8.md                           · production-usability + agent contracts
+CHANGELOG_v1.9.md                           · full_yaml mode + resource-impact auto-halve
+CHANGELOG_v1.9.1.md                         · module_priority yaml dead-config fix
+CHANGELOG_v1.9.2.md                         · cross-project run.log pollution fix
+CHANGELOG_v1.9.3.md                         · initial BATCH_SIZE configurable from yaml
+CHANGELOG_v1.10.md                          · paper-finder HF Papers + cross-source dedup
 ```
 
 ---
@@ -330,12 +403,57 @@ SDK (`pip install firecrawl-py`) per the caveat in paper-finder Phase 2.
 
 ## Versions
 
-See `CHANGELOG_v1.7.7.md`, `CHANGELOG_v1.7.6.md`, `CHANGELOG_v1.7.5.md`,
-`CHANGELOG_v1.7.4.md`, `CHANGELOG_v1.7.3.md`, `CHANGELOG_v1.7.2.md`,
-`CHANGELOG_v1.7.1.md`, `CHANGELOG_v1.7.md`, and `CHANGELOG_v1.6.md` for
-recent release notes.
+See `CHANGELOG_v1.10.md`, `CHANGELOG_v1.9.3.md`, `CHANGELOG_v1.9.2.md`, `CHANGELOG_v1.9.1.md`,
+`CHANGELOG_v1.9.md`, `CHANGELOG_v1.8.md`, `CHANGELOG_v1.7.7.md`,
+`CHANGELOG_v1.7.6.md`, `CHANGELOG_v1.7.5.md`, `CHANGELOG_v1.7.4.md`,
+`CHANGELOG_v1.7.3.md`, `CHANGELOG_v1.7.2.md`, `CHANGELOG_v1.7.1.md`,
+`CHANGELOG_v1.7.md`, and `CHANGELOG_v1.6.md` for recent release notes.
 
-- **v1.7.7** (current): production-readiness for hook + yaml_inject. Six
+- **v1.10** (current): paper-finder source diversification + dedup.
+  Adds HuggingFace Papers as Source 6 (ML-specialised ranking, fills
+  PwC coverage gaps) + Phase 2.5 cross-source dedup (collapses
+  duplicate papers across arXiv / PwC / S2 / HF / Local, merges
+  per-source metadata fields up). All SKILL-only changes — no new
+  Python modules, no new dependencies, no new tests. Drop-in.
+- **v1.9.3**: patch — initial BATCH_SIZE configurable from
+  yaml. New `autoresearch.loop.initial_batch_size` field; Stage 0
+  patches train.py with the value (NOT locked, so autoresearch may
+  halve dynamically). Falls back to template default 16 if unset.
+  Drop-in.
+- **v1.9.2**: patch — cross-project run.log pollution fix.
+  Real-world bug: agent in wrong cwd was reading neighbour project's
+  run.log and parsing metrics from a different experiment, silently
+  corrupting results.tsv. 4 layers of defence: project_root absolute
+  path canonicalised at Stage 0, `__RUN_START__`/`__RUN_END__` sentinels
+  in run.log, Step 5 prelude with cwd-lock + stale-file cleanup, Step 6
+  pre-parse freshness check via new `check_run_log_fresh` invariant.
+  +6 tests (123 → 129). Drop-in.
+- **v1.9.1**: patch — wires up the `autoresearch.module_priority`
+  yaml field. Dead config since v1.6; now actually controls priority
+  order. Tokens omitted from the list are SKIPPED ENTIRELY, enabling
+  architecture-only (`[modules_md_pending]`) or hyperparameter-only
+  (`[zero_param_changes]`) runs. Drop-in.
+- **v1.9**: full_yaml mode + resource-impact auto-halve.
+  Implements `weight_transfer.apply_yaml_spec` end-to-end (was a
+  placeholder in v1.7-v1.8), unblocking structural rewrites: BiFPN
+  replacing PAFPN, DETR-style decoders, ConvNeXt backbones, P2 head
+  architectures. New full_yaml dispatch in autoresearch + paper-finder
+  Phase 5 heuristic + arch_spec schema + spec doc chapter. Separately
+  adds `resource_impact` field on modules.md (vram_4x / vram_2x /
+  cpu_fallback_risk) and Step 3 auto-halve to prevent silent
+  CPU-fallback failures. 17 new tests; total 123. Drop-in.
+- **v1.8**: production-usability + agent contract enforcement.
+  Real-run regression fixes (B1-B5: compute_layer_map off-by-one, yaml
+  filename scale suffix, base-aware after_class, project= absolute path,
+  Loop 0 vanilla baseline). Pipeline polish (C1-C6: 3 autonomous stop
+  triggers, pretrain-trigger semantic clarification, description format
+  contract, expanded discoveries categories, per-loop log archive).
+  New `shared/invariants.py` module with 23 tests for runtime contract
+  enforcement (locked variables, OPTIMIZER not auto, section markers).
+  User-facing `results-tsv-guide.md`. Total python tests **82 → 106**.
+  No new architectural capability — full_yaml mode reserved for v1.9.
+  Drop-in.
+- **v1.7.7**: production-readiness for hook + yaml_inject. Six
   fixes — head ref shifting in `update_head_refs` (yaml_inject was
   silently broken from v1.7 to v1.7.6); `PicklableHook` + `reapply_on_rebuild`
   in new `shared/hook_utils.py` (hook mode was silently broken from

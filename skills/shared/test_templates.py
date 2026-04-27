@@ -33,6 +33,13 @@ REQUIRED_FUNCTIONS = ["def inject_modules", "def main"]
 # sufficient check — template_smoke test covers the full flow end-to-end.
 REQUIRED_BRANCHES = ["if ARCH_INJECTION_ENABLED", "build_custom_model_with_injection"]
 
+# v1.9.2 — every train.py / track.py must write run.log sentinels so Step 6
+# freshness check can detect cross-project run.log pollution.
+REQUIRED_SENTINELS = ["__RUN_START__", "__RUN_END__"]
+# track.py is the second leg of a tracking pipeline; train.py wrote the
+# RUN_START at the top, so track.py only needs RUN_END.
+REQUIRED_SENTINELS_TRACK_ONLY = ["__RUN_END__"]
+
 
 def check(path, kind="train"):
     src = pathlib.Path(path).read_text()
@@ -46,6 +53,7 @@ def check(path, kind="train"):
         missing += [v for v in REQUIRED_VARIABLES if not re.search(rf"(?m)^{v}\s*=", src)]
         missing += [f for f in REQUIRED_FUNCTIONS if f not in src]
         missing += [b for b in REQUIRED_BRANCHES if b not in src]
+        missing += [s for s in REQUIRED_SENTINELS if s not in src]
     elif kind == "track":
         # track.py only needs SEED (for RNG) and TIME_BUDGET (spec placeholder)
         for v in ["SEED", "TIME_BUDGET"]:
@@ -55,6 +63,7 @@ def check(path, kind="train"):
             missing.append("def apply_tracker_modules")
         if "def main" not in src:
             missing.append("def main")
+        missing += [s for s in REQUIRED_SENTINELS_TRACK_ONLY if s not in src]
 
     return missing
 

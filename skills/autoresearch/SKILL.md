@@ -133,7 +133,11 @@ Each loop takes ~20 minutes (TIME_BUDGET) plus a few seconds for startup and eva
 
    def log_discovery(message: str, loop: int = 0, category: str = "observation") -> None:
        """Append to discoveries.md atomically. Never blocks on user."""
-       VALID = {"observation", "limitation", "strategy_shift", "bug_workaround"}
+       # v1.8 — expanded category set; see § Categories guide
+       VALID = {
+           "observation", "limitation", "strategy_shift", "bug_workaround",
+           "agent_violation", "misclassification", "resource_constraint",
+       }
        if category not in VALID:
            category = "observation"
        entry = (
@@ -164,7 +168,29 @@ combination is promising, a paper's method doesn't apply to this architecture.
 
 When you notice something, call `log_discovery(...)` (Setup Step 9) and continue.
 
-Categories: `observation` / `limitation` / `strategy_shift` / `bug_workaround`
+#### v1.8 — Categories guide
+
+Pick the category that best matches the observation. The parser accepts
+any of these and any unknown category falls back silently to `observation`.
+Choosing the right one helps the post-run review surface different kinds
+of findings cleanly.
+
+| Category | Use when... | Example |
+|---|---|---|
+| `observation` | Empirical pattern noticed across multiple loops | "Both WIoU and Slide Loss shift mAP from head to tail classes" |
+| `limitation` | Pipeline / model / env boundary the loop hit but cannot fix | "yaml_inject is INSERT-only; SPD-Conv requires REPLACE semantics" |
+| `bug_workaround` | A real bug observed; agent is working around it but it should be fixed | "compute_layer_map off-by-one — patched locally, see ARAC v1.8 #B1" |
+| `strategy_shift` | Agent decides to change loop direction (e.g. give up on architecture, focus on hyperparameters) | "Loop 8: 4 architecture experiments cannot be tested at v1.7; pivoting to Priority B hyperparameter sweep" |
+| `agent_violation` | (v1.8) Invariants check caught a contract violation; iteration discarded | "[IMGSZ_locked] in train.py: expected=1920, observed=640" |
+| `misclassification` | paper-finder tagged a module wrong (e.g. yaml_inject when actually full_yaml needed) | "TPH tagged yaml_inject but paper requires full transformer head replacement → would need full_yaml" |
+| `resource_constraint` | VRAM / disk / compute limited which experiments could run | "EMA at batch=64 OOM-fallbacks to CPU assigner, training 3-7× slower; effectively untrainable in equal-budget regime" |
+
+Default to `observation` if no other category fits — the analyst reading
+discoveries.md can re-categorise after the fact, but a missing entry is
+gone forever.
+
+Categories: `observation` / `limitation` / `strategy_shift` / `bug_workaround` /
+`agent_violation` / `misclassification` / `resource_constraint`
 
 ### Examples of what goes into discoveries.md (NOT into chat)
 
@@ -195,6 +221,10 @@ write it to `discoveries.md` instead, and move to the next iteration.
 ## The Loop
 
 ```
+LOOP 0 (vanilla baseline, runs ONCE before the iterative loop):
+  Run train.py with all USE_* flags False, ARCH_INJECTION_ENABLED False.
+  This becomes the row that all later experiments compare against.
+
 LOOP (FOREVER or N times):
   1. Review
   2. Ideate
@@ -207,6 +237,77 @@ LOOP (FOREVER or N times):
   9. Update stall / crash / streak counters in pipeline_state
   10. Repeat
 ```
+
+---
+
+### Loop 0 — Vanilla baseline (v1.8)
+
+Before entering the iterative loop, run **one** training pass with no
+modifications: every `USE_*` flag in train.py set to `False`,
+`ARCH_INJECTION_ENABLED = False`, no hyperparameter tweaks. This establishes
+a "no module" reference that every subsequent keep/discard decision compares
+against.
+
+Why this is a separate step (not "iter 1 picks the first pending module"):
+without a true vanilla number, the first picked module's result becomes the
+"baseline" by default. If that module turns out to underperform a clean
+fine-tune, every subsequent keep/discard compares against an already-bad
+starting point — and the loop can converge to "best of bad options" instead
+of "any actual improvement over no-module".
+
+This step is mandatory and runs even when:
+- `pretrain_done == False` (vanilla on user's base weights)
+- modules.md has 20+ pending entries (vanilla still goes first)
+- The user wants to "skip ahead" (this is the load-bearing baseline)
+
+Skip ONLY if `pipeline_state.vanilla_baseline_done == True` already (e.g.
+resume after Loop 0 already ran).
+
+```python
+import json, pathlib, subprocess
+state = json.loads(pathlib.Path("pipeline_state.json").read_text())
+
+if not state.get("vanilla_baseline_done", False):
+    # Confirm train.py is at vanilla state — no flags flipped, no injection
+    src = pathlib.Path("train.py").read_text()
+    if "ARCH_INJECTION_ENABLED = True" in src:
+        # autoresearch resumed in a non-vanilla state; flip back
+        src = src.replace("ARCH_INJECTION_ENABLED = True",
+                          "ARCH_INJECTION_ENABLED = False")
+        pathlib.Path("train.py").write_text(src)
+    # USE_* flags: pipeline starts with none — first time only there are none
+    # to clear. If autoresearch was resumed, agent should manually verify.
+
+    # Commit vanilla state (will be the comparison ckpt for all later loops)
+    subprocess.run(["git", "add", "train.py"], check=False)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "loop 0: vanilla baseline"],
+        check=False,
+    )
+
+    # Run training (full TIME_BUDGET, no short-test)
+    rc = subprocess.run(
+        f"{state['python_runner']} train.py > run.log 2>&1",
+        shell=True, check=False,
+    ).returncode
+
+    # Parse metrics, write to results.tsv as loop=0, mark as keep (it IS
+    # the baseline by definition — no comparison needed)
+    # Use the same parse_metrics + append_result helpers as later loops.
+    metrics = parse_run_log("run.log")   # see Step 6
+    desc = "vanilla baseline"
+    append_result(loop=0, status="keep", description=desc, metrics=metrics)
+
+    state["vanilla_baseline_done"] = True
+    state["loop_count"] = 1   # next iter will be Loop 1, picks first pending
+    pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+    # Then enter the regular Loop at iteration 1.
+```
+
+After Loop 0 completes, `results.tsv` has one row at loop=0 with
+`description=vanilla baseline`, `status=keep`. The iterative loop starts at
+Loop 1, picks the first pending module per Step 2 priorities, and uses
+Loop 0's row as the comparison baseline (via Step 1's `best_row` lookup).
 
 ---
 
@@ -233,9 +334,134 @@ skips when `best_TIEBREAK is None`.
 
 ### Step 2 — Ideate
 
+#### v1.9.1 — Resolve priority order from yaml
+
+Before walking the priority ladder, read `autoresearch.module_priority`
+from `research_config.yaml`. This lets the user reorder which experiment
+classes get tried first (e.g. force architecture-first, hyperparameter-only
+runs, etc.).
+
+The 5 valid priority tokens map to the priority blocks below:
+
+| Token | Priority block |
+|---|---|
+| `modules_md_pending` | Priority A — paper-backed modules from modules.md |
+| `zero_param_changes` | Priority B — hyperparameters, LR, augmentation |
+| `replacement_changes` | Priority C — swap blocks of similar size |
+| `additive_changes` | Priority D — add new blocks (param count grows) |
+| `combinations` | Priority E — combine 2-3 previously-kept changes |
+
+```python
+import yaml, pathlib
+
+DEFAULT_PRIORITY_ORDER = [
+    "modules_md_pending",
+    "zero_param_changes",
+    "replacement_changes",
+    "additive_changes",
+    "combinations",
+]
+VALID_PRIORITY_TOKENS = set(DEFAULT_PRIORITY_ORDER)
+
+cfg = yaml.safe_load(pathlib.Path("research_config.yaml").read_text()) or {}
+configured = (cfg.get("autoresearch", {}) or {}).get("module_priority")
+
+if not configured:
+    # Unset / empty / null → use default v1.6+ order
+    priority_order = list(DEFAULT_PRIORITY_ORDER)
+elif not isinstance(configured, list):
+    log_discovery(
+        f"autoresearch.module_priority is {type(configured).__name__}, "
+        f"expected list. Falling back to default order.",
+        loop=state.get("loop_count", 0),
+        category="agent_violation",
+    )
+    priority_order = list(DEFAULT_PRIORITY_ORDER)
+else:
+    # Validate tokens, warn on unknown, dedup preserving first occurrence
+    seen = []
+    for tok in configured:
+        if not isinstance(tok, str):
+            continue
+        if tok not in VALID_PRIORITY_TOKENS:
+            log_discovery(
+                f"autoresearch.module_priority contains unknown token "
+                f"{tok!r}. Valid: {sorted(VALID_PRIORITY_TOKENS)}. Skipping.",
+                loop=state.get("loop_count", 0),
+                category="agent_violation",
+            )
+            continue
+        if tok not in seen:
+            seen.append(tok)
+    if seen:
+        priority_order = seen
+    else:
+        # All tokens invalid → fall back rather than walk an empty ladder
+        priority_order = list(DEFAULT_PRIORITY_ORDER)
+
+# priority_order now drives the ladder below. Tokens NOT in the list are
+# entirely skipped — including their pending entries. This lets the user
+# express "architecture only, no hyperparameter sweep" via:
+#   module_priority: [modules_md_pending]
+```
+
+Notes on configuration:
+
+- **Omitted tokens are skipped entirely.** Setting
+  `module_priority: [modules_md_pending]` means the loop will never try
+  hyperparameters, replacements, additions, or combinations — even if
+  `modules_md_pending` is empty. The agent should NOT silently fall back
+  to omitted tokens; respect the user's restriction.
+- **Order matters.** `[zero_param_changes, modules_md_pending]` reverses
+  the default — try hyperparameters first, fall through to paper-backed
+  modules only when no zero-param ideas remain.
+- **`combinations` first is allowed but degenerate.** If `combinations`
+  is the first token and no prior keeps exist (loop just started), the
+  Priority E branch is a no-op and the loop falls through to the next
+  token. This is by design — we trust the user's explicit choice over
+  validating dependency order.
+- **Invalid configurations** (non-list, all-unknown tokens, empty list)
+  fall back to the default 5-token order with a `discoveries.md` warning.
+
+After resolving `priority_order`, walk the ladder in that order. Each
+priority block below documents how to implement it; the ladder loop
+calls into the matching block by token name.
+
+#### Walk the ladder
+
+```python
+chosen = None
+for priority_token in priority_order:
+    if priority_token == "modules_md_pending":
+        chosen = try_priority_modules_md_pending(...)        # Priority A logic
+    elif priority_token == "zero_param_changes":
+        chosen = try_priority_zero_param(...)                # Priority B
+    elif priority_token == "replacement_changes":
+        chosen = try_priority_replacement(...)               # Priority C
+    elif priority_token == "additive_changes":
+        chosen = try_priority_additive(...)                  # Priority D
+    elif priority_token == "combinations":
+        chosen = try_priority_combinations(...)              # Priority E
+    if chosen is not None:
+        break
+
+if chosen is None:
+    # Every enabled priority returned None → trigger stall expansion
+    # (orchestrator's paper-finder retry path; see § Stall trigger)
+    state["stall_count"] = state.get("stall_count", 0) + 1
+    pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+    return   # let orchestrator decide
+```
+
+The functions named `try_priority_*` are conceptual — in practice the
+agent inlines each priority's logic per the blocks below. The loop
+above shows the dispatch contract.
+
+#### The priority blocks
+
 Pick the next change using this priority order:
 
-**Priority A — modules.md pending entries (if file exists)**
+**Priority A — modules.md pending entries (token: `modules_md_pending`)**
 
 Read `modules.md` via the canonical parser — never grep for `Status: pending`, and
 never parse the pipe-table format manually:
@@ -264,7 +490,36 @@ pending = mm.find_pending("modules.md", preferred_locations=preferred)
 #   3. Write order in modules.md (stable tiebreak)
 ```
 
-If `pending` is empty, fall through to Priority B. Otherwise take `pending[0]`.
+If `pending` is empty, fall through to the next enabled priority. Otherwise take `pending[0]`.
+
+#### v1.8 — `pending > 0 but all blocked` semantics
+
+`find_pending` returns entries with `Status: pending`. A separate value
+`Status: blocked` means "paper-finder identified the module but it cannot
+be tested at the current pipeline version" (e.g. needs full_yaml mode in
+v1.7.x, or the agent decided pre-emptively in Loop 8 of the real run).
+
+For the purpose of Priority A and stall detection, **blocked entries
+count as not-pending**:
+
+- `find_pending` already excludes them (returns only `Status: pending`).
+- For stall trigger: orchestrator's "no new pending modules" check uses
+  `mm.count_pending(...)` which only counts pending. If the only
+  remaining entries are blocked, `count_pending` returns 0 and stall
+  fires — correctly recognising that we've run out of testable ideas
+  even though `modules.md` is non-empty.
+
+Concrete example (real run): after Loop 8, modules.md had 4 entries with
+`Status: blocked` (BiFPN, P2 head, TPH, QueryDet — all needing full_yaml).
+`count_pending` returned 0; stall trigger fired correctly; orchestrator
+expanded paper-finder for new ideas. If `count_pending` had instead
+counted blocked entries, the loop would have spun forever trying to pick
+modules it had already decided not to test.
+
+The contract: agents that mark a module `blocked` (rather than running
+it and `discarded`) MUST also write a `discoveries.md` entry explaining
+why, so the user reviewing post-run sees "pipeline ran out of testable
+modules at this version" not "loop just stopped".
 
 #### Determine which file to edit
 
@@ -288,7 +543,7 @@ elif location in TRACKER_LOCATIONS:
         # applied. Mark discarded with a clear reason.
         mm.update_status("modules.md", chosen.name, "discarded")
         print(f"Skipping {chosen.name}: tracker module on detection-only project")
-        # fall through to Priority B in this iteration
+        # fall through to the next enabled priority in this iteration
         chosen = None
 else:
     # A5 — Unknown Location. DO NOT default to detector.
@@ -307,7 +562,7 @@ else:
         loop=state.get("loop_count", 0),
         category="observation",
     )
-    chosen = None      # fall through to Priority B
+    chosen = None      # fall through to the next enabled priority
 ```
 
 `target_file` and `hook_function` are used below when generating the injection.
@@ -343,7 +598,8 @@ mode = chosen.integration_mode   # parser returns "hook" for missing/blank
 
 KNOWN_HOOK       = {"hook"}
 KNOWN_YAML_INJECT = {"yaml_inject"}
-KNOWN_FULL_YAML   = {"full_yaml"}   # v1.8+ — not implemented yet
+KNOWN_FULL_YAML   = {"full_yaml"}   # v1.9 — implemented
+KNOWN_FULL_YAML_LEGACY_RESERVED = set()  # v1.9 — empty; placeholder if legacy renames needed
 
 if mode in KNOWN_HOOK:
     pass   # fall through to § Apply the change (hook path)
@@ -360,20 +616,37 @@ elif mode in KNOWN_YAML_INJECT:
             loop=state.get("loop_count", 0),
             category="observation",
         )
-        chosen = None   # fall through to Priority B
+        chosen = None   # fall through to the next enabled priority
     # else: proceed to § Apply the change (yaml_inject path) below
 elif mode in KNOWN_FULL_YAML:
-    # Reserved for v1.8. weight_transfer.build_custom_model_with_injection
-    # will raise NotImplementedError at train.py run time, but it's cleaner
-    # to discard now and log the mismatch than to crash the run.
+    # v1.9 — full_yaml is now implemented. The dispatch path here mirrors
+    # yaml_inject's structure but writes a different arch_spec.json shape:
+    # the agent provides a complete custom YAML file rather than a list of
+    # insertions.
+    if target_file != "train.py":
+        mm.update_status("modules.md", chosen.name, "discarded")
+        log_discovery(
+            f"Module {chosen.name!r} has Integration mode 'full_yaml' but "
+            f"Location {location!r} routes to {target_file}. full_yaml "
+            f"requires a detector Location (backbone/neck/head).",
+            loop=state.get("loop_count", 0),
+            category="misclassification",
+        )
+        chosen = None
+    # else: proceed to § Apply the change (full_yaml path) below
+elif mode in KNOWN_FULL_YAML_LEGACY_RESERVED:
+    # Defensive fallback — if a legacy modules.md from v1.7-v1.8 still tags
+    # something as the v1.8-only "reserved" sentinel value, discard it
+    # explicitly. Should not occur in v1.9-fresh modules.md files.
     mm.update_status("modules.md", chosen.name, "discarded")
     log_discovery(
-        f"Module {chosen.name!r} has Integration mode 'full_yaml' — reserved "
-        f"for v1.8+. Not supported in this release. Discarded.",
+        f"Module {chosen.name!r} tagged with v1.8-reserved full_yaml sentinel; "
+        f"v1.9 uses 'full_yaml' directly. Re-tag in modules.md or rely on "
+        f"paper-finder Phase 5 to re-emit.",
         loop=state.get("loop_count", 0),
-        category="limitation",
+        category="bug_workaround",
     )
-    chosen = None   # fall through to Priority B
+    chosen = None
 else:
     # Unknown mode — parser already warned. Fall back to hook (the v1.6 default)
     # rather than skip, so forward-compat mode values don't block work.
@@ -581,22 +854,104 @@ three status-transition callsites for a given iteration are:
 - Step 2 (Ideate, Priority A): `pending → injected`
 - Step 6 (Verify): `injected → tested` OR `injected → discarded`
 
-**Priority B — zero-param changes (if no pending modules, or as an interleave)**
+#### v1.9 — full_yaml branch
+
+When `mode == "full_yaml"`, the apply path differs from yaml_inject in that
+the agent writes a complete custom YAML to disk rather than supplying a list
+of insertion specs. The arch_spec.json shape changes accordingly.
+
+1. **Read the module's `Integration notes`**. v1.9 paper-finder writes
+   full_yaml entries with these required fields:
+
+   ```
+   ### Integration notes
+   custom_yaml_template:    <inline YAML or path-to-template-in-modules.md>
+   layer_map_strategy:      <auto | override>
+   layer_map_override:      <only when strategy=override; list of {base_idx, custom_idx}>
+   transfer_scope:          <backbone | backbone+neck | full>
+   ```
+
+   See `paper-finder/SKILL.md § Phase 5 full_yaml Integration notes` for the
+   schema. If `custom_yaml_template` is missing, mark `discarded` with
+   `category=misclassification` — the agent should NOT invent a YAML.
+
+2. **Write the custom YAML to disk**. Filename matters: ultralytics'
+   `guess_model_scale` reads scale from filename via regex (same B2 lesson
+   as v1.8). Use `<base_stem>_<module_name>.yaml`:
+
+   ```python
+   import pathlib, re
+   # Derive base stem from train.py's WEIGHTS line for consistency with B2
+   train_src = pathlib.Path("train.py").read_text()
+   m = re.search(r'(?m)^WEIGHTS\s*=\s*["\']([^"\']+)["\']', train_src)
+   base_stem = pathlib.Path(m.group(1)).stem if m else "yolo"
+   safe_name = re.sub(r'[^A-Za-z0-9]+', '_', chosen.name.lower())
+   custom_yaml_path = f"{base_stem}_{safe_name}.yaml"
+   pathlib.Path(custom_yaml_path).write_text(integration_notes["custom_yaml_template"])
+   ```
+
+3. **Write `arch_spec.json` with the full_yaml shape**:
+
+   ```python
+   import json
+   spec = {
+       "mode": "full_yaml",
+       "custom_yaml_path":   custom_yaml_path,
+       "layer_map_strategy": integration_notes.get("layer_map_strategy", "auto"),
+       "transfer_scope":     integration_notes.get("transfer_scope", "backbone"),
+       "strict": True,
+   }
+   if spec["layer_map_strategy"] == "override":
+       spec["layer_map_override"] = integration_notes["layer_map_override"]
+   pathlib.Path("arch_spec.json").write_text(json.dumps(spec, indent=2))
+   ```
+
+4. **Flip `ARCH_INJECTION_ENABLED = True`** — same as yaml_inject (the train.py
+   dispatcher in `build_custom_model_with_injection` routes by `spec["mode"]`).
+
+5. **Commit files together**: `arch_spec.json`, `<custom_yaml_path>`,
+   `train.py`. Tracking the custom YAML in git lets `git reset --hard HEAD~1`
+   restore the previous YAML on discard.
+
+6. **Update module status**: `mm.update_status("modules.md", chosen.name, "injected")`.
+
+**full_yaml-specific failure modes** (in addition to the yaml_inject ones):
+
+- **`auto` strategy unpaired layers**: in strict mode, if any base layer in
+  `transfer_scope` couldn't be paired with a custom layer of matching class,
+  `apply_yaml_spec` raises with the unpaired indices listed. Treat as crash.
+  Common cause: agent wrote a custom YAML that renames Conv → SPDConv but
+  paper-finder picked `transfer_scope=backbone` — should be either `override`
+  with explicit pairs or `transfer_scope=full` with `strict=False`.
+- **`custom_yaml_path` missing 'backbone' or 'head'**: ValueError from
+  `apply_yaml_spec`. Means the agent's YAML is malformed. Crash, discard.
+- **YAML scale-from-filename mismatch**: agent's YAML name lacks a recognised
+  scale suffix (n/s/m/l/x); ultralytics defaults to scale 'n' silently and
+  weight transfer crashes with shape mismatch. Mitigated by step 2's
+  `<base_stem>_...` naming pattern; still possible if `WEIGHTS` itself
+  doesn't encode scale.
+
+
+
+**Priority B — zero-param changes (token: `zero_param_changes`)**
 
 Hyperparameters, LR schedule, loss weights, augmentation, freeze strategy. These cost nothing
-and should be tried before adding any module.
+and should be tried before adding any module. (When the default order is in effect, "before"
+means "after Priority A is exhausted"; user-configured `module_priority` may reorder.)
 
-**Priority C — replacement changes**
+**Priority C — replacement changes (token: `replacement_changes`)**
 
 Swap one existing block for another of similar parameter count (net delta ≈ 0).
 
-**Priority D — additive changes**
+**Priority D — additive changes (token: `additive_changes`)**
 
-Only if A, B, C are exhausted. Prefer the lightest option that could plausibly help.
+Only if A, B, C are exhausted (or if user-configured `module_priority` puts D earlier).
+Prefer the lightest option that could plausibly help.
 
-**Priority E — combinations**
+**Priority E — combinations (token: `combinations`)**
 
 After finding what works individually, combine compatible wins (max 2 things at once).
+If no prior keeps exist (loop just started), this priority is a no-op and falls through.
 
 #### Tie-breaking — pick one, never ask
 
@@ -717,9 +1072,125 @@ and locked into `pipeline_state.loop_time_budget`. If an experiment is slow, hal
 **Never modify `SEED`** — the random seed must be identical across all runs so that
 differences in the primary metric reflect the change being tested, not randomness.
 
+#### v1.9 — Resource-impact auto-halve
+
+When the chosen module's `resource_impact` field is set, automatically halve
+`BATCH_SIZE` in train.py BEFORE running the experiment. This prevents the
+silent CPU `TaskAlignedAssigner` fallback (real run's Loop 7 — EMA at
+batch=64 silently went to CPU, training 3-7× slower, run discarded as
+"untrainable in equal-budget regime" without anyone realising the assigner
+moved).
+
+```python
+import re, pathlib
+
+# Read the module's resource_impact (None if not set)
+impact = chosen.resource_impact   # via Module.resource_impact property
+
+halve_count = {
+    "vram_4x":           2,   # ×0.25 (halve twice)
+    "vram_2x":           1,   # ×0.5
+    "cpu_fallback_risk": 1,   # ×0.5 + log
+}.get(impact, 0)
+
+if halve_count > 0:
+    src = pathlib.Path("train.py").read_text()
+    m = re.search(r"(?m)^BATCH_SIZE\s*=\s*(\d+)", src)
+    if m:
+        original = int(m.group(1))
+        reduced = max(1, original >> halve_count)   # >>n = halve n times
+        if reduced != original:
+            new_src = re.sub(
+                r"(?m)^BATCH_SIZE\s*=\s*\d+",
+                f"BATCH_SIZE     = {reduced}",
+                src, count=1,
+            )
+            pathlib.Path("train.py").write_text(new_src)
+            log_discovery(
+                f"Auto-halved BATCH_SIZE {original} → {reduced} "
+                f"(resource_impact={impact!r}, halve_count={halve_count}). "
+                f"Will restore to {original} on next non-impacting iteration.",
+                loop=state.get("loop_count", 0),
+                category="resource_constraint",
+            )
+            # Track the original so we can restore on the NEXT iteration
+            state["batch_size_pre_autohalve"] = original
+            pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+
+# At the start of each iteration: if previous iteration auto-halved, restore.
+# Done BEFORE the halve check so that an iteration NOT touching a high-impact
+# module gets the original BATCH_SIZE back.
+elif state.get("batch_size_pre_autohalve"):
+    src = pathlib.Path("train.py").read_text()
+    original = state["batch_size_pre_autohalve"]
+    new_src = re.sub(
+        r"(?m)^BATCH_SIZE\s*=\s*\d+",
+        f"BATCH_SIZE     = {original}",
+        src, count=1,
+    )
+    pathlib.Path("train.py").write_text(new_src)
+    state["batch_size_pre_autohalve"] = None
+    pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+```
+
+The auto-halve is **per-iteration** — if an iteration doesn't touch a
+high-impact module, BATCH_SIZE is restored to whatever it was before the
+last auto-halve. This prevents the halve from being sticky: a yaml_inject
+attention experiment that runs at batch=16 doesn't lock subsequent
+hyperparameter sweeps into batch=16 too.
+
+The halve does NOT interact with the crash-pause halve (Step 9 § Crash
+Diagnosis) — those are independent and cumulative. If both fire, the
+final batch is the result of both reductions; that's the safest behaviour
+under combined resource pressure.
+
 ---
 
 ### Step 4 — Commit
+
+#### v1.8 — Pre-commit invariant check
+
+Before staging the changes, run `invariants.run_all_checks(state)` to
+catch any contract violations the agent may have introduced (locked
+variable changed, OPTIMIZER set to 'auto', section marker deleted).
+Violations are NOT silently fixed — they are recorded as a failed
+iteration so the experimental record stays honest:
+
+```python
+import sys, pathlib, json
+state = json.loads(pathlib.Path("pipeline_state.json").read_text())
+sys.path.insert(0, str(pathlib.Path(state["skills_dir"]) / "shared"))
+import invariants
+
+violations = invariants.run_all_checks(state)
+if violations:
+    # 1. Log to discoveries.md as agent_violation
+    log_discovery(
+        invariants.format_violations(violations),
+        loop=state.get("loop_count", 0),
+        category="agent_violation",
+    )
+    # 2. Increment consecutive_crashes (3 in a row triggers crash-pause
+    #    via Step 9, which halves BATCH_SIZE — appropriate fallback when
+    #    the agent is repeatedly violating contracts)
+    state["consecutive_crashes"] = state.get("consecutive_crashes", 0) + 1
+    pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+    # 3. Roll back the working tree changes — do not commit a violating script
+    import subprocess
+    subprocess.run(["git", "checkout", "--", "train.py"], check=False)
+    if pathlib.Path("track.py").exists():
+        subprocess.run(["git", "checkout", "--", "track.py"], check=False)
+    # 4. Skip remaining Step 4-9 of this iteration; loop back to Step 1
+    raise invariants.ContractViolation(violations)
+```
+
+Why this is non-negotiable: a single locked-variable change (e.g. agent
+halves IMGSZ during OOM) silently invalidates every later keep/discard
+verdict against a different IMGSZ baseline. v1.7.x relied on SKILL prose
+to prevent this; v1.8 makes it enforceable.
+
+#### Commit
+
 ```bash
 git add train.py custom_modules.py
 [ -f track.py ] && git add track.py      # only exists for task_type: object_tracking
@@ -729,6 +1200,60 @@ git commit -m "experiment: <description>"
 ---
 
 ### Step 5 — Run
+
+#### v1.9.2 — Pre-run cleanup and cwd lock
+
+**Bug this prevents** (real-world report 2026-04): on a machine running
+multiple ARAC projects in adjacent directories, an agent in the wrong
+cwd reads the *neighbour's* `run.log`, parses metrics from a completely
+different experiment, and writes those metrics to *this* project's
+`results.tsv`. The keep/discard decision then runs on someone else's
+data. Worse, the symptom looks like "Step 5 finished early" because
+the neighbour's run was already complete.
+
+The cwd cannot be trusted in multi-project environments. Four layers
+of defence, all required:
+
+```python
+import os, pathlib, json
+from datetime import datetime
+
+state = json.loads(pathlib.Path("pipeline_state.json").read_text())
+
+# Layer 1 — cwd verification. The orchestrator's Stage 0 wrote
+# state["project_root"] as the absolute path of THIS project. If cwd
+# doesn't match, refuse to proceed; the agent is in the wrong directory.
+project_root = pathlib.Path(state["project_root"])
+cwd = pathlib.Path(os.getcwd()).resolve()
+if cwd != project_root:
+    raise RuntimeError(
+        f"cwd-lock violated: cwd={cwd}, project_root={project_root}. "
+        f"Agent appears to be in the wrong directory; refusing to run "
+        f"to prevent cross-project run.log pollution."
+    )
+
+# Layer 2 — clean ALL stale run.log artifacts. Use absolute paths so
+# even if cwd is wrong (Layer 1 should have caught that, but defence in
+# depth) we operate on this project's files.
+RUN_LOG  = project_root / "run.log"
+LOOP_N   = state.get("loop_count", 0) + 1
+LOG_ARCHIVE = project_root / "logs" / f"loop_{LOOP_N}.log"
+
+RUN_LOG.unlink(missing_ok=True)
+LOG_ARCHIVE.unlink(missing_ok=True)
+(project_root / "logs").mkdir(exist_ok=True)
+
+# Layer 3 — record Step 5 start time. Step 6 freshness check verifies
+# run.log was written AFTER this timestamp (else it's stale from a
+# previous loop or another project).
+start_iso = datetime.now().isoformat(timespec="seconds")
+start_unix = datetime.now().timestamp()
+state["step5_started_at"] = start_iso
+state["step5_started_at_unix"] = start_unix
+pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+```
+
+#### Run command
 
 The run command depends on `task_type` (read from `pipeline_state.json`). See
 `<skills_dir>/shared/train-script-spec.md` § Task-type variants for why the split
@@ -741,6 +1266,11 @@ value rather than hardcoding `uv`:
 ```bash
 TASK_TYPE=$(python3 -c "import json; print(json.load(open('pipeline_state.json'))['task_type'])")
 RUNNER=$(python3 -c "import json; print(json.load(open('pipeline_state.json')).get('python_runner', 'uv run'))")
+PROJECT_ROOT=$(python3 -c "import json; print(json.load(open('pipeline_state.json'))['project_root'])")
+
+# v1.9.2 — explicitly cd into project_root before running. Defence in
+# depth alongside the Python cwd check above.
+cd "$PROJECT_ROOT"
 
 case "$TASK_TYPE" in
   object_detection)
@@ -764,6 +1294,28 @@ Never pipe through `tee` — the parser in Step 6 reads `run.log` directly and
 Each loop takes ~20 minutes (TIME_BUDGET) plus a few seconds for startup and eval.
 Tracking adds maybe another minute for `track.py` inference + TrackEval.
 If total runtime exceeds `TIME_BUDGET × 2`: kill and treat as crash.
+
+#### v1.8 — Per-loop log archive
+
+After Step 5 completes (whether keep, discard, or crash), copy `run.log`
+to `logs/loop_<N>.log`. The current loop's log lives at `run.log` for
+Step 6's parser; the archived copy lets the user diff across loops or
+look back at why a specific iteration discarded.
+
+```bash
+LOOP_N=$(python3 -c "import json; print(json.load(open('pipeline_state.json')).get('loop_count', 0) + 1)")
+PROJECT_ROOT=$(python3 -c "import json; print(json.load(open('pipeline_state.json'))['project_root'])")
+mkdir -p "$PROJECT_ROOT/logs"
+cp "$PROJECT_ROOT/run.log" "$PROJECT_ROOT/logs/loop_${LOOP_N}.log"
+```
+
+The archive is kept indefinitely (logs are small, ~100 KB each at
+TIME_BUDGET=2h with default verbosity). For projects that run for
+hundreds of iterations, gzip after archive is fine but not required.
+
+`results.tsv` does not currently include a `log_tail` column — the
+archive is the canonical source. Use `tail -50 logs/loop_N.log` for
+quick inspection.
 
 ---
 
@@ -1023,6 +1575,47 @@ log_discovery(
 ---
 
 ### Step 6 — Verify
+
+#### v1.9.2 — Freshness check (FIRST thing in Step 6)
+
+Before parsing any metrics, verify the run.log we're about to read was
+actually produced by THIS Step 5 invocation, not stale from a different
+project / earlier loop / never-started run. Failure here means the
+metrics about to be extracted are NOT this experiment's metrics —
+proceeding would corrupt results.tsv with someone else's data.
+
+```python
+import sys, pathlib, json
+state = json.loads(pathlib.Path("pipeline_state.json").read_text())
+sys.path.insert(0, str(pathlib.Path(state["skills_dir"]) / "shared"))
+import invariants
+
+# Resolve run.log against project_root (NOT cwd) — defence in depth alongside
+# Step 5's cwd-lock.
+project_root = pathlib.Path(state["project_root"])
+run_log_path = project_root / "run.log"
+
+violations = invariants.check_run_log_fresh(state, run_log_path=str(run_log_path))
+if violations:
+    # Treat as crash. Do NOT parse metrics from a stale or missing log.
+    log_discovery(
+        invariants.format_violations(violations),
+        loop=state.get("loop_count", 0),
+        category="agent_violation",
+    )
+    state["consecutive_crashes"] = state.get("consecutive_crashes", 0) + 1
+    pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+    raise invariants.ContractViolation(violations)
+```
+
+This is the contract that says "I verified run.log is mine before
+parsing it". If it raises, the iteration is treated as a crash:
+metrics blank, status=crash, results.tsv gets a row noting the
+violation, autoresearch continues to next iteration (no infinite loop
+because consecutive_crashes increment leads to v1.7.6 crash-pause path
+after 3).
+
+#### Extract metrics
 
 Extract metrics using the parsing rules from `evaluation.parsing`. The exact
 extraction depends on `PARSE_SOURCE`. All three branches are implemented
@@ -1308,6 +1901,43 @@ git reset --hard HEAD~1
 
 ### Step 8 — Log
 
+#### v1.8 — Description format contract
+
+The `description` column in `results.tsv` is the only human-readable
+trace of what each iteration tried. v1.7.x left the format free-form;
+the user's Loop 9/15 experiments in real runs ended up with descriptions
+like `"copy_paste/mixup tweaks"` that lost which exact values were tested.
+v1.8 requires a structured format so post-hoc analysis (final summary,
+per-experiment regression checks) can parse descriptions reliably.
+
+The format is:
+
+| Experiment kind | Description format | Example |
+|---|---|---|
+| **Vanilla baseline** | `"vanilla baseline"` | `"vanilla baseline"` |
+| **Hook mode** | `"USE_<MODULE> (var1=val1, var2=val2)"` | `"USE_CBAM (channels=256)"` |
+| **yaml_inject mode** | `"<ModuleClass> [adapted: <notes>]"` | `"LazyCBAM [adapted: insertion at backbone Conv]"` |
+| **Hyperparameter** | `"var1=val1 (was old1), var2=val2 (was old2)"` | `"lr0=0.005 (was 0.01)"` |
+| **Combination** | `"<exp_A> + <exp_B>"` | `"USE_CBAM + lr0=0.005"` |
+| **Tiebreak rescue** | append `" [tiebreak]"` to whichever format above | `"lr0=0.003 (was 0.005) [tiebreak]"` |
+
+Rules:
+- Use the literal variable name as the key (`lr0`, `mixup`, `BATCH_SIZE`),
+  not paraphrases (`learning rate`)
+- Always include the **previous value** for hyperparameter changes —
+  this lets a reader reconstruct the cumulative path from `results.tsv`
+  alone, without consulting git history
+- Keep total length ≤ 200 chars for terminal-friendly viewing; `append_result`
+  sanitises tabs/newlines but doesn't truncate
+- For yaml_inject, include `[adapted: ...]` notes when the module class
+  was modified relative to paper (e.g. CBAM with custom kernel size, P2
+  head with different stride)
+
+The `[tiebreak]` suffix is added by Step 7 (decide rule 4) before the
+description reaches Step 8.
+
+#### Log
+
 ```bash
 git log --oneline -1
 ```
@@ -1410,6 +2040,14 @@ if status == "keep":
             state["best_tiebreak_value"] = results[TIEBREAK]
 state["primary_metric_name"] = PRIMARY
 
+# v1.8 — no_improvement_loops counter for orchestrator's autonomous stop trigger.
+# Resets to 0 on every keep; increments on every discard. Reach max_no_improvement_loops
+# (set in research_config.yaml → orchestrator.stopping) → orchestrator stops the run.
+if status == "keep":
+    state["no_improvement_loops"] = 0
+else:
+    state["no_improvement_loops"] = state.get("no_improvement_loops", 0) + 1
+
 # Count architecture keeps for combination trigger
 arch_keeps = 0
 if pathlib.Path("results.tsv").exists():
@@ -1469,6 +2107,11 @@ mechanism is needed from autoresearch's side.
     locked in the template. Changing `IMGSZ` between runs makes metric comparisons invalid
     (a model at 1920 vs 640 is a completely different operating point). If you need to reduce
     memory, halve `BATCH_SIZE` instead — never change resolution.
+
+    `BATCH_SIZE` itself is NOT locked. v1.9.3+ orchestrator sets the initial value from
+    `autoresearch.loop.initial_batch_size` (yaml); after that, autoresearch may halve
+    dynamically (resource_impact auto-halve, crash-pause halve, OOM detection). The yaml
+    only controls the starting point — runtime adjustments are autoresearch's prerogative.
 12. **Never hardcode metric names in the skill body** — always reference `PRIMARY`, `TIEBREAK`,
     `SECONDARY`, `GUARD` loaded from `research_config.yaml` at setup time. The same skill must
     work unchanged for detection (`val_mAP50_95`), tracking (`HOTA`), segmentation, etc.

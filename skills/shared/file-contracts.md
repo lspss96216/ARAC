@@ -345,6 +345,39 @@ Step 6 verify and dataset hunter Phase 6 Step 2 extract.
 `run.log` is stdout+stderr capture, exactly what the scripts printed. Skills
 parse it using regex / JSONPath / CSV per `evaluation.parsing` in the yaml.
 
+### v1.9.2 — Run sentinels
+
+Templates write two boundary sentinels around `main()`:
+
+```
+__RUN_START__: <iso timestamp> <git_commit_short> <pid>     ← line 1 of run.log
+... normal training/eval output ...
+__RUN_END__:   <iso timestamp> <exit_code>                   ← last line of run.log
+```
+
+Examples:
+```
+__RUN_START__: 2026-04-27T10:30:15 a1b2c3d4 12345
+[ultralytics output, training progress, val table, ...]
+__RUN_END__:   2026-04-27T12:30:48 0
+```
+
+For tracking task_type, `train.py` writes both sentinels but `track.py`
+overwrites only `__RUN_END__` at the end (since it runs after train.py
+and the file is appended in Step 5). The first-line `__RUN_START__` from
+train.py stays intact.
+
+Step 6's invariants `check_run_log_fresh(state)` verifies:
+- file exists
+- first non-empty line matches RUN_START regex
+- RUN_START iso ≥ `state["step5_started_at"]`
+
+Failure on any of these → `ContractViolation` raised, iteration treated
+as crash. This is the cross-project pollution prevention introduced in
+v1.9.2 after a real-world incident where an agent in the wrong cwd read
+a neighbour project's run.log and parsed metrics from a different
+experiment.
+
 ### The canonical-format invariant
 
 Templates (`train.py.detection`, `track.py.tracking`) guarantee metrics appear as
