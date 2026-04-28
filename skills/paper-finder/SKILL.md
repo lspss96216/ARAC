@@ -31,9 +31,17 @@ Find base model + populate modules.md from scratch.
 **Mode B — Expansion search** (triggered by autoresearch stall signal):
 Keep existing modules.md, append newly found modules without overwriting.
 
+**Mode C — Phase 1 only** (v1.11+, triggered by orchestrator concurrent
+mode): Run Phase 1-4 only (produce `base_model.md`); skip Phase 5-6
+(modules.md). Used when orchestrator wants base_weights resolved fast
+so train.py scaffold can proceed, while Phase 5-6 runs concurrently
+later in a separate subagent.
+
 The caller (autoresearch or user) passes one of:
 - `mode: initial` + task description
 - `mode: expand` + path to existing `modules.md` + reason for stall (e.g. "last 10 runs <0.001 improvement")
+- `mode: initial_phase1_only` + task description (v1.11+) — produces base_model.md only
+- `mode: phase56_only` + task description (v1.11+) — assumes base_model.md exists; runs Phase 5-6 only
 
 ---
 
@@ -586,6 +594,28 @@ they parse — is in `<skills_dir>/shared/file-contracts.md § base_model.md`.
 ---
 
 ## Phase 5 — Collect improvement modules
+
+#### v1.11 — Mode entry guard
+
+This phase runs in three contexts:
+
+| Caller mode | Entry behaviour |
+|---|---|
+| `mode: initial` | Continue from Phase 4's top papers (in-process) |
+| `mode: phase56_only` | Re-read base_model.md from disk; reconstruct top-papers list from Phase 1-4's outputs (subagent has no in-process context from earlier phases) |
+| `mode: expand` | Read existing modules.md; new entries appended below existing |
+| `mode: initial_phase1_only` | SKIP this phase entirely — caller wants base_model.md only |
+
+For `mode: phase56_only` (concurrent path from orchestrator):
+1. Verify `base_model.md` exists in cwd; raise if not
+2. Re-derive the top-papers list by re-running Phase 2 search +
+   Phase 3 scoring (cheap — most APIs are cached / fast)
+3. Skip Phase 4 (base model already chosen — read from base_model.md)
+4. Continue with Phase 5 normally
+
+For `mode: initial_phase1_only` (concurrent path Stage 1):
+- Skip this phase. Skip Phase 6.
+- Just write `base_model.md` and exit.
 
 From the remaining top papers (excluding the base model paper), extract modular techniques
 that can be plugged into an existing backbone, neck, head, or loss.

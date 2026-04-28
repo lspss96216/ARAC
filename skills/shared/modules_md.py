@@ -63,11 +63,39 @@ DEFAULT_INTEGRATION_MODE = "hook"
 # v1.9 — resource_impact tags. autoresearch Step 3 Modify uses these to
 # preemptively halve BATCH_SIZE for memory-heavy experiments (avoiding the
 # silent CPU TaskAlignedAssigner fallback that under-trains the run).
+#
+# v1.12 — semantics extended.
+# Real-world Loop 1 of session 2026-04-27: FlexSimAM was tagged
+# resource_impact=none (zero parameters), but scope=all in YOLO26x meant it
+# inserted in dozens of C3k2 positions. Each insertion creates 3 forward-
+# pass intermediate tensors (d, e_inv, sigmoid output) the size of the
+# feature map. Backprop must keep all of them as activation buffer.
+# Combined with TaskAlignedAssigner, the run hit 81.5GB VRAM ceiling on
+# H100 80GB and degraded to CPU assigner (13× slowdown).
+#
+# Lesson: parameter count alone doesn't predict memory cost. Scope
+# multiplier matters too. v1.12 introduces the concept of EFFECTIVE
+# resource_impact = base × scope multiplier, with the rule:
+#
+#   - scope=backbone or scope=neck or scope=head:  base   (1× the tag)
+#   - scope=all:                                    +1 step (none → 2x, 2x → 4x)
+#
+# Modules with no scope info (hook mode, full_yaml mode) use base only —
+# their memory profile depends on different factors that are caller-side
+# concerns.
 KNOWN_RESOURCE_IMPACTS = {
     "vram_4x",            # ~4× baseline VRAM (P2 head, dense attention)
     "vram_2x",            # ~2× baseline VRAM (single attention layer added)
     "cpu_fallback_risk",  # known to trigger CPU assigner fallback at default batch
     "none",               # explicit "no extra cost" — for parser sanity, optional
+}
+
+# v1.12 — escalation order for scope=all multiplier.
+_RESOURCE_ESCALATION = {
+    "none":              "vram_2x",     # zero-param + scope=all → behaves like 2x
+    "vram_2x":           "vram_4x",     # 2x + scope=all → 4x territory
+    "vram_4x":           "vram_4x",     # already at ceiling; no further escalation
+    "cpu_fallback_risk": "cpu_fallback_risk",  # orthogonal axis; don't escalate
 }
 
 
@@ -116,6 +144,60 @@ class Module:
         raw = self.fields.get("resource_impact") or ""
         stripped = raw.strip()
         return stripped if stripped else None
+
+    @property
+    def yaml_inject_scope(self) -> Optional[str]:
+        """v1.12 — extract `scope:` from the Integration notes section
+        (yaml_inject mode only). Returns "backbone", "neck", "head", "all",
+        or None if not yaml_inject / not specified.
+
+        Real-world Loop 1 evidence: FlexSimAM with scope=all consumed enough
+        VRAM to trigger CPU assigner fallback despite zero parameters.
+        Scope multiplier needs to feed into resource_impact decisions.
+        """
+        if self.integration_mode != "yaml_inject":
+            return None
+        notes = self.sections.get("Integration notes") or ""
+        m = _SCOPE_LINE_RE.search(notes)
+        return m.group(1).lower() if m else None
+
+    @property
+    def effective_resource_impact(self) -> Optional[str]:
+        """v1.12 — resource_impact escalated by scope=all multiplier.
+
+        For yaml_inject modules, scope=all means the module is inserted at
+        every match point in the model (typically dozens of C3k2 / C2f
+        blocks). The activation memory cost scales linearly with insertion
+        count. A "none" or "vram_2x" tagged module with scope=all behaves
+        like one tier higher in practice.
+
+        Returns the escalated tag (still in KNOWN_RESOURCE_IMPACTS), or None
+        if no resource_impact is set. autoresearch should use this property,
+        not raw resource_impact, when deciding batch halving.
+        """
+        base = self.resource_impact
+        if base is None:
+            return None
+        # Only escalate for yaml_inject modules — hook mode and full_yaml
+        # mode have different memory profiles that scope doesn't capture.
+        if self.integration_mode != "yaml_inject":
+            return base
+        scope = self.yaml_inject_scope
+        if scope == "all":
+            return _RESOURCE_ESCALATION.get(base, base)
+        return base
+
+
+# v1.12 — match `scope: <value>` in Integration notes. Spec format:
+#   yaml_inject spec:
+#    - module_class: LazyCBAM
+#    - position: after_class: C3k2
+#    - scope: backbone        # ← we extract this
+#    - yaml_args: [256]
+_SCOPE_LINE_RE = re.compile(
+    r"^\s*-?\s*scope\s*:\s*([A-Za-z_+]+)",
+    re.MULTILINE | re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------

@@ -171,13 +171,19 @@ autoresearch:
     max_runtime_multiplier: 2      # If a run exceeds time_budget_sec * this, kill it as crashed. Default 2.
     iterations: null               # null = loop forever until interrupted. Set integer for bounded run.
     seed: 42                       # Random seed. Locked across runs for reproducibility.
-    initial_batch_size: 16         # [optional, v1.9.3+] Starting BATCH_SIZE for train.py. Stage 0 patches the
-                                   # template's default into the actual value. Unlike IMGSZ/SEED/TIME_BUDGET this
-                                   # is NOT locked — autoresearch may halve it dynamically (resource_impact
-                                   # auto-halve, crash-pause, OOM). yaml only sets the starting point.
-                                   # If unset, falls back to template default (16). H100 80GB users typically
-                                   # set 64; smaller GPUs may need 8. Run the first iteration and adjust based
-                                   # on memory_gb in results.tsv.
+    initial_batch_size: 16         # [DEPRECATED in v1.12 — use `batch_size` below.]
+                                   # Pre-v1.12 (v1.9.3+) yaml field name. v1.12 keeps this as a
+                                   # backward-compat alias: if `batch_size` is unset and
+                                   # `initial_batch_size` is set, that value is used.
+                                   # New runs should write `batch_size` instead.
+    batch_size: 16                 # [v1.12+] LOCKED BATCH_SIZE for train.py. invariants.LOCKED_VARS now
+                                   # enforces this — same semantics as IMGSZ / SEED / TIME_BUDGET. Once
+                                   # set, it cannot drift across iterations. autoresearch will NOT halve
+                                   # dynamically; modules that OOM at this batch are marked DISCARD and
+                                   # blocked. Choose conservatively: pick a value with ~20GB headroom on
+                                   # baseline so resource-heavy modules can still run. H100 80GB users
+                                   # at IMGSZ=1920 try 32; at IMGSZ=640 try 32 (Loop 0 of session
+                                   # 2026-04-27 showed BATCH=64 used 78.35GB / 80GB, leaving 1.65GB).
   optimizer: SGD                   # [v1.7.7] Initial optimizer for train.py. Permitted: SGD/AdamW/Adam/RMSProp/NAdam/RAdam. Cannot be 'auto' (silently overrides LR0/MOMENTUM). autoresearch may swap during experiments but never to 'auto'.
   stall:                           # [optional] When to escalate after no-improvement streaks.
     threshold: 10                  # Consecutive non-improving rounds before triggering paper_finder expand.
@@ -235,6 +241,23 @@ orchestrator:
   git:                             # [optional] Git automation.
     auto_init: true                # Run `git init` if project isn't a repo. Required for autoresearch's commit/revert flow.
     branch_prefix: "autoresearch/" # All experiment commits go on a branch named <prefix><run_tag>.
+  concurrent_paper_finder:         # [optional, v1.11+] Run paper-finder Phase 5-6 in parallel with Loop 0 vanilla baseline.
+                                   # Saves ~2h wallclock per pipeline startup. Defaults to enabled (aggressive).
+    enabled: true                  # Set false to fall back to v1.10 sequential behaviour (paper-finder runs before Loop 0).
+    timeout_after_baseline_min: 30 # If subagent hasn't written paper_finder.done within N minutes after baseline completes,
+                                   # kill it and fall back to sequential paper-finder. 30 = 1.5× typical paper-finder runtime.
+    fallback_on_failure: true      # If subagent crashes before completing, run paper-finder sequentially instead of failing.
+                                   # Set false only if you want pipeline to halt on subagent failure (debug mode).
+    subagent_type: "general-purpose"  # [v1.11.1+] Task() subagent_type. "general-purpose" handles paper-finder's mix of
+                                      # web search + parsing + file I/O. Other valid values depend on your environment
+                                      # (Claude Code: "Explore" / "Plan" / custom subagents). Don't use "Explore" — it's
+                                      # codebase-search-optimised, wrong fit for paper search.
+    subagent_model: null              # [v1.11.1+] Model for the spawned subagent. null = inherit from main agent (default).
+                                      # Override with "haiku" / "sonnet" / "opus" / a model ID. Cost trade-off:
+                                      #   • haiku  ~$0.25/run — cheaper, may miss paper detail nuances
+                                      #   • sonnet ~$0.75/run — current default behaviour, balanced
+                                      #   • opus   ~$3.75/run — most thorough, overkill for routine paper-finder runs
+                                      # If your main agent runs on Sonnet and you set null, subagent gets Sonnet.
 
 # -----------------------------------------------------------------------------
 # advanced — output filenames, rarely changed

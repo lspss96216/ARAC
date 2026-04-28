@@ -295,6 +295,43 @@ if USE_SMALL_OBJECT_FPN:
 return model
 ```
 
+**Silent corruption: ModuleList replacement (v1.11.1 #3)**
+```python
+# WRONG — surfaced in real-world Loop 2 of session 2026-04-27.
+# Replacing the layer ModuleList shifts every subsequent layer's index by +1,
+# but ultralytics' Detect head uses HARDCODED from-indices baked into the
+# YAML (e.g. Concat[-1, 6]). After the shift, Concat sees the wrong layer's
+# output, shape resolution silently produces broken tensors, and mAP crashes
+# to ~0 (Loop 2 measured 0.0644). No exception is raised — the bug looks
+# like "experiment ran but didn't help" until you check param counts.
+def inject_modules(model):
+    if USE_CBAM:
+        new_layers = list(model.model.model)
+        new_layers.insert(5, AttentionBlock(256))
+        model.model.model = nn.ModuleList(new_layers)   # ← INDEX SHIFT
+    return model
+
+# Correct alternatives — pick by what you need:
+#
+# (a) Forward-output wrapping (no index change at all):
+#     PicklableHook.attach(layer, AttentionBlock, channels=256)
+#     # Layer count unchanged; Detect head's from-refs unaffected.
+#
+# (b) Real structural insertion with index re-resolution:
+#     # In modules.md: Integration mode = yaml_inject
+#     # Pipeline calls weight_transfer.apply_yaml_spec which generates the
+#     # new YAML, runs ultralytics' parse_model from scratch (correct
+#     # from-indices), and transfers compatible weights.
+#
+# (c) Whole-architecture replacement:
+#     # In modules.md: Integration mode = full_yaml
+#     # User provides custom_yaml_template; pipeline rebuilds entire model.
+#
+# v1.11.1's invariants.check_no_modulelist_replacement_in_inject_modules
+# catches this anti-pattern at commit time so it never reaches a training
+# run again.
+```
+
 ### Helper: `assert_idempotent()`
 
 When writing a new branch, verify idempotency during development. Call with

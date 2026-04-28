@@ -74,6 +74,18 @@ LOCKED_VARS = {
     "loop_time_budget":    "TIME_BUDGET",
     "seed":                "SEED",
     "imgsz":               "IMGSZ",
+    # v1.12 — BATCH_SIZE locked. Previously (v1.6 - v1.11.1) BATCH_SIZE was
+    # initial-set-but-not-locked: yaml provided the starting value and
+    # autoresearch was free to halve dynamically (resource_impact auto-halve,
+    # crash-pause halve, OOM detection). Real-world session 2026-04-27
+    # demonstrated this conflicted with fair comparison: half the loops ran
+    # at BATCH=64 (baseline), the other half at BATCH=32 (auto-halved or
+    # OOM-recovered), and Loop 9 had to manually re-run a vanilla baseline
+    # at BATCH=32 to interpret results. v1.12 locks BATCH_SIZE the same way
+    # as IMGSZ: yaml sets one value, every experiment uses that value, and
+    # OOM is treated as the experiment being infeasible (discard) rather
+    # than a signal to dynamically re-size the experimental setup.
+    "batch_size":          "BATCH_SIZE",
 }
 
 
@@ -306,6 +318,152 @@ def check_run_log_fresh(state: dict, run_log_path: str = "run.log") -> list[Viol
 # Aggregator
 # ──────────────────────────────────────────────────────────────────────────────
 
+    return violations
+
+
+# v1.11.1 #3 — `inject_modules()` must not replace the model's ModuleList.
+# Real-world (Loop 2 of session 2026-04-27): user wrote
+#     model.model.model = nn.ModuleList(new_layers)
+# inside inject_modules() to insert attention modules. This shifts every
+# layer's index by +1, but ultralytics' Detect head uses HARDCODED from-
+# indices (e.g. Concat[-1, 6]) baked into the YAML. Index shift breaks
+# Concat shape resolution → mAP crashes to 0.0644. The bug is silent at
+# import/scaffold time and only manifests as "experiment looks broken"
+# during training.
+#
+# Correct alternatives:
+#   - hook mode: PicklableHook.attach(layer, HookCls, ...) — wraps forward
+#     output without changing layer count.
+#   - yaml_inject mode: weight_transfer.apply_yaml_spec — handles index
+#     shifting via update_head_refs.
+#   - full_yaml mode: replace the entire architecture YAML; ultralytics
+#     parses the new from-refs from scratch.
+
+_INJECT_MODULES_BODY_RE = re.compile(
+    r"def\s+inject_modules\s*\([^)]*\)\s*(?:->\s*[^:]+)?\s*:\s*\n(.*?)(?=^def\s+|\Z)",
+    re.DOTALL | re.MULTILINE,
+)
+# Anti-pattern: `<obj>.model.model = ...` assignment.
+# The user code from real-world Loop 2 was literally:
+#     model.model.model = nn.ModuleList(new_layers)
+# Where outer `model` is the YOLO wrapper, `.model` is DetectionModel,
+# `.model.model` is the ModuleList. Replacing this is the bug.
+# We match the full chain `\b\w+\.model\.model\s*=` (assignment to a
+# variable's .model.model attribute).
+_MODULELIST_ASSIGN_RE = re.compile(r"\b\w+\.model\.model\s*=(?!=)")
+
+
+def check_no_modulelist_replacement_in_inject_modules(
+    src: str, script: str = "train.py"
+) -> list[Violation]:
+    """v1.11.1 #3 — flag `model.model.model = ...` assignment inside
+    inject_modules() function body.
+
+    Catches the silent-corruption anti-pattern surfaced by real-world
+    Loop 2 of 2026-04-27: replacing the layer ModuleList shifts Detect
+    head from-indices and crashes mAP to ~0 with no error message.
+    """
+    m = _INJECT_MODULES_BODY_RE.search(src)
+    if not m:
+        # No inject_modules() defined — nothing to check. Many scripts
+        # don't have one (vanilla baseline, etc.); silent OK.
+        return []
+    body = m.group(1)
+    if _MODULELIST_ASSIGN_RE.search(body):
+        return [Violation(
+            rule="inject_modules_no_modulelist_replacement",
+            script=script,
+            expected=(
+                "hook mode (PicklableHook.attach) or yaml_inject mode "
+                "(weight_transfer.apply_yaml_spec) for structural changes"
+            ),
+            observed=(
+                "model.model.model = ... assignment inside inject_modules() body"
+            ),
+            hint=(
+                "v1.11.1 #3 anti-pattern. Replacing the layer ModuleList shifts "
+                "Detect head from-indices (e.g. Concat[-1, 6]) and silently "
+                "crashes mAP. Use one of:\n"
+                "  • PicklableHook.attach(layer, HookCls, ...) — wraps forward "
+                "output, no index change.\n"
+                "  • weight_transfer.apply_yaml_spec(...) — full custom YAML "
+                "with index re-resolution.\n"
+                "  • full_yaml mode in modules.md — entire architecture replaced."
+            ),
+        )]
+    return []
+
+
+# v1.12 C — ultralytics auto-batch-reduce is a contract violation now.
+# Real-world Loop 10 of session 2026-04-27: MPDIoU was set up at BATCH=64
+# but OOMed; ultralytics' built-in handler emitted
+#     WARNING ⚠️ CUDA out of memory with batch=64. Reducing to batch=32 and retrying (1/3).
+# and silently re-ran at BATCH=32. Loop 11 hit the same path with AdamW.
+# Both experiments produced metrics that LOOKED comparable to the BATCH=64
+# baseline but were trained on a different effective configuration. Fair
+# comparison demands BATCH_SIZE be locked; mid-run reduction breaks that.
+#
+# v1.12 catches this by scanning run.log for ultralytics' specific warning
+# string. If found: ContractViolation, autoresearch discards the iteration,
+# and the module gets marked blocked (this BATCH+module combination is
+# infeasible on this GPU; user can rerun with smaller yaml batch_size or
+# disable the module).
+
+_ULTRALYTICS_AUTO_BATCH_REDUCE_RE = re.compile(
+    r"WARNING.*?CUDA out of memory with batch=\d+\..*?Reducing to batch=\d+",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def check_no_ultralytics_auto_batch_reduce(
+    run_log_path: str = "run.log",
+) -> list[Violation]:
+    """v1.12 — flag ultralytics' auto-batch-reduce warning in run.log.
+
+    Why this is an invariant: BATCH_SIZE is locked from yaml. ultralytics'
+    OOM handler tries to "help" by halving batch and retrying — but that
+    produces results trained at a smaller batch than every other
+    experiment, breaking fair comparison. Either:
+      - Run finishes at the original locked batch (success, fair compare)
+      - Run truly OOMs (discard, mark module blocked, user knows)
+
+    The middle path — silently retraining at half batch — is forbidden.
+
+    Detects by scanning run.log for ultralytics' specific warning string.
+    Caller (autoresearch Step 6) reads the result and treats any match
+    as ContractViolation → discard iteration, mark module blocked.
+    """
+    p = pathlib.Path(run_log_path)
+    if not p.exists():
+        # No run.log to check — pass through (other checks catch this case).
+        return []
+    try:
+        log_text = p.read_text(errors="ignore")
+    except Exception:
+        return []
+    m = _ULTRALYTICS_AUTO_BATCH_REDUCE_RE.search(log_text)
+    if m is None:
+        return []
+    return [Violation(
+        rule="ultralytics_auto_batch_reduce_detected",
+        script="run.log",
+        expected="run completes at the locked BATCH_SIZE, or fails with OOM (no auto-reduce)",
+        observed=f"ultralytics auto-batch-reduce warning: {m.group(0)[:200]!r}",
+        hint=(
+            "v1.12 — BATCH_SIZE is locked. ultralytics' built-in OOM handler "
+            "tried to halve batch and retrain, but that breaks fair comparison "
+            "across iterations (every other run uses the locked batch). "
+            "Treat this experiment as DISCARD and mark the module blocked.\n"
+            "Resolution options:\n"
+            "  • Lower yaml `autoresearch.loop.batch_size` so all experiments "
+            "(including baseline) run at the smaller value. Re-run from Loop 0.\n"
+            "  • Tag the module with higher resource_impact in modules.md so "
+            "autoresearch can predict the OOM (it'll still discard, but at "
+            "least the discard happens before the run instead of mid-run)."
+        ),
+    )]
+
+
 def run_all_checks(state: dict, script_paths: list[str] | None = None) -> list[Violation]:
     """Run every invariant check across given scripts. Returns flat list of
     violations (empty = all OK).
@@ -327,6 +485,8 @@ def run_all_checks(state: dict, script_paths: list[str] | None = None) -> list[V
         all_violations.extend(check_locked_variables(src, state, script=path))
         all_violations.extend(check_optimizer_not_auto(src, script=path))
         all_violations.extend(check_section_markers_present(src, script=path))
+        # v1.11.1 #3 — silent-corruption anti-pattern guard
+        all_violations.extend(check_no_modulelist_replacement_in_inject_modules(src, script=path))
     return all_violations
 
 

@@ -57,7 +57,31 @@ CURRENT_DEFAULTS: dict[str, Any] = {
     # --- v1.9.3 additions ---
     # initial_batch_size: starting BATCH_SIZE from yaml. None = use template
     # default (16). Stage 0 patches train.py once at scaffold time.
+    # v1.12 — DEPRECATED in favour of `batch_size`. Kept here as a
+    # backward-compat field so resumes from pre-v1.12 state files don't
+    # raise KeyError. New code should read state["batch_size"].
     "initial_batch_size":          None,
+
+    # --- v1.12 additions ---
+    # batch_size: LOCKED across all iterations (invariants.LOCKED_VARS
+    # enforces). Replaces v1.9.3's initial_batch_size with locked semantics.
+    # State init reads yaml's batch_size first, then initial_batch_size as
+    # backward-compat alias.
+    "batch_size":                  None,
+
+    # --- v1.11 additions ---
+    # concurrent_paper_finder state. Resume-safe: spawned=True survives across
+    # session breaks so we don't double-spawn the subagent on resume.
+    "concurrent_paper_finder_spawned":       False,
+    "concurrent_paper_finder_done":          False,
+    "concurrent_paper_finder_fallback_used": False,
+
+    # --- v1.11.1 additions ---
+    # Record which subagent_type + model the spawn used. Informative only —
+    # not used for control flow. Lets discoveries.md narrative show
+    # "this run's paper-finder was on Sonnet" so cost / quality review is easy.
+    "concurrent_paper_finder_subagent_type":  None,
+    "concurrent_paper_finder_subagent_model": None,
 }
 
 # Legacy -> current key renames. Applied once; after migration the old key

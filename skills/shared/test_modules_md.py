@@ -445,6 +445,115 @@ def test_preferred_locations_empty_list_same_as_none():
     print("✓ test_preferred_locations_empty_list_same_as_none")
 
 
+# ─── v1.12 B — effective_resource_impact + yaml_inject_scope ───────────────
+
+
+def _module_with_notes(integration_mode: str, resource_impact: str, notes: str):
+    """Helper — build a Module instance with given fields/sections."""
+    return mm.Module(
+        name="X",
+        fields={"Integration mode": integration_mode, "resource_impact": resource_impact},
+        sections={"Integration notes": notes},
+    )
+
+
+def test_yaml_inject_scope_extracts_backbone():
+    """v1.12 B — scope: backbone parsed from yaml_inject Integration notes."""
+    notes = """yaml_inject spec:
+ - module_class: LazyCBAM
+ - position: after_class: C3k2
+ - scope: backbone
+ - yaml_args: [256]"""
+    m = _module_with_notes("yaml_inject", "vram_2x", notes)
+    assert m.yaml_inject_scope == "backbone"
+    print("✓ test_yaml_inject_scope_extracts_backbone")
+
+
+def test_yaml_inject_scope_extracts_all_case_insensitive():
+    """v1.12 B — scope value is lowercased; ALL → all."""
+    notes = "yaml_inject spec:\n - scope: ALL\n - module_class: X"
+    m = _module_with_notes("yaml_inject", "none", notes)
+    assert m.yaml_inject_scope == "all"
+    print("✓ test_yaml_inject_scope_extracts_all_case_insensitive")
+
+
+def test_yaml_inject_scope_none_for_hook_mode():
+    """v1.12 B — hook mode has no scope concept."""
+    m = _module_with_notes("hook", "vram_2x", "scope: backbone")  # notes ignored
+    assert m.yaml_inject_scope is None
+    print("✓ test_yaml_inject_scope_none_for_hook_mode")
+
+
+def test_yaml_inject_scope_none_when_missing():
+    """v1.12 B — yaml_inject without scope: line returns None."""
+    notes = "yaml_inject spec:\n - module_class: X\n - position: at_index: 5"
+    m = _module_with_notes("yaml_inject", "vram_2x", notes)
+    assert m.yaml_inject_scope is None
+    print("✓ test_yaml_inject_scope_none_when_missing")
+
+
+def test_effective_resource_impact_zero_param_scope_all_escalates():
+    """v1.12 B core scenario — Loop 1 FlexSimAM bug.
+    scope=all + resource_impact=none → effective=vram_2x."""
+    notes = """yaml_inject spec:
+ - module_class: LazySimAM
+ - scope: all
+ - position: after_class: C3k2"""
+    m = _module_with_notes("yaml_inject", "none", notes)
+    assert m.effective_resource_impact == "vram_2x"
+    print("✓ test_effective_resource_impact_zero_param_scope_all_escalates")
+
+
+def test_effective_resource_impact_vram_2x_scope_all_escalates_to_4x():
+    """v1.12 B — vram_2x + scope=all → vram_4x."""
+    notes = "yaml_inject spec:\n - scope: all\n - module_class: X"
+    m = _module_with_notes("yaml_inject", "vram_2x", notes)
+    assert m.effective_resource_impact == "vram_4x"
+    print("✓ test_effective_resource_impact_vram_2x_scope_all_escalates_to_4x")
+
+
+def test_effective_resource_impact_4x_scope_all_no_further_escalation():
+    """v1.12 B — vram_4x is the ceiling; scope=all doesn't escalate further."""
+    notes = "yaml_inject spec:\n - scope: all\n - module_class: X"
+    m = _module_with_notes("yaml_inject", "vram_4x", notes)
+    assert m.effective_resource_impact == "vram_4x"
+    print("✓ test_effective_resource_impact_4x_scope_all_no_further_escalation")
+
+
+def test_effective_resource_impact_backbone_scope_no_escalation():
+    """v1.12 B — non-all scope (backbone/neck/head) leaves base unchanged."""
+    notes = "yaml_inject spec:\n - scope: backbone\n - module_class: X"
+    m = _module_with_notes("yaml_inject", "vram_2x", notes)
+    assert m.effective_resource_impact == "vram_2x"
+    print("✓ test_effective_resource_impact_backbone_scope_no_escalation")
+
+
+def test_effective_resource_impact_hook_mode_uses_base():
+    """v1.12 B — hook mode ignores scope concept entirely; effective == base."""
+    m = _module_with_notes("hook", "vram_2x", "(some hook description)")
+    assert m.effective_resource_impact == "vram_2x"
+    print("✓ test_effective_resource_impact_hook_mode_uses_base")
+
+
+def test_effective_resource_impact_returns_none_when_base_missing():
+    """v1.12 B — no resource_impact field → effective is None."""
+    m = mm.Module(
+        name="X",
+        fields={"Integration mode": "yaml_inject"},  # no resource_impact key
+        sections={"Integration notes": "scope: all"},
+    )
+    assert m.effective_resource_impact is None
+    print("✓ test_effective_resource_impact_returns_none_when_base_missing")
+
+
+def test_effective_resource_impact_cpu_fallback_orthogonal_to_scope():
+    """v1.12 B — cpu_fallback_risk is orthogonal axis; scope=all doesn't change it."""
+    notes = "yaml_inject spec:\n - scope: all"
+    m = _module_with_notes("yaml_inject", "cpu_fallback_risk", notes)
+    assert m.effective_resource_impact == "cpu_fallback_risk"
+    print("✓ test_effective_resource_impact_cpu_fallback_orthogonal_to_scope")
+
+
 if __name__ == "__main__":
     test_parse_basic()
     test_count_pending()
@@ -472,4 +581,16 @@ if __name__ == "__main__":
     test_preferred_locations_none_preserves_v172_behaviour()
     test_preferred_locations_case_insensitive()
     test_preferred_locations_empty_list_same_as_none()
+    # v1.12 — scope-dependent resource_impact
+    test_yaml_inject_scope_extracts_backbone()
+    test_yaml_inject_scope_extracts_all_case_insensitive()
+    test_yaml_inject_scope_none_for_hook_mode()
+    test_yaml_inject_scope_none_when_missing()
+    test_effective_resource_impact_zero_param_scope_all_escalates()
+    test_effective_resource_impact_vram_2x_scope_all_escalates_to_4x()
+    test_effective_resource_impact_4x_scope_all_no_further_escalation()
+    test_effective_resource_impact_backbone_scope_no_escalation()
+    test_effective_resource_impact_hook_mode_uses_base()
+    test_effective_resource_impact_returns_none_when_base_missing()
+    test_effective_resource_impact_cpu_fallback_orthogonal_to_scope()
     print("\nall tests passed")

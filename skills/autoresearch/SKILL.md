@@ -264,10 +264,108 @@ Skip ONLY if `pipeline_state.vanilla_baseline_done == True` already (e.g.
 resume after Loop 0 already ran).
 
 ```python
-import json, pathlib, subprocess
+import json, pathlib, subprocess, time, os
+from datetime import datetime, timedelta
 state = json.loads(pathlib.Path("pipeline_state.json").read_text())
 
 if not state.get("vanilla_baseline_done", False):
+    # ════════════════════════════════════════════════════════════════════
+    # v1.11 — Concurrent paper-finder spawn (BEFORE baseline launches)
+    # ════════════════════════════════════════════════════════════════════
+    # If user enabled concurrent paper-finder AND we haven't spawned the
+    # subagent yet for this pipeline run, kick it off now. The subagent
+    # runs in parallel with the baseline below; we wait + merge after.
+    import yaml as _yaml
+    cfg = _yaml.safe_load(pathlib.Path("research_config.yaml").read_text()) or {}
+    cpf_cfg = (cfg.get("orchestrator", {}) or {}).get("concurrent_paper_finder", {}) or {}
+    cpf_enabled = bool(cpf_cfg.get("enabled", True))   # v1.11 default True
+
+    if (cpf_enabled
+        and not state.get("concurrent_paper_finder_spawned", False)
+        and not state.get("paper_finder_done", False)):
+        # paper_finder.done sentinel from a previous run could still be on
+        # disk if user re-ran without clean. Remove it so our subagent's
+        # signal is unambiguous.
+        sentinel = pathlib.Path(state["project_root"]) / "paper_finder.done"
+        sentinel.unlink(missing_ok=True)
+        # Same for the subagent's state file.
+        pf_state = pathlib.Path(state["project_root"]) / "paper_finder_state.json"
+        pf_state.unlink(missing_ok=True)
+
+        # Spawn subagent via Task tool. The prompt MUST include cwd
+        # discipline (v1.9.2 lesson) and the explicit no-commit / no-touch
+        # main state contract.
+        subagent_prompt = f"""\
+You are a subagent for paper-finder Phase 5-6.
+
+CWD DISCIPLINE (CRITICAL):
+First action MUST be `cd "{state['project_root']}"`. Do NOT run from any
+other directory. Verify before each shell tool call that you're still in
+project_root.
+
+YOUR JOB:
+Run paper-finder Phase 5-6 ONLY. Phase 1 already ran (base_model.md
+exists in cwd). Read $SKILLS_DIR/paper-finder/SKILL.md (where SKILLS_DIR
+= "{state['skills_dir']}") and execute Phase 5 and Phase 6.
+
+Phase 5: collect improvement modules from the top papers identified in
+Phase 1's run.
+Phase 6: write modules.md via the canonical parser at $SKILLS_DIR/shared/modules_md.py.
+
+CONTRACTS YOU MUST RESPECT:
+1. Do NOT git commit. Main agent commits everything together later.
+2. Do NOT touch pipeline_state.json. It's the main agent's exclusive
+   write zone. Write your own progress to paper_finder_state.json instead.
+3. Write modules.md via mm.append_module — never raw markdown.
+4. When done, `touch paper_finder.done` as the LAST action. This is
+   the sentinel the main agent waits on.
+5. If you crash partway, do NOT touch paper_finder.done — main agent's
+   timeout will trip and trigger sequential fallback.
+
+DO NOT report findings to user. Just execute and write files. Main
+agent picks up the work after baseline finishes.
+
+Task description: {state['task']}
+Project root: {state['project_root']}
+Skills dir: {state['skills_dir']}
+"""
+        # v1.11.1 #7 — read subagent_type and subagent_model from yaml.
+        # subagent_type defaults to "general-purpose" (suits paper-finder's
+        # web search + parsing + file I/O work). subagent_model defaults
+        # to None = inherit from main agent. Override either if needed.
+        sub_type = cpf_cfg.get("subagent_type", "general-purpose")
+        sub_model = cpf_cfg.get("subagent_model")   # None = inherit
+
+        task_kwargs = dict(
+            description="paper-finder Phase 5-6 (concurrent with baseline)",
+            prompt=subagent_prompt,
+            subagent_type=sub_type,
+        )
+        if sub_model:
+            # Only pass model kwarg when explicitly set; otherwise the
+            # Task tool's default-inherit behaviour kicks in.
+            task_kwargs["model"] = sub_model
+
+        # Note: this is conceptual — actual Task tool invocation may have
+        # a different signature. Adapt to your environment.
+        Task(**task_kwargs)
+
+        state["concurrent_paper_finder_spawned"] = True
+        # v1.11.1 #7 — record what model + subagent_type the subagent ran on
+        # so discoveries.md narrative is informative for cost/quality review.
+        state["concurrent_paper_finder_subagent_type"] = sub_type
+        state["concurrent_paper_finder_subagent_model"] = sub_model or "<inherit>"
+        pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+        log_discovery(
+            f"Spawned concurrent paper-finder subagent for Phase 5-6 "
+            f"(subagent_type={sub_type}, model={sub_model or 'inherit'}). "
+            f"Will wait + merge after baseline completes.",
+            loop=0, category="observation",
+        )
+
+    # ════════════════════════════════════════════════════════════════════
+    # Baseline (unchanged from v1.10)
+    # ════════════════════════════════════════════════════════════════════
     # Confirm train.py is at vanilla state — no flags flipped, no injection
     src = pathlib.Path("train.py").read_text()
     if "ARCH_INJECTION_ENABLED = True" in src:
@@ -291,6 +389,82 @@ if not state.get("vanilla_baseline_done", False):
         shell=True, check=False,
     ).returncode
 
+    # ════════════════════════════════════════════════════════════════════
+    # v1.11 — Post-baseline: wait for concurrent subagent + merge
+    # ════════════════════════════════════════════════════════════════════
+    if state.get("concurrent_paper_finder_spawned") and not state.get("paper_finder_done"):
+        timeout_min = int(cpf_cfg.get("timeout_after_baseline_min", 30))
+        fallback_on_failure = bool(cpf_cfg.get("fallback_on_failure", True))
+        sentinel = pathlib.Path(state["project_root"]) / "paper_finder.done"
+        deadline = datetime.now() + timedelta(minutes=timeout_min)
+        poll_interval = 30   # seconds
+
+        while True:
+            if sentinel.exists():
+                # Subagent finished cleanly. Verify modules.md was written.
+                modules_md = pathlib.Path(state["project_root"]) / "modules.md"
+                if not modules_md.exists():
+                    log_discovery(
+                        "Concurrent paper-finder wrote done sentinel but "
+                        "modules.md missing. Treating as subagent failure.",
+                        loop=0, category="bug_workaround",
+                    )
+                    break   # falls through to fallback below
+                # Success path — mark done, merge state, commit
+                state["concurrent_paper_finder_done"] = True
+                state["modules_md_ready"] = True
+                state["paper_finder_done"] = True
+                # Merge any subagent-written state file
+                pf_state_file = pathlib.Path(state["project_root"]) / "paper_finder_state.json"
+                if pf_state_file.exists():
+                    pf_state = json.loads(pf_state_file.read_text())
+                    # Merge known-safe keys only (don't blanket-override)
+                    for k in ("paper_finder_phase5_count", "paper_finder_phase6_count"):
+                        if k in pf_state:
+                            state[k] = pf_state[k]
+                pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+                log_discovery(
+                    "Concurrent paper-finder completed; modules.md ready. "
+                    "Merged subagent state into pipeline_state.",
+                    loop=0, category="observation",
+                )
+                # Clean up sentinel + subagent state file
+                sentinel.unlink(missing_ok=True)
+                pf_state_file.unlink(missing_ok=True)
+                break
+
+            if datetime.now() > deadline:
+                # Timeout — subagent didn't finish in time
+                if not fallback_on_failure:
+                    raise RuntimeError(
+                        f"Concurrent paper-finder timed out after baseline + "
+                        f"{timeout_min} min, and fallback_on_failure=false. "
+                        f"Halting pipeline."
+                    )
+                log_discovery(
+                    f"Concurrent paper-finder timed out (waited {timeout_min} min "
+                    f"after baseline). Falling back to sequential paper-finder.",
+                    loop=0, category="bug_workaround",
+                )
+                state["concurrent_paper_finder_fallback_used"] = True
+                pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+                # Run paper-finder sequentially now (blocks). This is the
+                # same invocation Stage 1 sequential mode uses, but limited
+                # to Phase 5-6 since Phase 1's base_model.md already exists.
+                # IMPLEMENTATION NOTE: spawn a NEW subagent or run inline —
+                # whichever your environment supports. Either way, this is
+                # blocking; we don't continue until modules.md is written.
+                run_paper_finder_phase56_sequential(state)
+                state["paper_finder_done"] = True
+                state["modules_md_ready"] = True
+                pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+                break
+
+            time.sleep(poll_interval)
+
+    # ════════════════════════════════════════════════════════════════════
+    # Parse + record baseline (unchanged from v1.10)
+    # ════════════════════════════════════════════════════════════════════
     # Parse metrics, write to results.tsv as loop=0, mark as keep (it IS
     # the baseline by definition — no comparison needed)
     # Use the same parse_metrics + append_result helpers as later loops.
@@ -303,6 +477,41 @@ if not state.get("vanilla_baseline_done", False):
     pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
     # Then enter the regular Loop at iteration 1.
 ```
+
+#### v1.11 — Operational notes for concurrent paper-finder
+
+- **Resume safety**: if the agent crashes mid-Loop 0 and resumes, the
+  `concurrent_paper_finder_spawned: True` flag prevents double-spawn.
+  The subagent process from before may have died with the agent;
+  there's no way to re-attach. On resume, the subagent appears "still
+  pending"; the wait loop runs to timeout, then fallback fires. This
+  is the safest behaviour — better to repeat Phase 5-6 than to
+  miss it.
+
+- **Sentinel hygiene**: the spawn block deletes
+  `paper_finder.done` and `paper_finder_state.json` before spawning.
+  This prevents stale-sentinel false-positive (subagent crashed last
+  pipeline run, left sentinel from EARLIER successful run on disk).
+
+- **No commit during concurrent path**: the subagent contract forbids
+  git commit. The main agent commits baseline + paper-finder outputs
+  TOGETHER after merge (the existing `git add train.py` + commit above
+  is the baseline commit; modules.md / base_model.md changes get
+  committed in Step 4 of Loop 1's first iteration via the existing
+  Step 4 commit logic).
+
+- **CWD discipline propagation**: the subagent prompt MUST include
+  `cd "{state['project_root']}"` as first action. v1.9.2's cross-
+  project pollution defence applies to subagents too — they're a
+  separate process and can land in any cwd.
+
+- **Time savings**: paper-finder Phase 5-6 takes ~2h on a moderately
+  complex task. Loop 0 baseline takes ~TIME_BUDGET (1200s default,
+  20 min for fast iteration; 7200s = 2h for production runs). When
+  baseline is shorter than paper-finder, the wait loop activates and
+  the savings is `min(baseline_runtime, paper-finder_runtime)`. When
+  baseline is longer (production setup), savings is the full
+  paper-finder runtime — typical ~2h.
 
 After Loop 0 completes, `results.tsv` has one row at loop=0 with
 `description=vanilla baseline`, `status=keep`. The iterative loop starts at
@@ -1072,77 +1281,77 @@ and locked into `pipeline_state.loop_time_budget`. If an experiment is slow, hal
 **Never modify `SEED`** — the random seed must be identical across all runs so that
 differences in the primary metric reflect the change being tested, not randomness.
 
-#### v1.9 — Resource-impact auto-halve
+#### v1.12 — Resource-impact predictive skip (no auto-halve)
 
-When the chosen module's `resource_impact` field is set, automatically halve
-`BATCH_SIZE` in train.py BEFORE running the experiment. This prevents the
-silent CPU `TaskAlignedAssigner` fallback (real run's Loop 7 — EMA at
-batch=64 silently went to CPU, training 3-7× slower, run discarded as
-"untrainable in equal-budget regime" without anyone realising the assigner
-moved).
+**Changed in v1.12 from v1.9.** Previously this block auto-halved
+`BATCH_SIZE` for memory-heavy modules. v1.12 LOCKS BATCH_SIZE (see
+orchestrator § Locked variables) — autoresearch can no longer modify
+it. Instead, when a module's effective resource impact predicts OOM at
+the locked batch size, autoresearch SKIPS the experiment entirely and
+marks the module `blocked` in modules.md. This trades dynamic
+adaptation for fair comparison: every experiment that runs uses the
+same batch as the baseline, and modules that can't fit at that batch
+are surfaced (not silently re-fit).
 
 ```python
-import re, pathlib
+# Read the module's EFFECTIVE resource_impact — this is v1.12's
+# scope-aware version: scope=all on a yaml_inject module escalates the
+# tag by one tier (none → vram_2x → vram_4x). Real-world Loop 1
+# evidence: FlexSimAM tagged "none" but with scope=all consumed enough
+# VRAM for CPU assigner fallback.
+impact = chosen.effective_resource_impact   # v1.12 — Module property
 
-# Read the module's resource_impact (None if not set)
-impact = chosen.resource_impact   # via Module.resource_impact property
+# Predict whether this module can fit at the locked batch size.
+# Heuristic: vram_4x assumes baseline already uses ~25% of GPU, so
+# 4× would exceed 100%. vram_2x assumes baseline uses ~50% — usually
+# fits. The user is responsible for choosing yaml batch_size with
+# enough headroom (~20GB free at baseline) for vram_2x modules to run.
+locked_batch = state["batch_size"]   # canonical value, never changes
+will_likely_oom = (impact == "vram_4x")
+will_likely_cpu_fallback = (impact == "cpu_fallback_risk")
 
-halve_count = {
-    "vram_4x":           2,   # ×0.25 (halve twice)
-    "vram_2x":           1,   # ×0.5
-    "cpu_fallback_risk": 1,   # ×0.5 + log
-}.get(impact, 0)
-
-if halve_count > 0:
-    src = pathlib.Path("train.py").read_text()
-    m = re.search(r"(?m)^BATCH_SIZE\s*=\s*(\d+)", src)
-    if m:
-        original = int(m.group(1))
-        reduced = max(1, original >> halve_count)   # >>n = halve n times
-        if reduced != original:
-            new_src = re.sub(
-                r"(?m)^BATCH_SIZE\s*=\s*\d+",
-                f"BATCH_SIZE     = {reduced}",
-                src, count=1,
-            )
-            pathlib.Path("train.py").write_text(new_src)
-            log_discovery(
-                f"Auto-halved BATCH_SIZE {original} → {reduced} "
-                f"(resource_impact={impact!r}, halve_count={halve_count}). "
-                f"Will restore to {original} on next non-impacting iteration.",
-                loop=state.get("loop_count", 0),
-                category="resource_constraint",
-            )
-            # Track the original so we can restore on the NEXT iteration
-            state["batch_size_pre_autohalve"] = original
-            pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
-
-# At the start of each iteration: if previous iteration auto-halved, restore.
-# Done BEFORE the halve check so that an iteration NOT touching a high-impact
-# module gets the original BATCH_SIZE back.
-elif state.get("batch_size_pre_autohalve"):
-    src = pathlib.Path("train.py").read_text()
-    original = state["batch_size_pre_autohalve"]
-    new_src = re.sub(
-        r"(?m)^BATCH_SIZE\s*=\s*\d+",
-        f"BATCH_SIZE     = {original}",
-        src, count=1,
+if will_likely_oom or will_likely_cpu_fallback:
+    # Skip this iteration before launching train.py. Mark module blocked,
+    # log discoveries, advance to next pending module.
+    reason = "vram_4x effective" if will_likely_oom else "cpu_fallback_risk"
+    log_discovery(
+        f"Skipping {chosen.name}: effective_resource_impact={impact!r} "
+        f"({reason}) likely exceeds locked BATCH_SIZE={locked_batch} "
+        f"capacity. v1.12 does not auto-halve BATCH_SIZE; module "
+        f"marked blocked. To enable this module, lower yaml "
+        f"`autoresearch.loop.batch_size` enough for it to fit, then "
+        f"re-run from Loop 0 (baseline must use the new batch).",
+        loop=state.get("loop_count", 0),
+        category="resource_constraint",
     )
-    pathlib.Path("train.py").write_text(new_src)
-    state["batch_size_pre_autohalve"] = None
+    mm.update_status("modules.md", chosen.name, "blocked")
+    state.setdefault("blocked_modules", []).append(chosen.name)
     pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+    return   # back to top of Loop, pick next pending
 ```
 
-The auto-halve is **per-iteration** — if an iteration doesn't touch a
-high-impact module, BATCH_SIZE is restored to whatever it was before the
-last auto-halve. This prevents the halve from being sticky: a yaml_inject
-attention experiment that runs at batch=16 doesn't lock subsequent
-hyperparameter sweeps into batch=16 too.
+The "blocked" status is sticky for this pipeline run. If the user
+genuinely wants to test the module, they need to:
+1. Lower yaml `autoresearch.loop.batch_size` to something the module
+   can fit at
+2. Re-run from Loop 0 (baseline must use the same lowered batch for
+   fair comparison)
+3. The previously-blocked module returns to "pending" automatically
+   because Loop 0 re-baseline triggers state reset
 
-The halve does NOT interact with the crash-pause halve (Step 9 § Crash
-Diagnosis) — those are independent and cumulative. If both fire, the
-final batch is the result of both reductions; that's the safest behaviour
-under combined resource pressure.
+This is a deliberate decision: v1.12 prioritises experimental fairness
+over coverage. A module that can only run at half the baseline batch
+isn't comparable to other modules at full batch. v1.12 surfaces the
+incompatibility loudly rather than papering over it.
+
+**What was removed in v1.12** (compared to v1.9):
+- Auto-halve to `original >> halve_count` for vram_4x / vram_2x
+- `state["batch_size_pre_autohalve"]` tracking + restore
+- Per-iteration halve/restore cycle
+
+**What's still present**:
+- Module property `effective_resource_impact` (v1.12 scope-aware version)
+- `cpu_fallback_risk` detection (now a skip trigger, not a halve trigger)
 
 ---
 
@@ -1366,7 +1575,8 @@ Categories the classifier returns:
 | `tier1_init_signature`   | `TypeError: ...__init__() got unexpected kwarg` / `missing required arg` | Read stderr's class name, inspect the class, adjust `yaml_args` or `module_kwargs` in `arch_spec.json` (yaml_inject) or the `USE_*` branch's call site (hook) |
 | `tier1_syntax`           | `SyntaxError` in agent-written file | Read file, fix syntax |
 | `tier2_shape_mismatch`   | `RuntimeError: Given groups=1, weight of size [...]` / tensor-size-mismatch / mat1/mat2 shape | Tier-2 adapter repair — see Step 5.5c |
-| `oom`                    | `CUDA out of memory` | Existing v1.6 OOM path — halve `BATCH_SIZE`, not counted against repair attempts. |
+| `oom`                    | `CUDA out of memory` | **v1.12 — discard + block module.** Previously halved BATCH_SIZE; v1.12 locks BATCH_SIZE so OOM means "this module + this batch don't fit on this GPU." Mark module `blocked` in modules.md, log to discoveries.md as `resource_constraint`. User can lower yaml `batch_size` and re-run from Loop 0 if they want this module. |
+| `auto_batch_reduce`      | run.log contains `WARNING ⚠️ CUDA out of memory with batch=...Reducing to batch=` | **v1.12 NEW.** ultralytics' built-in OOM handler tried to silently halve batch and retry. This breaks fair comparison (run was trained at smaller batch than baseline). Treat as ContractViolation → discard + block module. Same recovery path as `oom`. |
 | `unfixable_layer_map`    | `transfer_weights strict mode: N entries 0 tensors` | Go straight to Step 7 discard. The insertion spec is architecturally wrong (scope too wide, wrong class name, position disagreeing with the base model's layer layout). |
 | `unfixable_weight_transfer` | `size mismatch for model.N.*` during state_dict load | Same — discard. |
 | `unfixable_dtype_device` | 2D vs 3D conv confusion, CPU/GPU mixing | Discard. |
@@ -1606,6 +1816,29 @@ if violations:
     state["consecutive_crashes"] = state.get("consecutive_crashes", 0) + 1
     pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
     raise invariants.ContractViolation(violations)
+
+# v1.12 — second freshness-adjacent check: did ultralytics auto-reduce
+# batch mid-run? If so, the run was trained at a smaller batch than the
+# locked one — results not comparable to baseline. Treat as discard +
+# mark module blocked.
+batch_violations = invariants.check_no_ultralytics_auto_batch_reduce(str(run_log_path))
+if batch_violations:
+    log_discovery(
+        invariants.format_violations(batch_violations),
+        loop=state.get("loop_count", 0),
+        category="resource_constraint",
+    )
+    # Mark the module that was being tested as blocked — it can't fit at
+    # the locked batch on this GPU.
+    if state.get("current_module"):
+        try:
+            mm.update_status("modules.md", state["current_module"], "blocked")
+            state.setdefault("blocked_modules", []).append(state["current_module"])
+        except Exception:
+            pass   # if modules.md not present (e.g. baseline iteration), skip
+    state["consecutive_crashes"] = state.get("consecutive_crashes", 0) + 1
+    pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
+    raise invariants.ContractViolation(batch_violations)
 ```
 
 This is the contract that says "I verified run.log is mine before
@@ -1693,7 +1926,7 @@ mm.update_status("modules.md", "<Module Name>",
 
 **Consecutive-crash handling (A3/C8).** After the decision for this iteration
 is made (Step 7) and before returning to Step 1, update crash counters and
-possibly halve `BATCH_SIZE`:
+possibly trigger a crash-pause:
 
 ```python
 import re, subprocess
@@ -1707,85 +1940,42 @@ else:
     state["consecutive_crashes"] = 0
 
 if state["consecutive_crashes"] >= crash_pause_after:
-    # v1.7.6 — fixed crash-pause sequencing.
+    # v1.12 — crash-pause no longer halves BATCH_SIZE.
     #
-    # Previous order: halve BATCH_SIZE in working tree → git reset --hard HEAD~1
-    # Bug: `git reset --hard` reverts both the broken commit AND the halve in
-    #      the working tree. Next loop reads the unchanged BATCH_SIZE from
-    #      train.py, crashes again the same way, counter resets to 0 after 3,
-    #      halve runs but is reset again — infinite loop with no observable
-    #      forward progress.
-    # Fix order: revert first → halve in clean working tree → commit halve so
-    #            the smaller BATCH_SIZE survives any later reset.
+    # Why removed: BATCH_SIZE is now LOCKED (invariants.LOCKED_VARS).
+    # Halving it mid-run would create a contract violation on the very
+    # next commit. Instead, after N consecutive crashes, autoresearch
+    # logs the symptom loudly and CONTINUES the loop. The user's options:
+    #   1. Lower yaml `autoresearch.loop.batch_size` and re-run from Loop 0
+    #   2. Disable the modules that keep crashing (mark blocked manually
+    #      or fix root cause and retry)
+    #   3. Inspect run.log + discoveries.md to identify the root cause
     #
-    # Also: v1.7.6 detects BATCH_SIZE=1 and stops further halving with a
-    # discoveries log (Bug 5 from review). Previous behaviour halved 1 → 1
-    # forever and did the revert dance every 3 crashes with no real change.
+    # Compared to v1.7.6 - v1.11.1 behaviour:
+    #   - No more git reset --hard HEAD~1 (the autoresearch commit revert)
+    #   - No more BATCH_SIZE halve + commit
+    #   - State counter still resets so the next 3 crashes can re-trigger
+    #     this log (loop spam protection)
 
-    # Step 1 — revert the broken commit FIRST (clean working tree)
-    subprocess.run(["git", "reset", "--hard", "HEAD~1"], check=False)
-
-    # Step 2 — read current BATCH_SIZE (after revert) and decide what to do
-    halved_any = False
-    floored_any = False
-    for script in ("train.py", "track.py"):
-        p = pathlib.Path(script)
-        if not p.exists():
-            continue
-        src = p.read_text()
-        m = re.search(r"(?m)^BATCH_SIZE\s*=\s*(\d+)", src)
-        if not m:
-            continue
-        current = int(m.group(1))
-        if current <= 1:
-            # Already at floor — halving would do nothing (1//2 = 0, max=1).
-            # Don't write the file, don't commit a no-op. Log and let
-            # autoresearch keep retrying — but the next 3 crashes won't
-            # trigger another silent halve; they'll trigger another log.
-            floored_any = True
-            continue
-        new_bs = max(1, current // 2)
-        p.write_text(re.sub(
-            r"(?m)^BATCH_SIZE\s*=.*$",
-            f"BATCH_SIZE     = {new_bs}",
-            src, count=1))
-        halved_any = True
-
-    # Step 3 — commit the halve so it survives future resets
-    if halved_any:
-        subprocess.run(["git", "add", "train.py"], check=False)
-        subprocess.run(["git", "add", "track.py"], check=False)   # no-op if absent
-        subprocess.run(
-            ["git", "commit", "-m",
-             f"crash-pause: halve BATCH_SIZE after {crash_pause_after} crashes"],
-            check=False,
-        )
-        log_discovery(
-            f"{crash_pause_after} consecutive crashes. Reverted last "
-            f"experiment, halved BATCH_SIZE, committed. Continuing loop.",
-            loop=state.get("loop_count", 0),
-            category="bug_workaround",
-        )
-    elif floored_any:
-        # Already at floor. Don't pretend to fix anything — flag clearly
-        # so the user can intervene (smaller image size, fewer epochs,
-        # different model). Counter still resets to avoid loop spam.
-        log_discovery(
-            f"{crash_pause_after} consecutive crashes but BATCH_SIZE "
-            f"already at 1. Cannot reduce further. Possible causes: model "
-            f"too large, IMGSZ too high, NaN gradients, broken module. "
-            f"Manual intervention recommended; loop continues anyway.",
-            loop=state.get("loop_count", 0),
-            category="limitation",
-        )
-
+    log_discovery(
+        f"{crash_pause_after} consecutive crashes. v1.12 does NOT halve "
+        f"BATCH_SIZE (it's locked). User options: (a) lower yaml "
+        f"autoresearch.loop.batch_size and re-run from Loop 0, "
+        f"(b) inspect crashing modules and mark blocked manually, or "
+        f"(c) investigate root cause via run.log + recent commits. "
+        f"Loop continues; same crash will be retried unless you intervene.",
+        loop=state.get("loop_count", 0),
+        category="bug_workaround",
+    )
     state["consecutive_crashes"] = 0
 
 pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
 ```
 
-This is the sole implementation of `autoresearch_crash_pause_after`. Without
-this block the yaml setting is advertised but inert.
+This is the v1.12 replacement for `autoresearch_crash_pause_after`'s
+auto-halve behaviour. The yaml setting still controls when the
+crash-pause log fires, but the action is now log-only — no automatic
+mutation of locked variables.
 
 ---
 

@@ -9,6 +9,34 @@ keeping what improves the primary metric.
 Supports `task_type: object_detection` and `object_tracking`, driven entirely
 by `research_config.yaml`. No skill hardcodes a specific metric.
 
+**This is v1.12** — strict fair-comparison mode. **BREAKING**:
+`BATCH_SIZE` is now LOCKED across all iterations (same enforcement as
+IMGSZ/SEED/TIME_BUDGET). Auto-halve paths removed: v1.9
+`resource_impact` halve replaced with predictive skip-and-block,
+v1.7.6 crash-pause halve replaced with log-only, ultralytics auto-
+batch-reduce now caught as ContractViolation. New `effective_resource_impact`
+property: `scope: all` on yaml_inject escalates the tag (`none` →
+`vram_2x`, `vram_2x` → `vram_4x`) — fixes real-world FlexSimAM
+silent CPU fallback. yaml field renamed `initial_batch_size` →
+`batch_size` (alias kept). +18 tests (143 → 161). See
+`CHANGELOG_v1.12.md` for migration steps.
+
+**This is v1.11.1** — patch release fixing 4 bugs surfaced by a
+v1.11 production run. **BREAKING change**: `reapply_on_rebuild`
+callback signature `cb(m) → cb(layers)`. Other 3 fixes are
+non-breaking: PicklableHook auto device sync, inject_modules
+ModuleList anti-pattern invariant, yaml-configurable subagent_type +
+subagent_model. See `CHANGELOG_v1.11.1.md` for migration steps.
+
+**This is v1.11** — concurrent paper-finder during baseline. Save
+~2h wallclock per pipeline startup by spawning paper-finder Phase 5-6
+as a subagent in parallel with Loop 0 vanilla baseline. Defaults to
+enabled; user can disable via `orchestrator.concurrent_paper_finder.
+enabled: false`. 30 min timeout post-baseline → fall back to
+sequential. Stage 1 splits Phase 1-4 (sequential, blocks Stage 2)
+from Phase 5-6 (concurrent with Loop 0). Drop-in. SKILL+yaml only.
+See `CHANGELOG_v1.11.md`.
+
 **This is v1.10** — paper-finder source diversification + dedup. Adds
 HuggingFace Papers as Source 6 (ML-specialised ranking, fixes PwC
 coverage gaps) and a new Phase 2.5 cross-source dedup step (collapses
@@ -231,6 +259,9 @@ CHANGELOG_v1.9.1.md                         · module_priority yaml dead-config 
 CHANGELOG_v1.9.2.md                         · cross-project run.log pollution fix
 CHANGELOG_v1.9.3.md                         · initial BATCH_SIZE configurable from yaml
 CHANGELOG_v1.10.md                          · paper-finder HF Papers + cross-source dedup
+CHANGELOG_v1.11.md                          · concurrent paper-finder during baseline
+CHANGELOG_v1.11.1.md                        · hook + invariant + subagent fixes (BREAKING reapply)
+CHANGELOG_v1.12.md                          · BATCH_SIZE locked + scope-aware resource_impact (BREAKING)
 ```
 
 ---
@@ -403,13 +434,38 @@ SDK (`pip install firecrawl-py`) per the caveat in paper-finder Phase 2.
 
 ## Versions
 
-See `CHANGELOG_v1.10.md`, `CHANGELOG_v1.9.3.md`, `CHANGELOG_v1.9.2.md`, `CHANGELOG_v1.9.1.md`,
+See `CHANGELOG_v1.12.md`, `CHANGELOG_v1.11.1.md`, `CHANGELOG_v1.11.md`, `CHANGELOG_v1.10.md`, `CHANGELOG_v1.9.3.md`, `CHANGELOG_v1.9.2.md`, `CHANGELOG_v1.9.1.md`,
 `CHANGELOG_v1.9.md`, `CHANGELOG_v1.8.md`, `CHANGELOG_v1.7.7.md`,
 `CHANGELOG_v1.7.6.md`, `CHANGELOG_v1.7.5.md`, `CHANGELOG_v1.7.4.md`,
 `CHANGELOG_v1.7.3.md`, `CHANGELOG_v1.7.2.md`, `CHANGELOG_v1.7.1.md`,
 `CHANGELOG_v1.7.md`, and `CHANGELOG_v1.6.md` for recent release notes.
 
-- **v1.10** (current): paper-finder source diversification + dedup.
+- **v1.12** (current): strict fair-comparison mode. **BREAKING**:
+  `BATCH_SIZE` LOCKED across iterations. v1.9 `resource_impact` auto-
+  halve replaced with predictive skip-and-block (modules predicted
+  to OOM are marked `blocked`, never run). v1.7.6 crash-pause halve
+  replaced with log-only. New invariant
+  `check_no_ultralytics_auto_batch_reduce` catches ultralytics' own
+  silent batch reduction. New `Module.effective_resource_impact`:
+  scope=all escalates tag one tier (fixes FlexSimAM silent CPU
+  fallback). yaml renamed `initial_batch_size` → `batch_size` (alias
+  kept). +18 tests (143 → 161). State migration backward-compatible.
+- **v1.11.1**: patch — 4 fixes from real-run feedback.
+  **BREAKING**: `reapply_on_rebuild` callback signature changed
+  `cb(m) → cb(layers)`; helper `_get_layers` resolves DetectionModel
+  vs YOLO wrapper shapes; WARNING → RuntimeError. Plus: PicklableHook
+  auto device sync (CPU sub-modules → output.device on first call),
+  new invariant blocks `inject_modules() → ModuleList` anti-pattern
+  at commit, yaml-configurable subagent_type + subagent_model. +14
+  tests (129 → 143).
+- **v1.11**: concurrent paper-finder. Spawns paper-finder
+  Phase 5-6 as a subagent during Loop 0 vanilla baseline, saving ~2h
+  per pipeline startup. Defaults to enabled. 30 min timeout →
+  graceful fallback to sequential. Stage 1 splits into Phase 1-4
+  (sequential, produces base_model.md) + Phase 5-6 (concurrent with
+  Loop 0). New paper-finder modes `initial_phase1_only` and
+  `phase56_only`. Drop-in. SKILL+yaml only.
+- **v1.10**: paper-finder source diversification + dedup.
   Adds HuggingFace Papers as Source 6 (ML-specialised ranking, fills
   PwC coverage gaps) + Phase 2.5 cross-source dedup (collapses
   duplicate papers across arXiv / PwC / S2 / HF / Local, merges

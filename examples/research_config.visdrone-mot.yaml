@@ -173,9 +173,9 @@ autoresearch:
     max_runtime_multiplier: 2      # Kill as crashed if exceeds budget × this.
     iterations: null               # null = run forever until interrupted (see orchestrator.stopping).
     seed: 42                       # Locked across runs.
-    initial_batch_size: 16         # [optional, v1.9.3+] Starting BATCH_SIZE. Stage 0 patches train.py.
-                                   # NOT locked — autoresearch may halve dynamically (resource_impact, crash-pause).
-                                   # See visdrone-detection.yaml for sizing guidance.
+    initial_batch_size: 16         # [DEPRECATED v1.12 — use `batch_size`]
+    batch_size: 16                 # [v1.12+] LOCKED BATCH_SIZE. invariants enforce no drift across iterations.
+                                   # See visdrone-detection.yaml for full description and sizing guidance.
   optimizer: SGD                   # [v1.7.7] Initial optimizer for train.py. Permitted: SGD/AdamW/Adam/RMSProp/NAdam/RAdam. Cannot be 'auto' (silently overrides LR0/MOMENTUM). autoresearch may swap during experiments but never to 'auto'.
   stall:
     threshold: 10                  # Consecutive no-improvement rounds before triggering paper finder expand.
@@ -213,6 +213,12 @@ orchestrator:
   git:
     auto_init: true
     branch_prefix: "autoresearch/"
+  concurrent_paper_finder:         # [optional, v1.11+] See visdrone-detection.yaml for full description.
+    enabled: true
+    timeout_after_baseline_min: 30
+    fallback_on_failure: true
+    subagent_type: "general-purpose"  # v1.11.1+
+    subagent_model: null              # v1.11.1+ — null = inherit; "haiku"/"sonnet"/"opus" to override
 
 # -----------------------------------------------------------------------------
 # advanced

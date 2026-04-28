@@ -349,6 +349,153 @@ def test_run_log_fresh_no_step5_timestamp_skips_freshness():
     print("✓ test_run_log_fresh_no_step5_timestamp_skips_freshness")
 
 
+# ─── v1.11.1 #3 tests — inject_modules ModuleList anti-pattern ─────────────
+
+
+def test_inject_modules_no_modulelist_clean():
+    """v1.11.1 #3 — inject_modules using PicklableHook.attach is OK."""
+    src = '''\
+def inject_modules(model) -> Any:
+    layers = _get_layers(model)
+    PicklableHook.attach(layers[10], CBAMHook, channels=256)
+    return model
+'''
+    violations = inv.check_no_modulelist_replacement_in_inject_modules(src, "train.py")
+    assert violations == []
+    print("✓ test_inject_modules_no_modulelist_clean")
+
+
+def test_inject_modules_modulelist_replacement_detected():
+    """v1.11.1 #3 — `model.model.model = ...` inside inject_modules raises violation."""
+    src = '''\
+def inject_modules(model) -> Any:
+    new_layers = list(model.model.model)
+    new_layers.insert(5, AttentionBlock(256))
+    model.model.model = nn.ModuleList(new_layers)
+    return model
+'''
+    violations = inv.check_no_modulelist_replacement_in_inject_modules(src, "train.py")
+    assert len(violations) == 1
+    v = violations[0]
+    assert v.rule == "inject_modules_no_modulelist_replacement"
+    assert "PicklableHook.attach" in v.hint
+    assert "apply_yaml_spec" in v.hint   # weight_transfer.apply_yaml_spec referenced
+    print("✓ test_inject_modules_modulelist_replacement_detected")
+
+
+def test_inject_modules_assignment_outside_function_ok():
+    """v1.11.1 #3 — `model.model.model = ...` OUTSIDE inject_modules() body
+    doesn't trigger; only assignments inside the function body are wrong.
+    (Real code might do this in main() after model is built, with awareness.)"""
+    src = '''\
+def inject_modules(model) -> Any:
+    PicklableHook.attach(model.model.model[10], CBAMHook, channels=256)
+    return model
+
+def main():
+    model = YOLO("yolo26x.pt")
+    # Outside inject_modules — different concern
+    something_else = model.model.model
+'''
+    violations = inv.check_no_modulelist_replacement_in_inject_modules(src, "train.py")
+    assert violations == []
+    print("✓ test_inject_modules_assignment_outside_function_ok")
+
+
+def test_inject_modules_no_function_ok():
+    """v1.11.1 #3 — script with no inject_modules() at all is fine."""
+    src = '''\
+from ultralytics import YOLO
+model = YOLO("yolov8x.pt")
+model.train(data="dataset.yaml", epochs=10)
+'''
+    violations = inv.check_no_modulelist_replacement_in_inject_modules(src, "train.py")
+    assert violations == []
+    print("✓ test_inject_modules_no_function_ok")
+
+
+# ─── v1.12 C+D — BATCH_SIZE locked + ultralytics auto-batch-reduce check ──
+
+
+def test_locked_variables_batch_size_match():
+    """v1.12 — BATCH_SIZE in script matches state['batch_size'] → no violation."""
+    src = "BATCH_SIZE = 32\nIMGSZ = 640\nSEED = 42\nTIME_BUDGET = 1200"
+    state = {"batch_size": 32, "imgsz": 640, "seed": 42, "loop_time_budget": 1200}
+    violations = inv.check_locked_variables(src, state)
+    assert violations == []
+    print("✓ test_locked_variables_batch_size_match")
+
+
+def test_locked_variables_batch_size_drift_detected():
+    """v1.12 — BATCH_SIZE changed in script vs state raises violation."""
+    src = "BATCH_SIZE = 16\nIMGSZ = 640\nSEED = 42\nTIME_BUDGET = 1200"
+    state = {"batch_size": 32, "imgsz": 640, "seed": 42, "loop_time_budget": 1200}
+    violations = inv.check_locked_variables(src, state)
+    assert len(violations) == 1
+    v = violations[0]
+    assert v.rule == "BATCH_SIZE_locked"
+    assert v.expected == 32
+    assert v.observed == 16
+    print("✓ test_locked_variables_batch_size_drift_detected")
+
+
+def test_locked_variables_batch_size_state_missing_skipped():
+    """v1.12 — pre-v1.12 state without batch_size key skips the check (graceful migration)."""
+    src = "BATCH_SIZE = 32\nIMGSZ = 640\nSEED = 42\nTIME_BUDGET = 1200"
+    state = {"imgsz": 640, "seed": 42, "loop_time_budget": 1200}  # no batch_size
+    violations = inv.check_locked_variables(src, state)
+    # Other locked vars match → no violations; batch_size silently skipped.
+    assert violations == []
+    print("✓ test_locked_variables_batch_size_state_missing_skipped")
+
+
+def test_auto_batch_reduce_clean_log_passes():
+    """v1.12 C — clean run.log without ultralytics warning passes."""
+    import tempfile, pathlib as P
+    with tempfile.TemporaryDirectory() as d:
+        log = P.Path(d) / "run.log"
+        log.write_text("Epoch 1/10 ... loss: 0.5\nEpoch 2/10 ... loss: 0.4\n")
+        violations = inv.check_no_ultralytics_auto_batch_reduce(str(log))
+    assert violations == []
+    print("✓ test_auto_batch_reduce_clean_log_passes")
+
+
+def test_auto_batch_reduce_warning_detected():
+    """v1.12 C — Loop 10 ultralytics warning detected verbatim."""
+    import tempfile, pathlib as P
+    log_content = """Epoch 1/10 starting...
+WARNING ⚠️ CUDA out of memory with batch=64. Reducing to batch=32 and retrying (1/3).
+Epoch 1/10 retrying at batch=32..."""
+    with tempfile.TemporaryDirectory() as d:
+        log = P.Path(d) / "run.log"
+        log.write_text(log_content)
+        violations = inv.check_no_ultralytics_auto_batch_reduce(str(log))
+    assert len(violations) == 1
+    v = violations[0]
+    assert v.rule == "ultralytics_auto_batch_reduce_detected"
+    assert "batch_size" in v.hint   # mentions yaml field
+    print("✓ test_auto_batch_reduce_warning_detected")
+
+
+def test_auto_batch_reduce_missing_log_passes():
+    """v1.12 C — no run.log file → check passes (other freshness check catches missing)."""
+    violations = inv.check_no_ultralytics_auto_batch_reduce("/nonexistent/run.log")
+    assert violations == []
+    print("✓ test_auto_batch_reduce_missing_log_passes")
+
+
+def test_auto_batch_reduce_case_insensitive():
+    """v1.12 C — match works regardless of CUDA / cuda casing."""
+    import tempfile, pathlib as P
+    log_content = "warning ⚠️ cuda out of memory with batch=64. reducing to batch=32"
+    with tempfile.TemporaryDirectory() as d:
+        log = P.Path(d) / "run.log"
+        log.write_text(log_content)
+        violations = inv.check_no_ultralytics_auto_batch_reduce(str(log))
+    assert len(violations) == 1
+    print("✓ test_auto_batch_reduce_case_insensitive")
+
+
 TESTS = [
     test_locked_variables_all_match,
     test_locked_variables_imgsz_changed,
@@ -380,6 +527,19 @@ TESTS = [
     test_run_log_fresh_stale,
     test_run_log_fresh_clean,
     test_run_log_fresh_no_step5_timestamp_skips_freshness,
+    # v1.11.1 #3 — inject_modules ModuleList anti-pattern
+    test_inject_modules_no_modulelist_clean,
+    test_inject_modules_modulelist_replacement_detected,
+    test_inject_modules_assignment_outside_function_ok,
+    test_inject_modules_no_function_ok,
+    # v1.12 C+D — BATCH_SIZE locked + auto-batch-reduce
+    test_locked_variables_batch_size_match,
+    test_locked_variables_batch_size_drift_detected,
+    test_locked_variables_batch_size_state_missing_skipped,
+    test_auto_batch_reduce_clean_log_passes,
+    test_auto_batch_reduce_warning_detected,
+    test_auto_batch_reduce_missing_log_passes,
+    test_auto_batch_reduce_case_insensitive,
 ]
 
 if __name__ == "__main__":

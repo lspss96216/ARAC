@@ -397,12 +397,28 @@ Apply it in both branches:
       "no_improvement_loops":  0,               # v1.8 — for autonomous stop trigger
       "pretrain_dead_config_warned": False,     # v1.8 — one-time warning latch
       "batch_size_pre_autohalve": None,         # v1.9 — restore BATCH_SIZE after resource_impact halve
+      # v1.11 — concurrent paper-finder state
+      # spawned: did we Task() spawn the subagent for this pipeline run? Resume-safe.
+      # done:    has subagent written paper_finder.done sentinel? Mirrored from disk for state queries.
+      # fallback_used: did sequential fallback fire? For discoveries.md narrative.
+      "concurrent_paper_finder_spawned":      False,
+      "concurrent_paper_finder_done":         False,
+      "concurrent_paper_finder_fallback_used": False,
+      # v1.11.1 — subagent provenance (informative only; populated by Loop 0 spawn)
+      "concurrent_paper_finder_subagent_type":  None,
+      "concurrent_paper_finder_subagent_model": None,
       "seed":                  ar.get("loop", {}).get("seed", 42),
-      # v1.9.3 — initial BATCH_SIZE for train.py. None signals "use template default"
-      # (currently 16). Stage 0 Step 3 patches train.py with this if not None.
-      # Unlike IMGSZ/SEED/TIME_BUDGET, this is NOT locked — autoresearch may
-      # halve dynamically (resource_impact auto-halve, crash-pause halve, OOM).
-      "initial_batch_size":    ar.get("loop", {}).get("initial_batch_size"),
+      # v1.12 — BATCH_SIZE is now LOCKED (invariants.LOCKED_VARS includes
+      # "batch_size"). yaml field renamed: `batch_size` (v1.12+) preferred,
+      # `initial_batch_size` (v1.9.3) still accepted for backward compat.
+      # Lookup priority:
+      #   1. yaml's `autoresearch.loop.batch_size` (v1.12)
+      #   2. yaml's `autoresearch.loop.initial_batch_size` (deprecated alias)
+      #   3. None → template default (16)
+      # Stored ONLY as state["batch_size"] regardless of which yaml key
+      # was read; downstream invariants check this canonical key.
+      "batch_size":            (ar.get("loop", {}).get("batch_size") or
+                                ar.get("loop", {}).get("initial_batch_size")),
       "paper_finder_expansions": 0,
       "consecutive_crashes":   0,           # A3/C8
       "param_only_streak":     0,
@@ -692,8 +708,42 @@ values that should come from `research_config.yaml`.
 
 **Entry condition:** `paper_finder_done == false`
 
+### v1.11 — Two execution modes
+
+The paper-finder runs in one of two modes depending on
+`orchestrator.concurrent_paper_finder.enabled`:
+
+| Mode | When | What runs in Stage 1 | What runs later |
+|---|---|---|---|
+| **Sequential** (v1.10 behaviour) | `concurrent_paper_finder.enabled: false` OR yaml block missing | All phases 1-6: base_model.md + modules.md both produced before Stage 2 | Nothing |
+| **Concurrent** (v1.11+ default) | `concurrent_paper_finder.enabled: true` | Phase 1 only — produces base_model.md (orchestrator needs WEIGHTS for train.py scaffold). Phase 5-6 deferred. | Phase 5-6 spawned as subagent during Loop 0 vanilla baseline |
+
+Why Phase 1 stays sequential: orchestrator Stage 0 Step 6 scaffolds
+`train.py` with `WEIGHTS = "<path>"` — that path comes from
+`base_model.md`. The vanilla baseline needs to actually run train.py;
+it can't start until WEIGHTS is resolved. So Phase 1 (~5 min) blocks
+Stage 2; Phase 5-6 (~2h) is the concurrency target.
+
+Why dataset-hunter doesn't get the same treatment: dataset-hunter
+writes `pretrain_weights` into pipeline_state, which the train.py
+scaffold also depends on. Running it in parallel with anything that
+edits pipeline_state creates race conditions. Keep sequential.
+
+### Mode selection
+
+```python
+import yaml, pathlib, json
+state = json.loads(pathlib.Path("pipeline_state.json").read_text())
+cfg = yaml.safe_load(pathlib.Path("research_config.yaml").read_text()) or {}
+cpf_cfg = (cfg.get("orchestrator", {}) or {}).get("concurrent_paper_finder", {}) or {}
+concurrent_enabled = bool(cpf_cfg.get("enabled", True))   # default True (v1.11 aggressive)
+```
+
+### Sequential mode (concurrent_enabled == False)
+
 1. Read `$SKILLS_DIR/paper-finder/SKILL.md`
-2. Run paper finder with `mode: initial` and the task description from pipeline state
+2. Run paper finder with `mode: initial` and the task description from pipeline state.
+   Run all phases 1-6 in a single invocation.
 3. Verify outputs exist before advancing:
    ```bash
    [ -f "base_model.md" ] && echo "base_model.md OK" || echo "ERROR: base_model.md missing"
@@ -708,6 +758,34 @@ values that should come from `research_config.yaml`.
    ```
 
 Proceed immediately to Stage 2.
+
+### Concurrent mode (concurrent_enabled == True, v1.11+ default)
+
+1. Read `$SKILLS_DIR/paper-finder/SKILL.md`
+2. Run paper finder with `mode: initial_phase1_only` and the task
+   description. The subagent prompt below documents the exact phase
+   restriction; for Stage 1 here, only Phase 1 is requested.
+3. Verify Phase 1 output:
+   ```bash
+   [ -f "base_model.md" ] && echo "base_model.md OK" || echo "ERROR: base_model.md missing"
+   ```
+4. If missing → retry once. If still missing → fall back to full
+   sequential paper-finder (don't proceed without base_model.md).
+
+5. Update `pipeline_state.json`:
+   ```json
+   { "stage": "dataset_hunter",
+     "base_model_md_ready": true,
+     "paper_finder_done": false,         // Phase 5-6 still pending
+     "modules_md_ready": false }
+   ```
+
+Note: `paper_finder_done` stays False because Phase 5-6 hasn't run.
+The flag flips to True after the concurrent subagent (spawned during
+Loop 0) finishes OR after the post-baseline fallback completes.
+
+Proceed immediately to Stage 2. The subagent for Phase 5-6 is spawned
+later, in autoresearch's Loop 0 prelude (see § Loop 0 spawn point).
 
 ---
 
@@ -1027,28 +1105,41 @@ for script in scripts_to_lock:
     lock_variable(script, "OPTIMIZER", repr(init_optimizer))
 state["optimizer"] = init_optimizer
 
-# v1.9.3 — BATCH_SIZE initial set. Same pattern as OPTIMIZER: initialised
-# from yaml but NOT locked, so autoresearch can halve dynamically:
-#   - resource_impact auto-halve (v1.9, modules tagged vram_4x/2x)
-#   - crash-pause halve (v1.7.6, after 3 consecutive crashes)
-#   - OOM detected by agent
-# yaml field: autoresearch.loop.initial_batch_size. If unset (None), the
-# template's default (16) stays in place — preserves v1.9.2 behaviour for
-# users who haven't migrated their yaml.
-init_batch = state.get("initial_batch_size")
+# v1.12 — BATCH_SIZE LOCKED. Was initial-set in v1.9.3-v1.11.1; v1.12
+# promotes it to the same lock semantics as IMGSZ / SEED / TIME_BUDGET.
+# The patch happens once at Stage 0 Step 3, and invariants.LOCKED_VARS
+# enforces no drift across iterations.
+#
+# Why locked: real-world session 2026-04-27 demonstrated that allowing
+# autoresearch to dynamically halve BATCH_SIZE (resource_impact auto-halve,
+# crash-pause, OOM detection) made experiments incomparable across
+# iterations. Loop 9 had to re-establish a vanilla baseline at BATCH=32
+# because half the loops ran at 64 and half at 32. v1.12 forbids the
+# divergence: BATCH_SIZE is one value for the entire run; OOM = discard +
+# block module rather than auto-shrink.
+#
+# yaml field lookup priority (handled at state init): batch_size > initial_batch_size > None.
+init_batch = state.get("batch_size")
 if init_batch is not None:
     if not isinstance(init_batch, int) or init_batch < 1:
         raise RuntimeError(
-            f"research_config.yaml → autoresearch.loop.initial_batch_size "
+            f"research_config.yaml → autoresearch.loop.batch_size "
             f"must be a positive integer, got {init_batch!r}. Set to a "
-            f"concrete batch size (e.g. 64 for H100 80GB, 8 for smaller GPUs) "
-            f"or remove the field to use the template default of 16."
+            f"concrete batch size with ~20GB headroom on baseline so "
+            f"resource-heavy modules can still run. H100 80GB users at "
+            f"IMGSZ=640 should try batch_size: 32."
         )
     for script in scripts_to_lock:
         lock_variable(script, "BATCH_SIZE", init_batch)
-    print(f"[orchestrator] BATCH_SIZE initialised to {init_batch} from yaml")
+    print(f"[orchestrator] BATCH_SIZE locked to {init_batch} from yaml (v1.12)")
 else:
-    print(f"[orchestrator] BATCH_SIZE: yaml unset, using template default (16)")
+    # Fall back to template default 16. Lock it anyway so invariants
+    # know to enforce no drift; user can edit yaml + re-run Stage 0 to
+    # change it.
+    print(f"[orchestrator] BATCH_SIZE: yaml unset, locking template default (16)")
+    state["batch_size"] = 16
+    for script in scripts_to_lock:
+        lock_variable(script, "BATCH_SIZE", 16)
 
 # v1.7.2 — persist the resolved IMGSZ in pipeline_state so downstream skills
 # (dataset-hunter's pretrain.py scaffold, autoresearch's Step 5.5 repair
@@ -1058,18 +1149,27 @@ state["imgsz"] = imgsz
 pathlib.Path("pipeline_state.json").write_text(json.dumps(state, indent=2))
 ```
 
-These three values (TIME_BUDGET, SEED, IMGSZ) are fixed for the entire pipeline
-run — identical across every experiment so that keep/discard decisions reflect
-the change being tested, not randomness or resolution differences.
+These four values (TIME_BUDGET, SEED, IMGSZ, BATCH_SIZE) are fixed for
+the entire pipeline run — identical across every experiment so that
+keep/discard decisions reflect the change being tested, not randomness,
+resolution differences, or batch-size differences.
 
-OPTIMIZER and BATCH_SIZE are **initialised** from yaml but NOT locked.
+OPTIMIZER is **initialised** from yaml but NOT locked.
 - OPTIMIZER: default `SGD` from `autoresearch.optimizer`. autoresearch may
   swap it to test other optimizers (e.g. AdamW) but **must never** set it
   to `'auto'` (see Critical Rule #15 in autoresearch SKILL).
-- BATCH_SIZE: from `autoresearch.loop.initial_batch_size` (v1.9.3+).
-  autoresearch may halve it dynamically (resource_impact auto-halve,
-  crash-pause halve, OOM). yaml only sets the starting point. If yaml
-  doesn't set it, the template default (16) is used.
+
+BATCH_SIZE is **locked** as of v1.12 (was initial-set in v1.9.3-v1.11.1).
+- BATCH_SIZE: from `autoresearch.loop.batch_size` (or backward-compat
+  alias `initial_batch_size`). Locked across iterations.
+- autoresearch may NOT halve it dynamically — modules that OOM at the
+  locked batch are marked DISCARD + blocked. resource_impact auto-halve
+  (v1.9), crash-pause halve (v1.7.6), and OOM-halve paths are all
+  REMOVED in v1.12.
+- Why: session 2026-04-27 (Loop 9) demonstrated that mixing BATCH=64
+  and BATCH=32 across iterations made experiments incomparable. The
+  user manually re-baselined to disambiguate. v1.12 forbids the
+  divergence.
 
 ### Step 4 — Mark autoresearch running
 
