@@ -173,9 +173,10 @@ autoresearch:
     max_runtime_multiplier: 2      # Kill as crashed if exceeds budget × this.
     iterations: null               # null = run forever until interrupted (see orchestrator.stopping).
     seed: 42                       # Locked across runs.
-    initial_batch_size: 16         # [DEPRECATED v1.12 — use `batch_size`]
-    batch_size: 16                 # [v1.12+] LOCKED BATCH_SIZE. invariants enforce no drift across iterations.
-                                   # See visdrone-detection.yaml for full description and sizing guidance.
+    batch_size: 16                 # [v1.12+] LOCKED BATCH_SIZE. invariants enforce no drift across
+                                   # iterations. See visdrone-detection.yaml for full description and
+                                   # sizing guidance. Backward compat: pre-v1.12 `initial_batch_size`
+                                   # still accepted if this field is absent.
   optimizer: SGD                   # [v1.7.7] Initial optimizer for train.py. Permitted: SGD/AdamW/Adam/RMSProp/NAdam/RAdam. Cannot be 'auto' (silently overrides LR0/MOMENTUM). autoresearch may swap during experiments but never to 'auto'.
   stall:
     threshold: 10                  # Consecutive no-improvement rounds before triggering paper finder expand.
@@ -196,13 +197,13 @@ autoresearch:
 orchestrator:
   auto_advance: true
   resume_from_state: true
-  optional_pretrain_trigger:
-    enabled: true
+  optional_pretrain_trigger:       # [v1.12.1+] See visdrone-detection.yaml for details.
+    enabled: false                 # v1.12.1 default. Set true only with dataset-hunter active.
     min_autoresearch_loops: 5
     stalled_loops_required: 5
   error_policy:
     paper_finder_retries: 1
-    autoresearch_crash_pause_after: 3  # After N consecutive crashes, halve BATCH_SIZE and continue (A3/C8).
+    autoresearch_crash_pause_after: 3  # [v1.12+] log-only. BATCH_SIZE is locked; no auto-halve.
   stopping:                        # [optional] Autonomous Stage 4 triggers. Unattended runs need at least one (C9).
     stop_flag_file: "stop_pipeline.flag"   # External scheduler drops this file to request clean shutdown.
     max_paper_finder_expansions: 3 # After this many expansions with no new modules, stop.

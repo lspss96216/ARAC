@@ -171,19 +171,20 @@ autoresearch:
     max_runtime_multiplier: 2      # If a run exceeds time_budget_sec * this, kill it as crashed. Default 2.
     iterations: null               # null = loop forever until interrupted. Set integer for bounded run.
     seed: 42                       # Random seed. Locked across runs for reproducibility.
-    initial_batch_size: 16         # [DEPRECATED in v1.12 — use `batch_size` below.]
-                                   # Pre-v1.12 (v1.9.3+) yaml field name. v1.12 keeps this as a
-                                   # backward-compat alias: if `batch_size` is unset and
-                                   # `initial_batch_size` is set, that value is used.
-                                   # New runs should write `batch_size` instead.
-    batch_size: 16                 # [v1.12+] LOCKED BATCH_SIZE for train.py. invariants.LOCKED_VARS now
-                                   # enforces this — same semantics as IMGSZ / SEED / TIME_BUDGET. Once
-                                   # set, it cannot drift across iterations. autoresearch will NOT halve
-                                   # dynamically; modules that OOM at this batch are marked DISCARD and
-                                   # blocked. Choose conservatively: pick a value with ~20GB headroom on
-                                   # baseline so resource-heavy modules can still run. H100 80GB users
-                                   # at IMGSZ=1920 try 32; at IMGSZ=640 try 32 (Loop 0 of session
-                                   # 2026-04-27 showed BATCH=64 used 78.35GB / 80GB, leaving 1.65GB).
+    batch_size: 16                 # [v1.12+] LOCKED BATCH_SIZE for train.py. invariants.LOCKED_VARS
+                                   # enforces this — same semantics as IMGSZ / SEED / TIME_BUDGET.
+                                   # Once set, it cannot drift across iterations. autoresearch will
+                                   # NOT halve dynamically; modules predicted to OOM are marked
+                                   # DISCARD + blocked. Choose conservatively: pick a value with
+                                   # ~20GB headroom on baseline so resource-heavy modules can still
+                                   # run. H100 80GB users at IMGSZ=1920 try 32; at IMGSZ=640 try 32
+                                   # (Loop 0 of session 2026-04-27 showed BATCH=64 used 78.35GB / 80GB,
+                                   # leaving 1.65GB — anything memory-heavy OOMs).
+                                   #
+                                   # Backward compat: pre-v1.12 yaml `initial_batch_size: N` still
+                                   # works if `batch_size:` is absent. State init prefers `batch_size`
+                                   # over `initial_batch_size` when both exist. New runs should write
+                                   # `batch_size` only.
   optimizer: SGD                   # [v1.7.7] Initial optimizer for train.py. Permitted: SGD/AdamW/Adam/RMSProp/NAdam/RAdam. Cannot be 'auto' (silently overrides LR0/MOMENTUM). autoresearch may swap during experiments but never to 'auto'.
   stall:                           # [optional] When to escalate after no-improvement streaks.
     threshold: 10                  # Consecutive non-improving rounds before triggering paper_finder expand.
@@ -211,17 +212,29 @@ autoresearch:
 orchestrator:
   auto_advance: true               # [required] Move between stages without asking. Setting false defeats the autonomous design.
   resume_from_state: true          # [required] On restart, read pipeline_state.json and resume from the recorded stage.
-  optional_pretrain_trigger:       # [optional] Auto-trigger pretrain mid-autoresearch if first stage skipped pretrain and the loop stalls.
-    enabled: true                  # Set false to disable mid-run pretrain entirely.
-    min_autoresearch_loops: 5      # Don't trigger before this many loops have run.
-    stalled_loops_required: 5      # Trigger after this many consecutive no-improvement loops.
+  optional_pretrain_trigger:       # [optional, IMPLEMENTED in v1.12.1] Auto-trigger mid-run pretrain when
+                                   # autoresearch stalls. v1.7-v1.12 had this in yaml docs but no actual
+                                   # evaluation code; v1.12.1 wires it up. Default disabled — explicit
+                                   # opt-in required. Requires dataset-hunter to have run AND
+                                   # produced a corpus (state.pretrain_done == true), otherwise the
+                                   # trigger logs a warning and self-disables for the rest of the run.
+    enabled: false                 # v1.12.1 default: false. Set true ONLY if your pipeline ran
+                                   # dataset-hunter and has a corpus available for re-pretrain. With
+                                   # dataset_hunter.enabled: false, this trigger has nothing to invoke
+                                   # and will warn-and-disable on first attempt.
+    min_autoresearch_loops: 5      # Don't even consider firing before this many loops have run. Avoids
+                                   # spurious early triggers when the first few modules are paper-finder's
+                                   # initial low-priority candidates.
+    stalled_loops_required: 5      # Fire after this many consecutive no-improvement loops AND
+                                   # min_autoresearch_loops met. Both gates must clear (AND, not OR).
+                                   # Sets state.request_repretrain=true; Step 6.5 picks it up next iter.
   error_policy:                    # [optional] How to handle expected failures.
     paper_finder_retries: 1        # Retry paper finder this many times before falling back to default base model.
-    autoresearch_crash_pause_after: 3  # After N consecutive crashes, halve BATCH_SIZE in train.py
-                                   # (and track.py if present), revert the last commit, reset
-                                   # the crash counter, log to discoveries.md, and continue
-                                   # looping. Does NOT pause for user input. Set to a very large
-                                   # number to effectively disable. (A3/C8 — now actually wired up.)
+    autoresearch_crash_pause_after: 3  # [v1.12+] After N consecutive crashes, log to discoveries.md
+                                   # and reset the crash counter. v1.12 NO LONGER halves BATCH_SIZE
+                                   # or reverts commits — BATCH_SIZE is locked. User intervenes manually
+                                   # if 3+ consecutive crashes happen. Set to a very large number to
+                                   # effectively disable. (A3/C8.)
   stopping:                        # [optional] Autonomous Stage 4 triggers. Unattended runs need at least one
                                    # of these configured, otherwise the loop runs forever.
     stop_flag_file: "stop_pipeline.flag"   # If this file appears in the project root, orchestrator

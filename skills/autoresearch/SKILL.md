@@ -2238,6 +2238,70 @@ if status == "keep":
 else:
     state["no_improvement_loops"] = state.get("no_improvement_loops", 0) + 1
 
+# v1.12.1 — optional_pretrain_trigger evaluation.
+#
+# Was dead config v1.7-v1.12: yaml had the fields, SKILL had the docs, no code
+# read them. v1.12.1 wires it up.
+#
+# Trigger condition (all four must hold):
+#   1. yaml orchestrator.optional_pretrain_trigger.enabled == true
+#   2. state.pretrain_offer_declined != true (no recent decline)
+#   3. state.loop_count >= min_autoresearch_loops (don't trigger too early)
+#   4. state.no_improvement_loops >= stalled_loops_required (genuine stall)
+#
+# When fired:
+#   - If state.pretrain_done == false (dataset-hunter never ran or no corpus):
+#     log a one-time warning, set pretrain_offer_declined=true to prevent
+#     re-firing, increment fired_count, continue. The trigger SELF-DISABLES
+#     for the rest of this run because there's nothing it can invoke.
+#   - If state.pretrain_done == true:
+#     set state.request_repretrain=true with reason. orchestrator's Step 6.5
+#     picks this up next iteration and runs dataset-hunter Phase 5+6 to
+#     re-pretrain on existing corpus. Resets no_improvement_loops so we don't
+#     immediately re-trigger.
+import yaml as _yaml
+cfg = _yaml.safe_load(pathlib.Path("research_config.yaml").read_text()) or {}
+trigger_cfg = (cfg.get("orchestrator", {}) or {}).get("optional_pretrain_trigger", {}) or {}
+if (trigger_cfg.get("enabled", False)
+    and not state.get("pretrain_offer_declined", False)
+    and state.get("loop_count", 0) >= int(trigger_cfg.get("min_autoresearch_loops", 5))
+    and state.get("no_improvement_loops", 0) >= int(trigger_cfg.get("stalled_loops_required", 5))):
+    state["pretrain_trigger_fired_count"] = state.get("pretrain_trigger_fired_count", 0) + 1
+    if not state.get("pretrain_done", False):
+        # Dataset-hunter never produced a corpus. Trigger has nothing to invoke.
+        # Log once, self-disable, continue loop.
+        if not state.get("pretrain_trigger_no_corpus_warned", False):
+            log_discovery(
+                f"optional_pretrain_trigger fired (loop={state['loop_count']}, "
+                f"no_improvement={state['no_improvement_loops']}) but "
+                f"state.pretrain_done is false — dataset-hunter never produced "
+                f"a corpus. Self-disabling trigger for the rest of this run. "
+                f"To enable mid-run pretrain, run dataset-hunter first OR "
+                f"set orchestrator.optional_pretrain_trigger.enabled: false "
+                f"in yaml to suppress this warning.",
+                loop=state.get("loop_count", 0),
+                category="bug_workaround",
+            )
+            state["pretrain_trigger_no_corpus_warned"] = True
+        # Self-disable: pretrain_offer_declined latches future trigger evaluations.
+        state["pretrain_offer_declined"] = True
+    else:
+        # Corpus exists; signal Step 6.5 to re-pretrain on next iteration.
+        state["request_repretrain"] = True
+        state["repretrain_reason"] = (
+            f"optional_pretrain_trigger: stalled "
+            f"{state['no_improvement_loops']} consecutive loops"
+        )
+        state["no_improvement_loops"] = 0   # reset; Step 6.5 will re-pretrain
+        log_discovery(
+            f"optional_pretrain_trigger fired: stalled "
+            f"{state['no_improvement_loops']} consecutive loops with no "
+            f"improvement. Setting request_repretrain; orchestrator Step 6.5 "
+            f"will pick up next iteration.",
+            loop=state.get("loop_count", 0),
+            category="strategy_shift",
+        )
+
 # Count architecture keeps for combination trigger
 arch_keeps = 0
 if pathlib.Path("results.tsv").exists():

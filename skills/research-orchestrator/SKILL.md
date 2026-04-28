@@ -394,9 +394,14 @@ Apply it in both branches:
       "stall_count":           0,
       "loop_count":            0,
       "vanilla_baseline_done": False,           # v1.8 — Loop 0 vanilla baseline
-      "no_improvement_loops":  0,               # v1.8 — for autonomous stop trigger
+      "no_improvement_loops":  0,               # v1.8 — for autonomous stop trigger AND v1.12.1 pretrain trigger
       "pretrain_dead_config_warned": False,     # v1.8 — one-time warning latch
-      "batch_size_pre_autohalve": None,         # v1.9 — restore BATCH_SIZE after resource_impact halve
+      "batch_size_pre_autohalve": None,         # v1.9 — (deprecated v1.12; field kept for state migration)
+      # v1.12.1 — optional_pretrain_trigger state (was dead config v1.7-v1.12; now wired up)
+      # trigger_fired_count: how many times the auto-trigger has fired this run (informative)
+      # trigger_no_corpus_warned: one-time latch for "trigger fired but no pretrain corpus available"
+      "pretrain_trigger_fired_count": 0,
+      "pretrain_trigger_no_corpus_warned": False,
       # v1.11 — concurrent paper-finder state
       # spawned: did we Task() spawn the subagent for this pipeline run? Resume-safe.
       # done:    has subagent written paper_finder.done sentinel? Mirrored from disk for state queries.

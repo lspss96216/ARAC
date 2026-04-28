@@ -9,6 +9,14 @@ keeping what improves the primary metric.
 Supports `task_type: object_detection` and `object_tracking`, driven entirely
 by `research_config.yaml`. No skill hardcodes a specific metric.
 
+**This is v1.12.1** — patch wiring up dead config + correcting stale
+yaml comment. `optional_pretrain_trigger` (yaml since v1.7, documented
+in v1.8 SKILL prose, never evaluated in code) now actually fires —
+default `enabled: false` so behaviour is preserved for current users.
+`autoresearch_crash_pause_after` yaml comment corrected to v1.12's
+log-only behaviour. Pure SKILL+yaml patch, no code or tests changed.
+See `CHANGELOG_v1.12.1.md`.
+
 **This is v1.12** — strict fair-comparison mode. **BREAKING**:
 `BATCH_SIZE` is now LOCKED across all iterations (same enforcement as
 IMGSZ/SEED/TIME_BUDGET). Auto-halve paths removed: v1.9
@@ -262,6 +270,7 @@ CHANGELOG_v1.10.md                          · paper-finder HF Papers + cross-so
 CHANGELOG_v1.11.md                          · concurrent paper-finder during baseline
 CHANGELOG_v1.11.1.md                        · hook + invariant + subagent fixes (BREAKING reapply)
 CHANGELOG_v1.12.md                          · BATCH_SIZE locked + scope-aware resource_impact (BREAKING)
+CHANGELOG_v1.12.1.md                        · wire up optional_pretrain_trigger + crash-pause yaml comment fix
 ```
 
 ---
@@ -434,13 +443,20 @@ SDK (`pip install firecrawl-py`) per the caveat in paper-finder Phase 2.
 
 ## Versions
 
-See `CHANGELOG_v1.12.md`, `CHANGELOG_v1.11.1.md`, `CHANGELOG_v1.11.md`, `CHANGELOG_v1.10.md`, `CHANGELOG_v1.9.3.md`, `CHANGELOG_v1.9.2.md`, `CHANGELOG_v1.9.1.md`,
+See `CHANGELOG_v1.12.1.md`, `CHANGELOG_v1.12.md`, `CHANGELOG_v1.11.1.md`, `CHANGELOG_v1.11.md`, `CHANGELOG_v1.10.md`, `CHANGELOG_v1.9.3.md`, `CHANGELOG_v1.9.2.md`, `CHANGELOG_v1.9.1.md`,
 `CHANGELOG_v1.9.md`, `CHANGELOG_v1.8.md`, `CHANGELOG_v1.7.7.md`,
 `CHANGELOG_v1.7.6.md`, `CHANGELOG_v1.7.5.md`, `CHANGELOG_v1.7.4.md`,
 `CHANGELOG_v1.7.3.md`, `CHANGELOG_v1.7.2.md`, `CHANGELOG_v1.7.1.md`,
 `CHANGELOG_v1.7.md`, and `CHANGELOG_v1.6.md` for recent release notes.
 
-- **v1.12** (current): strict fair-comparison mode. **BREAKING**:
+- **v1.12.1** (current): patch — wires up `optional_pretrain_trigger`
+  (was dead config since v1.7). yaml fields now actually evaluated in
+  autoresearch Step 8: triggers `request_repretrain` when stall
+  threshold met AND corpus exists; warns + self-disables when no
+  corpus. Default `enabled: false` preserves current behaviour.
+  `autoresearch_crash_pause_after` yaml comment corrected to v1.12
+  log-only semantics. Pure SKILL+yaml patch.
+- **v1.12**: strict fair-comparison mode. **BREAKING**:
   `BATCH_SIZE` LOCKED across iterations. v1.9 `resource_impact` auto-
   halve replaced with predictive skip-and-block (modules predicted
   to OOM are marked `blocked`, never run). v1.7.6 crash-pause halve

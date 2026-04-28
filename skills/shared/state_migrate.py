@@ -82,6 +82,13 @@ CURRENT_DEFAULTS: dict[str, Any] = {
     # "this run's paper-finder was on Sonnet" so cost / quality review is easy.
     "concurrent_paper_finder_subagent_type":  None,
     "concurrent_paper_finder_subagent_model": None,
+
+    # --- v1.12.1 additions ---
+    # optional_pretrain_trigger state. Was dead config v1.7-v1.12; v1.12.1
+    # wires it up. fired_count is informative; no_corpus_warned is a one-time
+    # latch so logs aren't spammed when dataset-hunter never ran.
+    "pretrain_trigger_fired_count":      0,
+    "pretrain_trigger_no_corpus_warned": False,
 }
 
 # Legacy -> current key renames. Applied once; after migration the old key
