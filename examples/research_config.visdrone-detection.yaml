@@ -205,6 +205,24 @@ autoresearch:
     - replacement_changes          # C: swap one block for another of similar size
     - additive_changes             # D: add new block (param count grows)
     - combinations                 # E: combine 2-3 previously-kept changes
+  tuning:                          # [v1.13+] Multi-attempt per-module hyperparameter tuning.
+                                   # Real-world session 2026-04-27: yaml_inject modules consistently
+                                   # discarded with mAP -0.025 to -0.035 because random-init layers
+                                   # couldn't converge in 1200s budget. v1.13 lets autoresearch try
+                                   # the same module multiple times with different LR / momentum /
+                                   # warmup, reading trajectory shape between attempts to inform
+                                   # next hyperparams.
+    enabled: true                  # Set false to revert to v1.12.1 single-attempt-per-module behaviour.
+    max_attempts: 3                # Hard cap before module is finalised (keep / discard) regardless
+                                   # of trajectory. Each attempt = one full TIME_BUDGET training run.
+    attempt_extension_threshold: 0.03  # If attempt-to-attempt mAP improvement >= this fraction (3%),
+                                       # autoresearch may extend by 1-2 attempts up to max_extended below.
+                                       # Set to 1.0 to disable extension (always cap at max_attempts).
+    max_extended_attempts: 5       # Absolute ceiling even with extensions. max_attempts + 2 by default.
+    no_improvement_skip_threshold: 0.02  # Within a tuning sequence, if attempt N's mAP is >= 2% better
+                                         # than attempt N-1, the no_improvement_loops counter does NOT
+                                         # increment. Prevents tuning runs from triggering early stop
+                                         # before module's verdict is finalised.
 
 # -----------------------------------------------------------------------------
 # orchestrator — pipeline-level control

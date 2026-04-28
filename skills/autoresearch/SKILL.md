@@ -543,6 +543,96 @@ skips when `best_TIEBREAK is None`.
 
 ### Step 2 — Ideate
 
+#### v1.13 — Tuning continuation check (FIRST step)
+
+Before walking the priority ladder, check if the previous loop ended
+mid-tuning. If so, the same module gets picked again with attempt_n+1
+and agent-chosen hyperparam tweak. The priority ladder is BYPASSED for
+this iteration.
+
+```python
+# Read tuning config and current state
+import yaml as _yaml, json as _json, pathlib as _P
+from shared.tuning_history import format_module_history_for_agent
+from shared.modules_md import find_by_name
+
+cfg = _yaml.safe_load(_P.Path("research_config.yaml").read_text()) or {}
+_tuning_cfg = ((cfg.get("autoresearch", {}) or {}).get("tuning") or {})
+_tuning_enabled = bool(_tuning_cfg.get("enabled", True))
+_max_attempts = int(_tuning_cfg.get("max_attempts", 3))
+_max_extended = int(_tuning_cfg.get("max_extended_attempts", 5))
+
+state = _json.loads(_P.Path("pipeline_state.json").read_text())
+_active_module = state.get("current_tuning_module")
+_active_attempt = state.get("current_tuning_attempt", 0)
+
+if _tuning_enabled and _active_module and _active_attempt > 0:
+    # Continue tuning the same module with attempt_n+1
+    state["current_tuning_attempt"] = _active_attempt + 1
+    _new_attempt = state["current_tuning_attempt"]
+
+    # Build agent reasoning context from prior attempts
+    history_summary = format_module_history_for_agent(
+        "tuning_history.tsv", _active_module
+    )
+    chosen = find_by_name("modules.md", _active_module)
+
+    # The agent now needs to decide hyperparams for this attempt.
+    # CRITICAL: the choice is based on:
+    #   1. Last attempt's trajectory shape + diagnosis (from history)
+    #   2. The paper's recommended hyperparams (read from chosen.fields["paper"]
+    #      or chosen.sections["Integration notes"] if cited)
+    #   3. The agent's own knowledge about the module type
+    #   4. Constraints: BATCH_SIZE/IMGSZ/SEED/TIME_BUDGET locked; OPTIMIZER
+    #      changeable but never 'auto' (Critical Rule #15)
+    #
+    # The agent is NOT given a rule table mapping shape → hyperparam.
+    # Trajectory shapes are SIGNALS for the agent's reasoning, not a
+    # decision tree. The SKILL provides shape + diagnosis text and lets
+    # the agent's knowledge handle the inference.
+    #
+    # Reasonable starting heuristics (illustrative — not enforced):
+    #   - oscillating + paper LR=0.001 used → halve LR for next attempt
+    #   - monotonic_climbing + already at paper LR → try LR×2 + warmup×2
+    #   - flat_no_learning → likely structural; try larger LR or check
+    #     module is actually being called
+    #   - early_collapse → reduce LR, increase weight_decay
+    #   - train_val_diverge → weight_decay↑, augmentation↑
+    #
+    # The agent reads history_summary, the diagnosis, and the paper's
+    # original recipe (if any), then patches train.py with the chosen
+    # values. See Step 3 — Modify for the patching mechanics.
+    log_discovery(
+        f"Continuing tuning sequence for {_active_module}: "
+        f"attempt {_new_attempt} (cap {_max_extended if state.get('tuning_attempt_extended') else _max_attempts}). "
+        f"History so far:\n{history_summary}",
+        loop=state.get("loop_count", 0),
+        category="tuning_progress",
+    )
+
+    # Pre-populate the iteration plan: target this module again
+    state["current_module"] = _active_module
+    _P.Path("pipeline_state.json").write_text(_json.dumps(state, indent=2))
+
+    # Skip the rest of Step 2 (priority ladder); jump straight to Step 3
+    # with the chosen module locked in. Agent picks hyperparams there.
+    _skip_priority_ladder = True
+else:
+    _skip_priority_ladder = False
+```
+
+If `_skip_priority_ladder` is True, jump to Step 3 — Modify with
+`chosen` already resolved. If False, walk the priority ladder below to
+pick a new pending module (which will start at attempt 1).
+
+When a NEW pending module is picked (priority ladder below), set:
+```python
+state["current_tuning_module"]   = chosen.name
+state["current_tuning_attempt"]  = 1
+state["tuning_attempt_extended"] = False
+state["last_attempt_final_map"]  = None
+```
+
 #### v1.9.1 — Resolve priority order from yaml
 
 Before walking the priority ladder, read `autoresearch.module_priority`
@@ -1275,11 +1365,97 @@ with pretrained features.
 Make exactly the change decided in Step 2. One idea per experiment.
 
 **Never modify `TIME_BUDGET`** — this value is set by the user in `research_config.yaml`
-and locked into `pipeline_state.loop_time_budget`. If an experiment is slow, halve
-`BATCH_SIZE` instead. Changing `TIME_BUDGET` invalidates fair comparison between runs.
+and locked into `pipeline_state.loop_time_budget`. v1.12+ also LOCKS `BATCH_SIZE`,
+`IMGSZ`, and `SEED` — invariants enforce no drift across iterations.
 
 **Never modify `SEED`** — the random seed must be identical across all runs so that
 differences in the primary metric reflect the change being tested, not randomness.
+
+#### v1.13 — Tuning attempt: hyperparam patch (when continuing same module)
+
+When `state.current_tuning_attempt > 1` (i.e. this is attempt 2+ for the
+same module), the architectural change has ALREADY been applied in
+attempt 1's Step 3. The git working tree may even still show that
+change committed. For attempts 2..N the work is:
+
+1. **Decide hyperparams** based on:
+   - Last attempt's `trajectory_diag.shape` and `diagnosis` text
+   - Paper's recommended hyperparams (if cited in module's Integration notes)
+   - Cross-module patterns from `tuning_history.kept_attempts()`
+2. **Patch train.py** Section ② variables to the new values
+3. **Verify** the patch obeys invariants (BATCH_SIZE/IMGSZ/SEED/TIME_BUDGET
+   unchanged; OPTIMIZER ≠ 'auto')
+4. **Commit** with description noting attempt number + hp change
+
+```python
+import re as _re, pathlib as _P
+
+# v1.13 — hyperparam tuning is allowed for these vars only.
+# BATCH_SIZE, IMGSZ, SEED, TIME_BUDGET stay LOCKED (v1.12 invariants enforce).
+TUNABLE_VARS = {"LR0", "MOMENTUM", "WEIGHT_DECAY", "WARMUP_EPOCHS", "OPTIMIZER"}
+LOCKED_VARS_V12 = {"BATCH_SIZE", "IMGSZ", "SEED", "TIME_BUDGET"}
+
+def patch_train_var(var_name: str, new_value, train_path: str = "train.py"):
+    """v1.13 — patch one Section ② variable. Refuses to touch locked vars."""
+    if var_name in LOCKED_VARS_V12:
+        raise RuntimeError(
+            f"v1.13: refusing to patch locked variable {var_name!r}. "
+            f"BATCH_SIZE/IMGSZ/SEED/TIME_BUDGET are locked across all iterations."
+        )
+    if var_name not in TUNABLE_VARS:
+        raise RuntimeError(
+            f"v1.13: {var_name!r} is not in TUNABLE_VARS. Add it to the set or "
+            f"reconsider whether this should be tunable across attempts."
+        )
+    if var_name == "OPTIMIZER":
+        # Critical Rule #15: never 'auto'. invariants.check_optimizer_not_auto
+        # will catch it post-commit, but error here for cleaner failure.
+        if str(new_value).lower() == "auto":
+            raise RuntimeError(
+                "v1.13: OPTIMIZER='auto' forbidden — Critical Rule #15. "
+                "Use 'SGD', 'AdamW', etc."
+            )
+        new_repr = f"'{new_value}'"
+    else:
+        new_repr = repr(new_value)
+
+    p = _P.Path(train_path)
+    src = p.read_text()
+    pattern = _re.compile(rf"(?m)^{var_name}\s*=\s*.+?(\s*#.*)?$")
+    if not pattern.search(src):
+        raise RuntimeError(f"Variable {var_name!r} not found in {train_path}")
+    new_src = pattern.sub(rf"{var_name} = {new_repr}\1", src, count=1)
+    p.write_text(new_src)
+```
+
+**The agent's reasoning workflow**:
+
+```
+Read state["current_tuning_module"]      → "CBAM"
+Read state["current_tuning_attempt"]     → 2
+Read tuning_history.tsv                  → attempt 1 was shape=oscillating,
+                                            LR0=0.01, final_mAP=0.26
+Read paper recipe for CBAM               → "we used SGD lr=0.001 momentum=0.9"
+Read trajectory_diag.diagnosis           → "swing 0.04 in late half, suggests
+                                            LR too high or momentum/optimizer
+                                            instability"
+
+Reasoning:
+  - Attempt 1 oscillated at LR=0.01 (10× the paper's 0.001)
+  - Paper used SGD; we already use SGD
+  - Halve LR toward paper's value
+  → patch_train_var("LR0", 0.005)
+
+Commit with description:
+  "USE_CBAM attempt 2 (LR0=0.005, was 0.01 → oscillated)"
+```
+
+For attempts 2..N, the architectural change in train.py persists from
+attempt 1. The git commit only modifies hyperparam vars in Section ②.
+
+#### Existing — change types (v1.6+)
+
+Make exactly the change decided in Step 2. One idea per experiment.
 
 #### v1.12 — Resource-impact predictive skip (no auto-halve)
 
@@ -1981,6 +2157,103 @@ mutation of locked variables.
 
 ### Step 7 — Decide
 
+#### v1.13 — Tuning-aware verdict logic
+
+When `state.current_tuning_module` is set, the iteration is part of a
+multi-attempt tuning sequence. The verdict logic is:
+
+1. **Provisional attempts** (attempt_n < max_attempts AND no clear keep
+   signal): mark the module as `injected` provisionally — NO final keep/
+   discard verdict yet. State stays in `current_tuning_module`. Step 2 of
+   next loop continues with attempt_n+1 + agent-chosen hyperparam tweak.
+
+2. **Clear keep** (this attempt's mAP ≥ baseline + keep_threshold):
+   FINALIZE. Module status → `tested`. `current_tuning_module` cleared.
+   Subsequent attempts won't run because verdict is settled.
+
+3. **Final attempt reached** (attempt_n == max_attempts, OR extension cap):
+   FINALIZE. mAP < baseline → `discarded` + `discard_reason="tuning_failed"`.
+
+4. **Extension granted** (attempt-to-attempt improvement ≥ 3%, AND
+   `tuning_attempt_extended` is False): set `tuning_attempt_extended=True`,
+   raise effective cap to `max_extended_attempts`. Continue tuning.
+
+5. **No improvement / negative change between attempts** AND not yet at
+   cap: the agent SHOULD reason about whether to try a substantially
+   different hyperparam direction or give up early. SKILL doesn't force
+   early exit — agent reads trajectory_diag.shape + history, decides.
+
+```python
+import json as _json
+from shared.tuning_history import attempt_count_for_module
+
+# Read tuning config
+_tuning_cfg = ((cfg.get("autoresearch", {}) or {}).get("tuning") or {})
+_tuning_enabled = bool(_tuning_cfg.get("enabled", True))
+_max_attempts = int(_tuning_cfg.get("max_attempts", 3))
+_max_extended = int(_tuning_cfg.get("max_extended_attempts", 5))
+_extension_threshold = float(_tuning_cfg.get("attempt_extension_threshold", 0.03))
+
+_module = state.get("current_tuning_module")
+_attempt = state.get("current_tuning_attempt", 0)
+
+if _tuning_enabled and _module and _attempt > 0:
+    # Determine effective cap (may be extended)
+    _effective_cap = (_max_extended if state.get("tuning_attempt_extended")
+                      else _max_attempts)
+
+    # Compute attempt-to-attempt improvement for extension gating
+    _prev = state.get("last_attempt_final_map")
+    _improvement = ((trajectory_diag.final_map - _prev) / abs(_prev)
+                    if (_prev is not None and _prev > 1e-6) else 0.0)
+
+    # Clear-keep check happens via the existing keep_threshold logic below;
+    # we just record the diagnosis context. Set the FINAL flag only once
+    # the existing logic decides keep/discard.
+    _is_final_attempt = (_attempt >= _effective_cap)
+    _can_extend = (
+        not state.get("tuning_attempt_extended")
+        and _attempt == _max_attempts
+        and _improvement >= _extension_threshold
+    )
+
+    if _can_extend:
+        state["tuning_attempt_extended"] = True
+        log_discovery(
+            f"Extending tuning cap for {_module}: attempt-to-attempt "
+            f"improvement {_improvement*100:.1f}% >= "
+            f"{_extension_threshold*100:.0f}% threshold. "
+            f"Allowing up to {_max_extended} attempts (was {_max_attempts}).",
+            loop=state.get("loop_count", 0),
+            category="tuning_progress",
+        )
+        _is_final_attempt = (_attempt >= _max_extended)
+
+    # Pass _is_final_attempt to the keep/discard logic below — it will be
+    # used to decide whether to mark `tested`/`discarded` (final) or
+    # `injected` (provisional, more attempts pending).
+    state["_v1_13_is_final_attempt"] = _is_final_attempt
+else:
+    # Not in tuning mode (e.g. baseline iteration, or tuning disabled).
+    # Existing v1.12.1 logic applies — every iteration is final.
+    state["_v1_13_is_final_attempt"] = True
+```
+
+After the keep/discard verdict is computed below (existing logic), v1.13
+applies the following overlay:
+
+- If `keep` → finalize regardless of attempt count. Clear tuning state.
+- If `discard` AND `_v1_13_is_final_attempt`:
+  - mark module `discarded` with `discard_reason="tuning_failed"`
+  - clear `current_tuning_module`, reset `current_tuning_attempt=0`,
+    `tuning_attempt_extended=False`, `last_attempt_final_map=None`
+- If `discard` AND NOT `_v1_13_is_final_attempt`:
+  - mark module status `tuning` (provisional, more attempts pending)
+  - keep `current_tuning_module` set, increment attempt counter at top
+    of next Step 2
+
+#### Existing keep/discard logic (v1.6+, retained)
+
 Build helper that respects each metric's direction:
 ```python
 def is_better(new, old, name):
@@ -2230,13 +2503,129 @@ if status == "keep":
             state["best_tiebreak_value"] = results[TIEBREAK]
 state["primary_metric_name"] = PRIMARY
 
-# v1.8 — no_improvement_loops counter for orchestrator's autonomous stop trigger.
-# Resets to 0 on every keep; increments on every discard. Reach max_no_improvement_loops
-# (set in research_config.yaml → orchestrator.stopping) → orchestrator stops the run.
+# v1.13 — Attempt-aware no_improvement update + trajectory recording.
+#
+# Major change from v1.8: when autoresearch is mid-tuning a module (multi-
+# attempt), attempt-to-attempt mAP improvement >= 2% (yaml-configurable)
+# does NOT increment no_improvement_loops. This prevents stop_trigger from
+# firing in the middle of a productive tuning sequence.
+#
+# Loop semantics summary:
+#   v1.8-v1.12.1:  Loop = 1 (module, default_hp) experiment, status keep/discard
+#   v1.13:         Loop = 1 (module, attempt_N) experiment
+#                  - Attempts 1..N-1: status="injected" (provisional, no verdict yet)
+#                  - Attempt N (final or improvement-cap reached): keep/discard
+#
+# State invariants for tuning:
+#   state.current_tuning_module:   module being tuned (None when between modules)
+#   state.current_tuning_attempt:  1-indexed attempt within current module
+#   state.last_attempt_final_map:  previous attempt's mAP for delta check
+#   state.tuning_attempt_extended: True if we've granted +1/+2 extension already
+
+# First, parse trajectory from this iteration's run and record to tuning_history.
+# This happens for EVERY attempt — even the final one. tuning_history.tsv
+# accumulates the full record so cross-loop pattern queries see all attempts.
+import sys, pathlib as _P
+sys.path.insert(0, str(_P.Path(__file__).parent.parent / "shared")) if False else None
+# (the orchestrator's PYTHONPATH already includes shared/ — line above is for IDEs)
+from shared.trajectory import parse_results_csv, classify_shape
+from shared.tuning_history import Attempt as _Attempt, append_attempt
+from datetime import datetime as _dt
+
+# Find ultralytics' results.csv. v1.13 uses default ultralytics save_dir
+# pattern: runs/<task>/exp/results.csv. Caller can override via state if
+# the user has a custom save_dir.
+_results_csv = state.get("ultralytics_results_csv") or "runs/detect/exp/results.csv"
+trajectory_points = parse_results_csv(_results_csv)
+trajectory_diag = classify_shape(
+    trajectory_points,
+    baseline_final_map=state.get("baseline_metric_value"),
+)
+
+# Capture the hyperparams that were used for THIS attempt (for tuning_history).
+# These are the values currently in train.py — read them out for the record.
+import re as _re
+_train_src = pathlib.Path(state.get("train_script", "train.py")).read_text()
+def _read_var(name, default=None):
+    """Read a Section ② variable's current value (numeric or string)."""
+    m = _re.search(rf"(?m)^{name}\s*=\s*(.+?)\s*(?:#.*)?$", _train_src)
+    if not m: return default
+    val = m.group(1).strip().strip("'\"")
+    try: return float(val) if "." in val else int(val)
+    except ValueError: return val
+
+_hp_for_record = {
+    "LR0":            _read_var("LR0"),
+    "MOMENTUM":       _read_var("MOMENTUM"),
+    "WEIGHT_DECAY":   _read_var("WEIGHT_DECAY"),
+    "WARMUP_EPOCHS":  _read_var("WARMUP_EPOCHS"),
+    "OPTIMIZER":      _read_var("OPTIMIZER"),
+}
+
+# Determine attempt_n for record. If we're tuning, use state.current_tuning_attempt.
+# If not tuning (e.g. baseline iteration), attempt_n=0 acts as sentinel.
+_attempt_n = state.get("current_tuning_attempt", 0)
+_module_name = state.get("current_tuning_module") or state.get("current_module") or ""
+
+if _module_name and _attempt_n > 0:
+    # Record this attempt to tuning_history.tsv
+    append_attempt(
+        "tuning_history.tsv",
+        _Attempt(
+            timestamp=_dt.utcnow().isoformat(),
+            loop_count=state.get("loop_count", 0),
+            module_name=_module_name,
+            attempt_n=_attempt_n,
+            shape=trajectory_diag.shape,
+            final_map=trajectory_diag.final_map,
+            peak_map=trajectory_diag.peak_map,
+            peak_epoch=trajectory_diag.peak_epoch,
+            final_epoch=trajectory_diag.final_epoch,
+            hyperparams=_hp_for_record,
+            diagnosis=trajectory_diag.diagnosis,
+        ),
+    )
+
+# Now decide whether to count this as a no-improvement loop.
+# v1.13 rule: if mid-tuning AND attempt-to-attempt improvement >= threshold,
+# do NOT increment no_improvement_loops.
+_tuning_cfg = ((cfg.get("autoresearch", {}) or {}).get("tuning") or {})
+_tuning_skip_threshold = float(_tuning_cfg.get("no_improvement_skip_threshold", 0.02))
+
+_is_tuning_attempt = bool(state.get("current_tuning_module")) and _attempt_n > 1
+_prev_map = state.get("last_attempt_final_map")
+_attempt_improvement_pct = (
+    (trajectory_diag.final_map - _prev_map) / abs(_prev_map)
+    if (_prev_map is not None and _prev_map > 1e-6) else 0.0
+)
+_attempt_made_meaningful_progress = (
+    _is_tuning_attempt and _attempt_improvement_pct >= _tuning_skip_threshold
+)
+
 if status == "keep":
     state["no_improvement_loops"] = 0
+elif _attempt_made_meaningful_progress:
+    # Mid-tuning with ≥2% improvement vs last attempt — don't count this
+    # iteration toward stall trigger. Module is genuinely making progress
+    # even if it hasn't beaten baseline yet.
+    log_discovery(
+        f"Attempt {_attempt_n} for {_module_name}: mAP "
+        f"{_prev_map:.4f} → {trajectory_diag.final_map:.4f} "
+        f"(+{_attempt_improvement_pct*100:.1f}% vs prev attempt). "
+        f"no_improvement_loops counter NOT incremented (>= "
+        f"{_tuning_skip_threshold*100:.0f}% threshold).",
+        loop=state.get("loop_count", 0),
+        category="tuning_progress",
+    )
+    # no_improvement_loops unchanged
 else:
     state["no_improvement_loops"] = state.get("no_improvement_loops", 0) + 1
+
+# Update last_attempt_final_map for the NEXT iteration's delta check.
+# Only meaningful when we're in a tuning sequence — clear it when we start
+# a new module (Step 2 handles that).
+if state.get("current_tuning_module"):
+    state["last_attempt_final_map"] = trajectory_diag.final_map
 
 # v1.12.1 — optional_pretrain_trigger evaluation.
 #

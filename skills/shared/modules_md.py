@@ -47,7 +47,21 @@ from datetime import date
 from typing import Optional
 
 
-VALID_STATUSES = {"pending", "injected", "tested", "discarded"}
+VALID_STATUSES = {"pending", "tuning", "injected", "tested", "discarded", "blocked"}
+# v1.13 — `tuning` is a new status between pending and tested. It means
+# autoresearch has tried this module at least once but the decision is
+# deferred pending more attempts (up to 3 default, with attempt-to-attempt
+# improvement extension). Once autoresearch finalises (keep / discard
+# decision after attempt cap), status flips to tested or discarded.
+#
+# v1.12 — `blocked` was added implicitly via state["blocked_modules"]; v1.13
+# promotes it to a first-class status so modules.md is the source of truth.
+# A module is `blocked` when:
+#   - effective_resource_impact predicts OOM at locked BATCH_SIZE (v1.12)
+#   - all tuning attempts exhausted with no convergence (v1.13)
+#   - ultralytics auto-batch-reduce was caught mid-run (v1.12)
+# Blocked modules don't return to pending unless user lowers yaml batch_size
+# and re-runs from Loop 0.
 VALID_COMPLEXITIES = {"low", "medium", "high"}
 _COMPLEXITY_ORDER = {"low": 0, "medium": 1, "high": 2}
 

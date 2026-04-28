@@ -89,6 +89,21 @@ CURRENT_DEFAULTS: dict[str, Any] = {
     # latch so logs aren't spammed when dataset-hunter never ran.
     "pretrain_trigger_fired_count":      0,
     "pretrain_trigger_no_corpus_warned": False,
+
+    # --- v1.13 additions ---
+    # Per-module tuning state. autoresearch tracks the current module being
+    # tuned (or None when between modules), the attempt number within that
+    # module's sequence, and the previous attempt's final_map for the
+    # attempt-to-attempt improvement check.
+    #
+    # current_tuning_module: name of module being tuned (None when not tuning)
+    # current_tuning_attempt: 1-indexed attempt within current module (0 when not tuning)
+    # tuning_attempt_extended: whether we've granted attempt-extension for current module
+    # last_attempt_final_map: previous attempt's final mAP, for ≥2% / ≥3% improvement checks
+    "current_tuning_module":   None,
+    "current_tuning_attempt":  0,
+    "tuning_attempt_extended": False,
+    "last_attempt_final_map":  None,
 }
 
 # Legacy -> current key renames. Applied once; after migration the old key

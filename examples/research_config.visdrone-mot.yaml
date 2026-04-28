@@ -190,6 +190,12 @@ autoresearch:
     - replacement_changes
     - additive_changes
     - combinations
+  tuning:                          # [v1.13+] Multi-attempt per-module tuning. See visdrone-detection.yaml for full description.
+    enabled: true
+    max_attempts: 3
+    attempt_extension_threshold: 0.03
+    max_extended_attempts: 5
+    no_improvement_skip_threshold: 0.02
 
 # -----------------------------------------------------------------------------
 # orchestrator

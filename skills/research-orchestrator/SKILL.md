@@ -402,6 +402,15 @@ Apply it in both branches:
       # trigger_no_corpus_warned: one-time latch for "trigger fired but no pretrain corpus available"
       "pretrain_trigger_fired_count": 0,
       "pretrain_trigger_no_corpus_warned": False,
+      # v1.13 — per-module tuning state (multi-attempt loop)
+      # current_tuning_module: name of module being tuned (None when between modules)
+      # current_tuning_attempt: 1-indexed attempt within current module (0 = not tuning)
+      # tuning_attempt_extended: whether attempt-extension already granted (1 extension max per module)
+      # last_attempt_final_map: previous attempt's final mAP, for improvement checks
+      "current_tuning_module":   None,
+      "current_tuning_attempt":  0,
+      "tuning_attempt_extended": False,
+      "last_attempt_final_map":  None,
       # v1.11 — concurrent paper-finder state
       # spawned: did we Task() spawn the subagent for this pipeline run? Resume-safe.
       # done:    has subagent written paper_finder.done sentinel? Mirrored from disk for state queries.

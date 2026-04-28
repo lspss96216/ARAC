@@ -554,6 +554,145 @@ def test_effective_resource_impact_cpu_fallback_orthogonal_to_scope():
     print("✓ test_effective_resource_impact_cpu_fallback_orthogonal_to_scope")
 
 
+# ─── v1.13 — tuning + blocked statuses ─────────────────────────────────────
+
+
+def test_tuning_status_accepted_by_update():
+    """v1.13 — `tuning` is a valid status."""
+    sample = """# Modules
+
+## TestMod
+
+| Field | Value |
+|-------|-------|
+| Paper | dummy |
+| arXiv | 1234.56789 |
+| Published | 2024 |
+| Location | backbone |
+| Complexity | low |
+| paper2code | yes |
+| Status | pending |
+
+### What it does
+test
+
+### Integration notes
+test
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+        f.write(sample)
+        path = f.name
+    ok = mm.update_status(path, "TestMod", "tuning")
+    assert ok
+    mods = mm.parse(path)
+    m = next(x for x in mods if x.name == "TestMod")
+    assert m.status == "tuning"
+    print("✓ test_tuning_status_accepted_by_update")
+
+
+def test_blocked_status_accepted_by_update():
+    """v1.13 — `blocked` is a valid status (was implicit state field in v1.12)."""
+    sample = """# Modules
+
+## TestMod
+
+| Field | Value |
+|-------|-------|
+| Paper | dummy |
+| arXiv | 1234.56789 |
+| Published | 2024 |
+| Location | backbone |
+| Complexity | low |
+| paper2code | yes |
+| Status | pending |
+
+### What it does
+test
+
+### Integration notes
+test
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+        f.write(sample)
+        path = f.name
+    ok = mm.update_status(path, "TestMod", "blocked")
+    assert ok
+    mods = mm.parse(path)
+    m = next(x for x in mods if x.name == "TestMod")
+    assert m.status == "blocked"
+    print("✓ test_blocked_status_accepted_by_update")
+
+
+def test_tuning_status_does_not_count_as_pending():
+    """v1.13 — modules in `tuning` state should NOT appear in find_pending().
+    Otherwise dispatch keeps re-picking the same module while it's mid-tuning."""
+    sample = """# Modules
+
+## TestPending
+
+| Field | Value |
+|-------|-------|
+| Paper | dummy |
+| arXiv | 1.1 |
+| Published | 2024 |
+| Location | backbone |
+| Complexity | low |
+| paper2code | yes |
+| Status | pending |
+
+### What it does
+x
+
+### Integration notes
+x
+
+## TestTuning
+
+| Field | Value |
+|-------|-------|
+| Paper | dummy |
+| arXiv | 1.2 |
+| Published | 2024 |
+| Location | backbone |
+| Complexity | low |
+| paper2code | yes |
+| Status | tuning |
+
+### What it does
+x
+
+### Integration notes
+x
+
+## TestBlocked
+
+| Field | Value |
+|-------|-------|
+| Paper | dummy |
+| arXiv | 1.3 |
+| Published | 2024 |
+| Location | backbone |
+| Complexity | low |
+| paper2code | yes |
+| Status | blocked |
+
+### What it does
+x
+
+### Integration notes
+x
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
+        f.write(sample)
+        path = f.name
+    pending = mm.find_pending(path)
+    names = [m.name for m in pending]
+    assert "TestPending" in names
+    assert "TestTuning" not in names
+    assert "TestBlocked" not in names
+    print("✓ test_tuning_status_does_not_count_as_pending")
+
+
 if __name__ == "__main__":
     test_parse_basic()
     test_count_pending()
@@ -593,4 +732,8 @@ if __name__ == "__main__":
     test_effective_resource_impact_hook_mode_uses_base()
     test_effective_resource_impact_returns_none_when_base_missing()
     test_effective_resource_impact_cpu_fallback_orthogonal_to_scope()
+    # v1.13 — tuning + blocked statuses
+    test_tuning_status_accepted_by_update()
+    test_blocked_status_accepted_by_update()
+    test_tuning_status_does_not_count_as_pending()
     print("\nall tests passed")

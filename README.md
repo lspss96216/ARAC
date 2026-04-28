@@ -9,6 +9,21 @@ keeping what improves the primary metric.
 Supports `task_type: object_detection` and `object_tracking`, driven entirely
 by `research_config.yaml`. No skill hardcodes a specific metric.
 
+**This is v1.13** — multi-attempt per-module hyperparameter tuning.
+**Loop semantics changed**: a "loop" was 1 (module, default_hp) experiment
+in v1.6-v1.12.1; v1.13 = 1 (module, attempt_N) experiment, up to 3 attempts
+per module (extensible to 5 if attempt-to-attempt mAP improves ≥3%).
+Agent reads new trajectory shape + diagnosis (6 canonical shapes:
+`monotonic_climbing`, `oscillating`, `early_collapse`, `train_val_diverge`,
+`flat_no_learning`, `converged_above/below_baseline`) and chooses
+next-attempt hyperparams using paper recipes + `tuning_history.tsv`
+cross-loop pattern. OPTIMIZER becomes attempt-changeable (still never
+'auto'). Same module attempt-to-attempt mAP ≥2% does NOT count toward
+stall trigger. +30 tests (161 → 191). New shared modules: `trajectory.py`,
+`tuning_history.py`. New yaml block: `autoresearch.tuning` (default
+`enabled: true`; set `false` to revert to v1.12.1 behaviour). See
+`CHANGELOG_v1.13.md`.
+
 **This is v1.12.1** — patch wiring up dead config + correcting stale
 yaml comment. `optional_pretrain_trigger` (yaml since v1.7, documented
 in v1.8 SKILL prose, never evaluated in code) now actually fires —
@@ -271,6 +286,7 @@ CHANGELOG_v1.11.md                          · concurrent paper-finder during ba
 CHANGELOG_v1.11.1.md                        · hook + invariant + subagent fixes (BREAKING reapply)
 CHANGELOG_v1.12.md                          · BATCH_SIZE locked + scope-aware resource_impact (BREAKING)
 CHANGELOG_v1.12.1.md                        · wire up optional_pretrain_trigger + crash-pause yaml comment fix
+CHANGELOG_v1.13.md                          · multi-attempt per-module tuning + trajectory shapes (BREAKING loop semantics)
 ```
 
 ---
@@ -443,13 +459,23 @@ SDK (`pip install firecrawl-py`) per the caveat in paper-finder Phase 2.
 
 ## Versions
 
-See `CHANGELOG_v1.12.1.md`, `CHANGELOG_v1.12.md`, `CHANGELOG_v1.11.1.md`, `CHANGELOG_v1.11.md`, `CHANGELOG_v1.10.md`, `CHANGELOG_v1.9.3.md`, `CHANGELOG_v1.9.2.md`, `CHANGELOG_v1.9.1.md`,
+See `CHANGELOG_v1.13.md`, `CHANGELOG_v1.12.1.md`, `CHANGELOG_v1.12.md`, `CHANGELOG_v1.11.1.md`, `CHANGELOG_v1.11.md`, `CHANGELOG_v1.10.md`, `CHANGELOG_v1.9.3.md`, `CHANGELOG_v1.9.2.md`, `CHANGELOG_v1.9.1.md`,
 `CHANGELOG_v1.9.md`, `CHANGELOG_v1.8.md`, `CHANGELOG_v1.7.7.md`,
 `CHANGELOG_v1.7.6.md`, `CHANGELOG_v1.7.5.md`, `CHANGELOG_v1.7.4.md`,
 `CHANGELOG_v1.7.3.md`, `CHANGELOG_v1.7.2.md`, `CHANGELOG_v1.7.1.md`,
 `CHANGELOG_v1.7.md`, and `CHANGELOG_v1.6.md` for recent release notes.
 
-- **v1.12.1** (current): patch — wires up `optional_pretrain_trigger`
+- **v1.13** (current): **multi-attempt per-module tuning**. **BREAKING
+  loop semantics**: 1 loop = 1 (module, attempt_N) experiment instead
+  of 1 (module, default_hp). Up to 3 attempts default; extension to 5
+  if attempt-to-attempt mAP ≥3%. Agent reads `trajectory.py`'s 6-shape
+  classification + `tuning_history.tsv` cross-loop pattern and chooses
+  hyperparams (LR0/MOMENTUM/WEIGHT_DECAY/WARMUP_EPOCHS/OPTIMIZER —
+  still never 'auto'). Same-module attempt mAP ≥2% improvement doesn't
+  count toward stall trigger. New `tuning` + `blocked` statuses in
+  modules.md. +30 tests (161 → 191). Drop-in for state schema; revert
+  via `tuning.enabled: false`.
+- **v1.12.1**: patch — wires up `optional_pretrain_trigger`
   (was dead config since v1.7). yaml fields now actually evaluated in
   autoresearch Step 8: triggers `request_repretrain` when stall
   threshold met AND corpus exists; warns + self-disables when no
